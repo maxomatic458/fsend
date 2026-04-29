@@ -1,0 +1,28 @@
+[package]
+name = "fsend-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-compression = { version = "0.4.12", features = ["tokio", "gzip"] }
+async-recursion = "1"
+async-trait = "0.1"
+bincode = { version = "2.0.1", features = ["serde"] }
+clap = { version = "4.5.31", features = ["derive"] }
+color-eyre = "0.6.3"
+colored = "3.0.0"
+dialoguer = "0.11.0"
+futures-util = "0.3"
+indicatif = "0.17.8"
+iroh = "0.35.0"
+quinn = { version = "0.11.6", features = ["runtime-tokio"] }
+rand = "0.8.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2.0.12"
+tokio = { version = "1.43.1", features = ["rt", "rt-multi-thread", "time", "macros", "net", "fs"] }
+tokio-tungstenite = { version = "0.26.2", features = ["native-tls"] }
+tracing = "0.1.41"
+tracing-subscriber = "0.3.20"
+webrtc = "0.8"
+bytes = "1"
