@@ -13,7 +13,8 @@ pub const FSEND_ALPN: &[u8] = b"fsend/0.1.0";
 
 // --- File tree types (ported from qs-core) ---
 
-#[derive(Debug, PartialEq, Clone, Encode, Decode, Hash)]
+#[derive(Debug, PartialEq, Clone, Encode, Decode, Hash, Serialize, Deserialize)]
+#[serde(tag = "type")]
 pub enum FileSendRecvTree {
     File { name: String, skip: u64, size: u64 },
     Dir { name: String, files: Vec<FileSendRecvTree> },
@@ -42,6 +43,7 @@ impl FileSendRecvTree {
 }
 
 #[derive(Debug, PartialEq, Clone, Encode, Decode, Hash, Serialize, Deserialize)]
+#[serde(tag = "type")]
 pub enum FilesAvailable {
     File { name: String, size: u64 },
     Dir { name: String, files: Vec<FilesAvailable> },
@@ -137,7 +139,8 @@ pub fn get_files_available(path: &Path) -> std::io::Result<FilesAvailable> {
     }
 }
 
-#[derive(Debug, PartialEq, Clone, Encode, Decode, Hash)]
+#[derive(Debug, PartialEq, Clone, Encode, Decode, Hash, Serialize, Deserialize)]
+#[serde(tag = "type")]
 pub enum FilesToSkip {
     File { name: String, skip: u64 },
     Dir { name: String, files: Vec<FilesToSkip> },
@@ -160,13 +163,15 @@ impl FilesToSkip {
 
 // --- Protocol packets ---
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode, Serialize, Deserialize)]
+#[serde(tag = "type")]
 pub enum SenderToReceiver {
     ConnRequest { version: String },
     FileInfo { files: Vec<FilesAvailable> },
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode, Serialize, Deserialize)]
+#[serde(tag = "type")]
 pub enum ReceiverToSender {
     WrongVersion { expected: String },
     Ok,

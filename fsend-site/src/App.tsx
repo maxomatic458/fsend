@@ -1,9 +1,16 @@
-import type { Component } from 'solid-js';
+import { Router, Route } from '@solidjs/router';
+import { Layout } from './components/Layout';
+import { HomePage } from './pages/HomePage';
+import { SendPage } from './pages/SendPage';
+import { ReceivePage } from './pages/ReceivePage';
 
-const App: Component = () => {
+export default function App() {
   return (
-    <p class="text-4xl text-green-700 text-center py-20">Hello tailwind!</p>
+    <Router>
+      <Route path="/" component={() => <Layout><HomePage /></Layout>} />
+      <Route path="/send" component={() => <Layout><SendPage /></Layout>} />
+      <Route path="/receive" component={() => <Layout><ReceivePage /></Layout>} />
+      <Route path="/receive/:code" component={() => <Layout><ReceivePage /></Layout>} />
+    </Router>
   );
-};
-
-export default App;
+}

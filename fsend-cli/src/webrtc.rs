@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use async_recursion::async_recursion;
 use async_trait::async_trait;
-use bincode::{Decode, Encode};
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex, Notify};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
@@ -68,23 +68,23 @@ async fn recv_fragmented(
     Ok(assembled)
 }
 
-async fn send_packet<P: Encode + std::fmt::Debug>(
+async fn send_packet<P: Serialize + std::fmt::Debug>(
     dc: &Arc<RTCDataChannel>,
     packet: &P,
 ) -> Result<(), TransferError> {
     tracing::debug!("webrtc sending packet: {:?}", packet);
-    let data = bincode::encode_to_vec(packet, bincode::config::standard())
+    let data = serde_json::to_vec(packet)
         .map_err(|e| TransferError::WebRtc(format!("encode: {e}")))?;
     let compressed = transfer::compress_gzip(&data).await?;
     send_fragmented(dc, &compressed).await
 }
 
-async fn recv_packet<P: Decode<()> + std::fmt::Debug>(
+async fn recv_packet<P: for<'de> Deserialize<'de> + std::fmt::Debug>(
     rx: &Mutex<mpsc::Receiver<Vec<u8>>>,
 ) -> Result<P, TransferError> {
     let compressed = recv_fragmented(rx).await?;
     let decompressed = transfer::decompress_gzip(&compressed).await?;
-    let (packet, _) = bincode::decode_from_slice(&decompressed, bincode::config::standard())
+    let packet: P = serde_json::from_slice(&decompressed)
         .map_err(|e| TransferError::WebRtc(format!("decode: {e}")))?;
     tracing::debug!("webrtc received packet: {:?}", packet);
     Ok(packet)
@@ -532,15 +532,6 @@ impl Transfer for WebRtcTransfer {
                 }
             }
         }
-
-        // Signal end of transfer with an empty message
-        self.data_dc()
-            .send(&Bytes::new())
-            .await
-            .map_err(|e| TransferError::WebRtc(format!("send eof: {e}")))?;
-
-        // Wait for the receiver to close
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
         Ok(())
     }
