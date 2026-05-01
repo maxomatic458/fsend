@@ -1,7 +1,13 @@
 [package]
 name = "fsend-cli"
+license = "MIT"
+description = "A CLI for fsend, a peer-to-peer file sharing tool"
+authors = ["Maxomatic458"]
+keywords = ["file-transfer", "peer-to-peer", "p2p", "cli"]
 version = "0.1.0"
 edition = "2021"
+repository = "https://github.com/maxomatic458/fsend"
+homepage = "https://fsend.sh"
 
 [dependencies]
 async-compression = { version = "0.4.12", features = ["tokio", "gzip"] }
@@ -26,3 +32,7 @@ tracing = "0.1.41"
 tracing-subscriber = "0.3.20"
 webrtc = "0.8"
 bytes = "1"
+
+[[bin]]
+name = "fsend"
+path = "src/main.rs"
