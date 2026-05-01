@@ -1,11 +1,11 @@
-import type { SelectedEntry } from './types';
-import { supportsFileSystemAccess } from './fsAccess';
+import type { SelectedEntry } from "./types";
+import { supportsFileSystemAccess } from "./fsAccess";
 
 export async function pickFiles(): Promise<SelectedEntry[]> {
   if (supportsFileSystemAccess()) {
     const handles = await window.showOpenFilePicker({ multiple: true });
     return handles.map((h) => ({
-      kind: 'file' as const,
+      kind: "file" as const,
       name: h.name,
       handle: h,
     }));
@@ -16,25 +16,25 @@ export async function pickFiles(): Promise<SelectedEntry[]> {
 export async function pickDirectory(): Promise<SelectedEntry> {
   if (supportsFileSystemAccess()) {
     const handle = await window.showDirectoryPicker();
-    return { kind: 'directory', name: handle.name, handle };
+    return { kind: "directory", name: handle.name, handle };
   }
   return pickDirectoryFallback();
 }
 
 export async function pickSaveDirectory(): Promise<FileSystemDirectoryHandle> {
-  return window.showDirectoryPicker({ mode: 'readwrite' });
+  return window.showDirectoryPicker({ mode: "readwrite" });
 }
 
 function pickFilesFallback(): Promise<SelectedEntry[]> {
   return new Promise((resolve) => {
-    const input = document.createElement('input');
-    input.type = 'file';
+    const input = document.createElement("input");
+    input.type = "file";
     input.multiple = true;
     input.onchange = () => {
       const files = Array.from(input.files ?? []);
       resolve(
         files.map((f) => ({
-          kind: 'file' as const,
+          kind: "file" as const,
           name: f.name,
           file: f,
         })),
@@ -46,18 +46,18 @@ function pickFilesFallback(): Promise<SelectedEntry[]> {
 
 function pickDirectoryFallback(): Promise<SelectedEntry> {
   return new Promise((resolve) => {
-    const input = document.createElement('input');
-    input.type = 'file';
+    const input = document.createElement("input");
+    input.type = "file";
     input.webkitdirectory = true;
     input.onchange = () => {
       const fileList = Array.from(input.files ?? []);
       if (fileList.length === 0) return;
-      const dirName = fileList[0].webkitRelativePath.split('/')[0];
+      const dirName = fileList[0].webkitRelativePath.split("/")[0];
       resolve({
-        kind: 'directory',
+        kind: "directory",
         name: dirName,
         files: fileList.map((f) => ({
-          relativePath: f.webkitRelativePath.split('/').slice(1).join('/'),
+          relativePath: f.webkitRelativePath.split("/").slice(1).join("/"),
           file: f,
         })),
       });
@@ -66,7 +66,9 @@ function pickDirectoryFallback(): Promise<SelectedEntry> {
   });
 }
 
-export async function handleDrop(dataTransfer: DataTransfer): Promise<SelectedEntry[]> {
+export async function handleDrop(
+  dataTransfer: DataTransfer,
+): Promise<SelectedEntry[]> {
   const entries: SelectedEntry[] = [];
 
   if (supportsFileSystemAccess()) {
@@ -74,11 +76,15 @@ export async function handleDrop(dataTransfer: DataTransfer): Promise<SelectedEn
     for (const item of items) {
       const handle = await item.getAsFileSystemHandle!();
       if (!handle) continue;
-      if (handle.kind === 'file') {
-        entries.push({ kind: 'file', name: handle.name, handle: handle as FileSystemFileHandle });
+      if (handle.kind === "file") {
+        entries.push({
+          kind: "file",
+          name: handle.name,
+          handle: handle as FileSystemFileHandle,
+        });
       } else {
         entries.push({
-          kind: 'directory',
+          kind: "directory",
           name: handle.name,
           handle: handle as FileSystemDirectoryHandle,
         });
@@ -94,10 +100,12 @@ export async function handleDrop(dataTransfer: DataTransfer): Promise<SelectedEn
     if (!webkitEntry) continue;
     if (webkitEntry.isFile) {
       const file = await getFileFromEntry(webkitEntry as FileSystemFileEntry);
-      entries.push({ kind: 'file', name: file.name, file });
+      entries.push({ kind: "file", name: file.name, file });
     } else if (webkitEntry.isDirectory) {
-      const files = await readDirectoryRecursive(webkitEntry as FileSystemDirectoryEntry);
-      entries.push({ kind: 'directory', name: webkitEntry.name, files });
+      const files = await readDirectoryRecursive(
+        webkitEntry as FileSystemDirectoryEntry,
+      );
+      entries.push({ kind: "directory", name: webkitEntry.name, files });
     }
   }
   return entries;
@@ -109,7 +117,7 @@ function getFileFromEntry(entry: FileSystemFileEntry): Promise<File> {
 
 async function readDirectoryRecursive(
   dirEntry: FileSystemDirectoryEntry,
-  prefix = '',
+  prefix = "",
 ): Promise<{ relativePath: string; file: File }[]> {
   const reader = dirEntry.createReader();
   const results: { relativePath: string; file: File }[] = [];
@@ -125,7 +133,10 @@ async function readDirectoryRecursive(
         const file = await getFileFromEntry(entry as FileSystemFileEntry);
         results.push({ relativePath: path, file });
       } else if (entry.isDirectory) {
-        const sub = await readDirectoryRecursive(entry as FileSystemDirectoryEntry, path);
+        const sub = await readDirectoryRecursive(
+          entry as FileSystemDirectoryEntry,
+          path,
+        );
         results.push(...sub);
       }
     }

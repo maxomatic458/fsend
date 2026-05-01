@@ -5,13 +5,15 @@ interface Window {
     types?: Array<{ description?: string; accept: Record<string, string[]> }>;
   }): Promise<FileSystemFileHandle[]>;
   showDirectoryPicker(options?: {
-    mode?: 'read' | 'readwrite';
+    mode?: "read" | "readwrite";
   }): Promise<FileSystemDirectoryHandle>;
 }
 
 // Augment DataTransferItem
 interface DataTransferItem {
-  getAsFileSystemHandle?(): Promise<FileSystemFileHandle | FileSystemDirectoryHandle | null>;
+  getAsFileSystemHandle?(): Promise<
+    FileSystemFileHandle | FileSystemDirectoryHandle | null
+  >;
 }
 
 // Augment HTMLInputElement

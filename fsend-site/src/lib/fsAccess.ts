@@ -1,10 +1,10 @@
-import type { FilesAvailable, FilesToSkip } from './types';
+import type { FilesAvailable, FilesToSkip } from "./types";
 
 export function supportsFileSystemAccess(): boolean {
   return (
-    typeof window !== 'undefined' &&
-    'showOpenFilePicker' in window &&
-    'showDirectoryPicker' in window
+    typeof window !== "undefined" &&
+    "showOpenFilePicker" in window &&
+    "showDirectoryPicker" in window
   );
 }
 
@@ -23,12 +23,12 @@ async function getSkipInfo(
   dirHandle: FileSystemDirectoryHandle,
   offered: FilesAvailable,
 ): Promise<FilesToSkip | null> {
-  if (offered.type === 'File') {
+  if (offered.type === "File") {
     try {
       const fh = await dirHandle.getFileHandle(offered.name);
       const file = await fh.getFile();
       if (file.size > 0) {
-        return { type: 'File', name: offered.name, skip: file.size };
+        return { type: "File", name: offered.name, skip: file.size };
       }
     } catch {
       // file doesn't exist
@@ -45,7 +45,7 @@ async function getSkipInfo(
       if (skip) skipFiles.push(skip);
     }
     if (skipFiles.length === 0) return null;
-    return { type: 'Dir', name: offered.name, files: skipFiles };
+    return { type: "Dir", name: offered.name, files: skipFiles };
   } catch {
     return null;
   }

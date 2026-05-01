@@ -1,22 +1,24 @@
-import { createSignal, onMount } from 'solid-js';
-import { FiSun, FiMoon } from 'solid-icons/fi';
+import { createSignal, onMount } from "solid-js";
+import { FiSun, FiMoon } from "solid-icons/fi";
 
 export function ThemeToggle() {
   const [dark, setDark] = createSignal(false);
 
   onMount(() => {
-    const stored = localStorage.getItem('theme');
-    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-    const isDark = stored === 'dark' || (!stored && prefersDark);
+    const stored = localStorage.getItem("theme");
+    const prefersDark = window.matchMedia(
+      "(prefers-color-scheme: dark)",
+    ).matches;
+    const isDark = stored === "dark" || (!stored && prefersDark);
     setDark(isDark);
-    document.documentElement.classList.toggle('dark', isDark);
+    document.documentElement.classList.toggle("dark", isDark);
   });
 
   const toggle = () => {
     const next = !dark();
     setDark(next);
-    document.documentElement.classList.toggle('dark', next);
-    localStorage.setItem('theme', next ? 'dark' : 'light');
+    document.documentElement.classList.toggle("dark", next);
+    localStorage.setItem("theme", next ? "dark" : "light");
   };
 
   return (

@@ -1,7 +1,7 @@
-import { For, Show } from 'solid-js';
-import { FiFolder, FiFile, FiX } from 'solid-icons/fi';
-import { formatBytes } from '../lib/format';
-import type { SelectedEntry } from '../lib/types';
+import { For, Show } from "solid-js";
+import { FiFolder, FiFile, FiX } from "solid-icons/fi";
+import { formatBytes } from "../lib/format";
+import type { SelectedEntry } from "../lib/types";
 
 interface FileListProps {
   entries: SelectedEntry[];
@@ -18,13 +18,15 @@ export function FileList(props: FileListProps) {
             {(entry, i) => (
               <div class="flex items-center justify-between py-3 px-4 hover:bg-gray-50 dark:hover:bg-neutral-700/50 transition-colors">
                 <div class="flex items-center gap-3">
-                  {entry.kind === 'directory' ? (
+                  {entry.kind === "directory" ? (
                     <FiFolder class="w-6 h-6 text-gray-500 dark:text-gray-400" />
                   ) : (
                     <FiFile class="w-6 h-6 text-gray-500 dark:text-gray-400" />
                   )}
                   <div>
-                    <div class="font-medium text-gray-800 dark:text-gray-100">{entry.name}</div>
+                    <div class="font-medium text-gray-800 dark:text-gray-100">
+                      {entry.name}
+                    </div>
                   </div>
                 </div>
                 <button

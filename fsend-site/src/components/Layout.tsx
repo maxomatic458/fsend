@@ -1,7 +1,7 @@
-import type { JSX } from 'solid-js';
-import { A } from '@solidjs/router';
-import { ThemeToggle } from './ThemeToggle';
-import { FiGithub, FiMail } from 'solid-icons/fi';
+import type { JSX } from "solid-js";
+import { A } from "@solidjs/router";
+import { ThemeToggle } from "./ThemeToggle";
+import { FiGithub, FiMail } from "solid-icons/fi";
 
 export function Layout(props: { children: JSX.Element }) {
   return (

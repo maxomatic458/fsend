@@ -3,8 +3,6 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-// --- Protocol types (mirroring fsend-relay) ---
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Protocol {
@@ -24,8 +22,6 @@ pub enum ConnectionInfo {
         addrs: Vec<String>,
     },
 }
-
-// --- Client -> Server ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CreateSessionRequest {
@@ -50,8 +46,6 @@ enum ClientMessage {
     JoinSession(JoinSessionRequest),
     Exchange(ExchangeRequest),
 }
-
-// --- Server -> Client ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CreateSessionAnswer {
@@ -87,8 +81,6 @@ enum ServerMessage {
     Exchange(ExchangeAnswer),
     Error(ErrorAnswer),
 }
-
-// --- Relay client ---
 
 #[derive(Debug, Error)]
 pub enum RelayError {

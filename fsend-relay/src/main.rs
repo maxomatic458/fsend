@@ -1,14 +1,24 @@
-use std::{net::SocketAddr, sync::Arc, time::{Duration, Instant}};
-use axum::{extract::{State, WebSocketUpgrade, ws::{Message, WebSocket}}, response::IntoResponse, routing::get, Router};
+use axum::{
+    Router,
+    extract::{
+        State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
+    },
+    response::IntoResponse,
+    routing::get,
+};
 use clap::Parser;
 use dashmap::DashMap;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
+use std::{
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::sync::oneshot;
 use tower_http::cors::CorsLayer;
 use tracing::info;
-
-// --- Protocol types ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -30,8 +40,7 @@ enum ConnectionInfo {
     },
 }
 
-// --- Client -> Server messages ---
-
+// Client -> Server
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CreateSessionRequest {
     capabilities: Vec<Protocol>,
@@ -56,7 +65,7 @@ enum ClientMessage {
     Exchange(ExchangeRequest),
 }
 
-// --- Server -> Client messages ---
+// Server -> Client
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CreateSessionAnswer {
@@ -94,8 +103,6 @@ enum ServerMessage {
     Error(ErrorAnswer),
 }
 
-// --- Negotiation ---
-
 fn negotiate_protocol(sender: &[Protocol], receiver: &[Protocol]) -> Option<Protocol> {
     if sender.contains(&Protocol::Iroh) && receiver.contains(&Protocol::Iroh) {
         Some(Protocol::Iroh)
@@ -106,15 +113,11 @@ fn negotiate_protocol(sender: &[Protocol], receiver: &[Protocol]) -> Option<Prot
     }
 }
 
-// --- Session state ---
-
-/// A waiting session: the sender is connected and waiting for a receiver.
 struct Session {
     sender_capabilities: Vec<Protocol>,
     /// Channel for the receiver to send itself to the sender's task.
-    /// Carries (negotiated protocol, receiver's exchange tx, receiver's exchange rx).
     receiver_join_tx: oneshot::Sender<ReceiverJoin>,
-    created_at: Instant,
+    _created_at: Instant,
     expires_at: Instant,
 }
 
@@ -159,17 +162,16 @@ impl AppState {
     }
 }
 
-// --- Helpers ---
-
 fn send_server_msg(msg: &ServerMessage) -> Message {
     Message::Text(serde_json::to_string(msg).unwrap().into())
 }
 
 fn send_error(message: impl Into<String>) -> Message {
-    send_server_msg(&ServerMessage::Error(ErrorAnswer { message: message.into() }))
+    send_server_msg(&ServerMessage::Error(ErrorAnswer {
+        message: message.into(),
+    }))
 }
 
-/// Read the next text message from the socket, ignoring pings/pongs/close.
 async fn recv_client_msg(ws: &mut WebSocket) -> Option<ClientMessage> {
     loop {
         match ws.recv().await? {
@@ -177,12 +179,10 @@ async fn recv_client_msg(ws: &mut WebSocket) -> Option<ClientMessage> {
                 return serde_json::from_str(&text).ok();
             }
             Ok(Message::Close(_)) | Err(_) => return None,
-            _ => continue, // ignore ping/pong/binary
+            _ => continue,
         }
     }
 }
-
-// --- WebSocket handler ---
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
@@ -199,7 +199,9 @@ async fn handle_socket(mut ws: WebSocket, state: AppState) {
         ClientMessage::CreateSession(req) => handle_sender(ws, state, req).await,
         ClientMessage::JoinSession(req) => handle_receiver(ws, state, req).await,
         ClientMessage::Exchange(_) => {
-            let _ = ws.send(send_error("unexpected Exchange before session setup")).await;
+            let _ = ws
+                .send(send_error("unexpected Exchange before session setup"))
+                .await;
         }
     }
 }
@@ -209,17 +211,24 @@ async fn handle_sender(mut ws: WebSocket, state: AppState, req: CreateSessionReq
     let (receiver_join_tx, receiver_join_rx) = oneshot::channel::<ReceiverJoin>();
 
     let now = Instant::now();
-    state.sessions.insert(code.clone(), Session {
-        sender_capabilities: req.capabilities,
-        receiver_join_tx,
-        created_at: now,
-        expires_at: now + Duration::from_secs(SESSION_DURATION_SECONDS),
-    });
+    state.sessions.insert(
+        code.clone(),
+        Session {
+            sender_capabilities: req.capabilities,
+            receiver_join_tx,
+            _created_at: now,
+            expires_at: now + Duration::from_secs(SESSION_DURATION_SECONDS),
+        },
+    );
 
     // Tell the sender their code.
-    if ws.send(send_server_msg(&ServerMessage::CreateSession(CreateSessionAnswer {
-        code: code.clone(),
-    }))).await.is_err() {
+    if ws
+        .send(send_server_msg(&ServerMessage::CreateSession(
+            CreateSessionAnswer { code: code.clone() },
+        )))
+        .await
+        .is_err()
+    {
         state.sessions.remove(&code);
         return;
     }
@@ -245,19 +254,23 @@ async fn handle_sender(mut ws: WebSocket, state: AppState, req: CreateSessionReq
     };
 
     // Session consumed from the map by the receiver; notify the sender of the negotiated protocol.
-    if ws.send(send_server_msg(&ServerMessage::PeerJoined(PeerJoinedAnswer {
-        protocol: join.protocol,
-    }))).await.is_err() {
+    if ws
+        .send(send_server_msg(&ServerMessage::PeerJoined(
+            PeerJoinedAnswer {
+                protocol: join.protocol,
+            },
+        )))
+        .await
+        .is_err()
+    {
         return;
     }
 
-    // Wait for the sender's ExchangeRequest.
     let sender_info = match recv_client_msg(&mut ws).await {
         Some(ClientMessage::Exchange(ex)) => ex.connection_info,
         _ => return,
     };
 
-    // Send our info to the receiver and get theirs.
     let _ = join.sender_info_tx.send(sender_info);
 
     let receiver_info = match join.receiver_info_rx.await {
@@ -265,16 +278,16 @@ async fn handle_sender(mut ws: WebSocket, state: AppState, req: CreateSessionReq
         Err(_) => return,
     };
 
-    // Forward the receiver's connection info to the sender.
-    let _ = ws.send(send_server_msg(&ServerMessage::Exchange(ExchangeAnswer {
-        connection_info: receiver_info,
-    }))).await;
+    let _ = ws
+        .send(send_server_msg(&ServerMessage::Exchange(ExchangeAnswer {
+            connection_info: receiver_info,
+        })))
+        .await;
 
     info!(code = %code, "exchange complete (sender side)");
 }
 
 async fn handle_receiver(mut ws: WebSocket, state: AppState, req: JoinSessionRequest) {
-    // Look up and remove the session.
     let session = match state.sessions.remove(&req.code) {
         Some((_, s)) => s,
         None => {
@@ -283,7 +296,6 @@ async fn handle_receiver(mut ws: WebSocket, state: AppState, req: JoinSessionReq
         }
     };
 
-    // Negotiate protocol.
     let protocol = match negotiate_protocol(&session.sender_capabilities, &req.capabilities) {
         Some(p) => p,
         None => {
@@ -292,56 +304,59 @@ async fn handle_receiver(mut ws: WebSocket, state: AppState, req: JoinSessionReq
         }
     };
 
-    // Set up exchange channels.
     let (receiver_info_tx, receiver_info_rx) = oneshot::channel::<ConnectionInfo>();
     let (sender_info_tx, sender_info_rx) = oneshot::channel::<ConnectionInfo>();
 
-    // Notify the sender's task that we've joined.
-    if session.receiver_join_tx.send(ReceiverJoin {
-        protocol,
-        receiver_info_rx,
-        sender_info_tx,
-    }).is_err() {
+    if session
+        .receiver_join_tx
+        .send(ReceiverJoin {
+            protocol,
+            receiver_info_rx,
+            sender_info_tx,
+        })
+        .is_err()
+    {
         let _ = ws.send(send_error("sender disconnected")).await;
         return;
     }
 
-    // Tell the receiver the negotiated protocol.
-    if ws.send(send_server_msg(&ServerMessage::JoinSession(JoinSessionAnswer {
-        protocol,
-    }))).await.is_err() {
+    if ws
+        .send(send_server_msg(&ServerMessage::JoinSession(
+            JoinSessionAnswer { protocol },
+        )))
+        .await
+        .is_err()
+    {
         return;
     }
 
     info!(code = %req.code, ?protocol, "receiver joined, exchanging");
 
-    // First, get the sender's info and forward it to the receiver.
-    // This allows the receiver to see the sender's info (e.g. WebRTC offer)
-    // before generating its own response (e.g. WebRTC answer).
+    // Get the sender's info and forward it to the receiver.
     let sender_info = match sender_info_rx.await {
         Ok(info) => info,
         Err(_) => return,
     };
 
-    if ws.send(send_server_msg(&ServerMessage::Exchange(ExchangeAnswer {
-        connection_info: sender_info,
-    }))).await.is_err() {
+    if ws
+        .send(send_server_msg(&ServerMessage::Exchange(ExchangeAnswer {
+            connection_info: sender_info,
+        })))
+        .await
+        .is_err()
+    {
         return;
     }
 
-    // Now wait for the receiver's ExchangeRequest (response).
     let receiver_info = match recv_client_msg(&mut ws).await {
         Some(ClientMessage::Exchange(ex)) => ex.connection_info,
         _ => return,
     };
 
-    // Forward receiver's info back to the sender.
     let _ = receiver_info_tx.send(receiver_info);
 
     info!(code = %req.code, "exchange complete (receiver side)");
 }
-
-// --- Constants ---
 
 const SESSION_DURATION_SECONDS: u64 = 5 * 60;
 const CLEANUP_INTERVAL_SECONDS: u64 = 5 * 60;
@@ -363,7 +378,6 @@ async fn main() {
     let args = Args::parse();
     let state = AppState::new();
 
-    // Periodic cleanup of expired sessions.
     let cleanup_state = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(CLEANUP_INTERVAL_SECONDS));

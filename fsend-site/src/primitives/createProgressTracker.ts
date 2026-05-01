@@ -1,5 +1,5 @@
-import { createStore, produce } from 'solid-js/store';
-import { TransferStats } from '../lib/stats';
+import { createStore, produce } from "solid-js/store";
+import { TransferStats } from "../lib/stats";
 
 export interface ProgressEntry {
   name: string;
@@ -31,7 +31,9 @@ export function createProgressTracker() {
   let currentEntryIdx = 0;
   let statsInterval: ReturnType<typeof setInterval> | undefined;
 
-  function initialize(items: Array<{ name: string; size: number; skip: number; isDir: boolean }>) {
+  function initialize(
+    items: Array<{ name: string; size: number; skip: number; isDir: boolean }>,
+  ) {
     const entries = items.map((item) => ({
       name: item.name,
       size: item.size,
@@ -52,7 +54,10 @@ export function createProgressTracker() {
 
     currentEntryIdx = 0;
     // Find the first non-complete entry
-    while (currentEntryIdx < entries.length && entries[currentEntryIdx].transferred >= entries[currentEntryIdx].size) {
+    while (
+      currentEntryIdx < entries.length &&
+      entries[currentEntryIdx].transferred >= entries[currentEntryIdx].size
+    ) {
       currentEntryIdx++;
     }
 
@@ -84,7 +89,8 @@ export function createProgressTracker() {
           // Advance to next entry if current is complete
           while (
             currentEntryIdx < p.entries.length &&
-            p.entries[currentEntryIdx].transferred >= p.entries[currentEntryIdx].size
+            p.entries[currentEntryIdx].transferred >=
+              p.entries[currentEntryIdx].size
           ) {
             currentEntryIdx++;
           }

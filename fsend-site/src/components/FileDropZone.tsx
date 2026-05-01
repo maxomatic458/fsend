@@ -1,8 +1,8 @@
-import { createSignal } from 'solid-js';
-import { FiUpload, FiFolder, FiFile } from 'solid-icons/fi';
-import { pickFiles, pickDirectory, handleDrop } from '../lib/filePicker';
-import type { SelectedEntry } from '../lib/types';
-import { Button } from './Button';
+import { createSignal } from "solid-js";
+import { FiUpload, FiFolder, FiFile } from "solid-icons/fi";
+import { pickFiles, pickDirectory, handleDrop } from "../lib/filePicker";
+import type { SelectedEntry } from "../lib/types";
+import { Button } from "./Button";
 
 interface FileDropZoneProps {
   onFilesSelected: (entries: SelectedEntry[]) => void;
@@ -64,13 +64,15 @@ export function FileDropZone(props: FileDropZoneProps) {
       onDrop={onDrop}
       class={`border-2 border-dashed rounded-xl p-8 text-center transition-colors ${
         isDragging()
-          ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20'
-          : 'border-gray-300 dark:border-neutral-600'
+          ? "border-blue-500 bg-blue-50 dark:bg-blue-900/20"
+          : "border-gray-300 dark:border-neutral-600"
       }`}
     >
       <FiUpload class="w-10 h-10 mx-auto mb-3 text-gray-400 dark:text-neutral-500" />
       <p class="text-gray-600 dark:text-gray-400 mb-4">
-        {isDragging() ? 'Drop files here' : 'Drag and drop files or folders here'}
+        {isDragging()
+          ? "Drop files here"
+          : "Drag and drop files or folders here"}
       </p>
       <div class="flex gap-3 justify-center">
         <Button variant="gray" onClick={selectFiles}>

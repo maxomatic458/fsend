@@ -1,27 +1,27 @@
-import { createSignal, onCleanup, onMount, Show } from 'solid-js';
-import { useNavigate, useParams } from '@solidjs/router';
-import { FiArrowLeft, FiDownload, FiFolder, FiLink } from 'solid-icons/fi';
-import type { FilesAvailable } from '../lib/types';
-import { supportsFileSystemAccess } from '../lib/fsAccess';
-import { pickSaveDirectory } from '../lib/filePicker';
-import { runReceiver } from '../lib/receiver';
-import { runFallbackReceiver } from '../lib/fallbackReceiver';
-import { createProgressTracker } from '../primitives/createProgressTracker';
-import { FileOffer } from '../components/FileOffer';
-import { TransferProgress } from '../components/TransferProgress';
-import { ErrorCard } from '../components/ErrorCard';
-import { Button } from '../components/Button';
-import { Card } from '../components/Card';
-import { formatBytes } from '../lib/format';
+import { createSignal, onCleanup, onMount, Show } from "solid-js";
+import { useNavigate, useParams } from "@solidjs/router";
+import { FiArrowLeft, FiDownload, FiFolder, FiLink } from "solid-icons/fi";
+import type { FilesAvailable } from "../lib/types";
+import { supportsFileSystemAccess } from "../lib/fsAccess";
+import { pickSaveDirectory } from "../lib/filePicker";
+import { runReceiver } from "../lib/receiver";
+import { runFallbackReceiver } from "../lib/fallbackReceiver";
+import { createProgressTracker } from "../primitives/createProgressTracker";
+import { FileOffer } from "../components/FileOffer";
+import { TransferProgress } from "../components/TransferProgress";
+import { ErrorCard } from "../components/ErrorCard";
+import { Button } from "../components/Button";
+import { Card } from "../components/Card";
+import { formatBytes } from "../lib/format";
 
 type ReceiveState =
-  | 'input'
-  | 'connecting'
-  | 'handshaking'
-  | 'offered'
-  | 'transferring'
-  | 'completed'
-  | 'error';
+  | "input"
+  | "connecting"
+  | "handshaking"
+  | "offered"
+  | "transferring"
+  | "completed"
+  | "error";
 
 export function ReceivePage() {
   const navigate = useNavigate();
@@ -29,14 +29,15 @@ export function ReceivePage() {
   const tracker = createProgressTracker();
   const hasNativeFS = supportsFileSystemAccess();
 
-  const [state, setState] = createSignal<ReceiveState>('input');
-  const [code, setCode] = createSignal('');
-  const [error, setError] = createSignal('');
+  const [state, setState] = createSignal<ReceiveState>("input");
+  const [code, setCode] = createSignal("");
+  const [error, setError] = createSignal("");
   const [offeredFiles, setOfferedFiles] = createSignal<FilesAvailable[]>([]);
   const [acceptFn, setAcceptFn] = createSignal<(() => void) | null>(null);
   const [rejectFn, setRejectFn] = createSignal<(() => void) | null>(null);
-  const [dirHandle, setDirHandle] = createSignal<FileSystemDirectoryHandle | null>(null);
-  const [connectionType, setConnectionType] = createSignal<string>('unknown');
+  const [dirHandle, setDirHandle] =
+    createSignal<FileSystemDirectoryHandle | null>(null);
+  const [connectionType, setConnectionType] = createSignal<string>("unknown");
   const [resume, setResume] = createSignal(false);
 
   const abortController = new AbortController();
@@ -53,7 +54,10 @@ export function ReceivePage() {
   });
 
   const formatCode = (input: string) => {
-    return input.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8);
+    return input
+      .toUpperCase()
+      .replace(/[^A-Z0-9]/g, "")
+      .slice(0, 8);
   };
 
   const selectSaveDir = async () => {
@@ -65,32 +69,50 @@ export function ReceivePage() {
 
   const startReceiving = () => {
     if (code().length === 0) return;
-    setState('connecting');
+    setState("connecting");
 
     const callbacks = {
-      onConnecting: () => setState('connecting'),
-      onHandshaking: () => setState('handshaking'),
-      onFilesOffered: (files: FilesAvailable[], accept: () => void, reject: () => void) => {
+      onConnecting: () => setState("connecting"),
+      onHandshaking: () => setState("handshaking"),
+      onFilesOffered: (
+        files: FilesAvailable[],
+        accept: () => void,
+        reject: () => void,
+      ) => {
         setOfferedFiles(files);
         setAcceptFn(() => accept);
         setRejectFn(() => reject);
-        setState('offered');
+        setState("offered");
       },
-      onTransferring: (items: Array<{ name: string; size: number; skip: number; isDir: boolean }>) => {
+      onTransferring: (
+        items: Array<{
+          name: string;
+          size: number;
+          skip: number;
+          isDir: boolean;
+        }>,
+      ) => {
         tracker.initialize(items);
-        setState('transferring');
+        setState("transferring");
       },
       onProgress: (bytes: number) => tracker.recordBytes(bytes),
-      onComplete: () => setState('completed'),
+      onComplete: () => setState("completed"),
       onError: (msg: string) => {
         setError(msg);
-        setState('error');
+        setState("error");
       },
-      onConnectionType: (type: 'direct' | 'relay' | 'unknown') => setConnectionType(type),
+      onConnectionType: (type: "direct" | "relay" | "unknown") =>
+        setConnectionType(type),
     };
 
     if (hasNativeFS && dirHandle()) {
-      runReceiver(code(), dirHandle()!, resume(), callbacks, abortController.signal);
+      runReceiver(
+        code(),
+        dirHandle()!,
+        resume(),
+        callbacks,
+        abortController.signal,
+      );
     } else {
       runFallbackReceiver(code(), callbacks, abortController.signal);
     }
@@ -112,11 +134,14 @@ export function ReceivePage() {
     rejectFn()?.();
   };
 
-  const goBack = () => { abortController.abort(); navigate('/'); };
+  const goBack = () => {
+    abortController.abort();
+    navigate("/");
+  };
 
   const handleTryAgain = () => {
-    setError('');
-    setState('input');
+    setError("");
+    setState("input");
   };
 
   return (
@@ -129,14 +154,17 @@ export function ReceivePage() {
         >
           <FiArrowLeft class="w-4 h-4" /> Back
         </button>
-        <h1 class="text-3xl font-bold text-gray-800 dark:text-gray-100 mb-8">Receive Files</h1>
+        <h1 class="text-3xl font-bold text-gray-800 dark:text-gray-100 mb-8">
+          Receive Files
+        </h1>
 
         {/* State: input */}
-        <Show when={state() === 'input'}>
+        <Show when={state() === "input"}>
           <Show when={!hasNativeFS}>
             <div class="bg-yellow-100 dark:bg-yellow-900/40 text-yellow-800 dark:text-yellow-200 border border-yellow-300 dark:border-yellow-700 px-3 py-2 rounded-lg text-sm font-medium mb-4">
-              Your browser doesn't support the File System Access API.
-              Files will be downloaded as a zip archive. Transfer resumption won't be available.
+              Your browser doesn't support the File System Access API. Files
+              will be downloaded as a zip archive. Transfer resumption won't be
+              available.
             </div>
           </Show>
 
@@ -166,7 +194,7 @@ export function ReceivePage() {
                 </label>
                 <div class="flex gap-2">
                   <div class="flex-1 p-3 border dark:border-neutral-600 rounded-lg bg-gray-50 dark:bg-neutral-700 text-gray-800 dark:text-gray-200">
-                    {dirHandle() ? dirHandle()!.name : 'No directory selected'}
+                    {dirHandle() ? dirHandle()!.name : "No directory selected"}
                   </div>
                   <Button variant="blue" onClick={selectSaveDir}>
                     <span class="flex items-center gap-2">
@@ -198,7 +226,9 @@ export function ReceivePage() {
             <Button
               variant="green"
               onClick={startReceiving}
-              disabled={!code() || code().length !== 8 || (hasNativeFS && !dirHandle())}
+              disabled={
+                !code() || code().length !== 8 || (hasNativeFS && !dirHandle())
+              }
               class="w-full py-3"
             >
               <span class="flex items-center justify-center gap-2">
@@ -210,12 +240,14 @@ export function ReceivePage() {
         </Show>
 
         {/* State: connecting */}
-        <Show when={state() === 'connecting'}>
+        <Show when={state() === "connecting"}>
           <Card class="text-center">
             <div class="flex justify-center mb-4">
               <div class="animate-spin w-12 h-12 border-4 border-gray-300 border-t-blue-500 rounded-full" />
             </div>
-            <p class="text-gray-600 dark:text-gray-400 mb-4">Connecting to sender...</p>
+            <p class="text-gray-600 dark:text-gray-400 mb-4">
+              Connecting to sender...
+            </p>
             <Button variant="gray" onClick={goBack}>
               Cancel
             </Button>
@@ -223,17 +255,19 @@ export function ReceivePage() {
         </Show>
 
         {/* State: handshaking */}
-        <Show when={state() === 'handshaking'}>
+        <Show when={state() === "handshaking"}>
           <Card class="text-center">
             <div class="flex justify-center mb-4">
               <div class="animate-spin w-12 h-12 border-4 border-gray-300 border-t-blue-500 rounded-full" />
             </div>
-            <p class="text-gray-600 dark:text-gray-400">Establishing connection...</p>
+            <p class="text-gray-600 dark:text-gray-400">
+              Establishing connection...
+            </p>
           </Card>
         </Show>
 
         {/* State: offered */}
-        <Show when={state() === 'offered'}>
+        <Show when={state() === "offered"}>
           <Card>
             <FileOffer
               files={offeredFiles()}
@@ -244,36 +278,43 @@ export function ReceivePage() {
         </Show>
 
         {/* State: transferring / completed */}
-        <Show when={state() === 'transferring' || state() === 'completed'}>
+        <Show when={state() === "transferring" || state() === "completed"}>
           <Show when={!hasNativeFS}>
             <div class="bg-yellow-100 dark:bg-yellow-900/40 text-yellow-800 dark:text-yellow-200 border border-yellow-300 dark:border-yellow-700 px-3 py-2 rounded-lg text-sm font-medium mb-4">
-              Your browser does not support the Native Filesystem API. The entire download (
-              {formatBytes(tracker.progress.totalSize)}) needs to be saved to memory first. Ensure
-              you have enough free system memory.
+              Your browser does not support the Native Filesystem API. The
+              entire download ({formatBytes(tracker.progress.totalSize)}) needs
+              to be saved to memory first. Ensure you have enough free system
+              memory.
             </div>
           </Show>
           <Card>
-            <Show when={connectionType() !== 'unknown'}>
+            <Show when={connectionType() !== "unknown"}>
               <div class="flex items-center justify-center gap-2 mb-4">
-                <div class={`w-3 h-3 rounded-full ${connectionType() === 'direct' ? 'bg-green-500' : 'bg-yellow-500'}`} />
+                <div
+                  class={`w-3 h-3 rounded-full ${connectionType() === "direct" ? "bg-green-500" : "bg-yellow-500"}`}
+                />
                 <span
                   class={`text-sm font-medium ${
-                    connectionType() === 'direct'
-                      ? 'text-green-600 dark:text-green-400'
-                      : 'text-yellow-600 dark:text-yellow-400'
+                    connectionType() === "direct"
+                      ? "text-green-600 dark:text-green-400"
+                      : "text-yellow-600 dark:text-yellow-400"
                   }`}
                 >
-                  {connectionType() === 'direct' ? 'Direct Connection' : 'Relay Connection'}
+                  {connectionType() === "direct"
+                    ? "Direct Connection"
+                    : "Relay Connection"}
                 </span>
               </div>
             </Show>
             <TransferProgress
               progress={tracker.progress}
-              status={state() === 'completed' ? 'Download Complete!' : 'Receiving...'}
+              status={
+                state() === "completed" ? "Download Complete!" : "Receiving..."
+              }
               speedLabel="Download"
             />
 
-            <Show when={state() === 'transferring'}>
+            <Show when={state() === "transferring"}>
               <div class="mt-6 text-center">
                 <Show when={hasNativeFS}>
                   <p class="text-sm text-gray-500 dark:text-gray-400 mb-3">
@@ -291,7 +332,7 @@ export function ReceivePage() {
               </div>
             </Show>
 
-            <Show when={state() === 'completed'}>
+            <Show when={state() === "completed"}>
               <div class="mt-6 text-center">
                 <p class="text-green-600 dark:text-green-400 font-semibold text-lg mb-4">
                   All files received successfully!
@@ -315,9 +356,11 @@ export function ReceivePage() {
         </Show>
 
         {/* State: error */}
-        <Show when={state() === 'error'}>
+        <Show when={state() === "error"}>
           <ErrorCard class="text-center">
-            <p class="text-red-600 dark:text-red-400 font-semibold mb-4">{error()}</p>
+            <p class="text-red-600 dark:text-red-400 font-semibold mb-4">
+              {error()}
+            </p>
             <Button variant="red" onClick={handleTryAgain}>
               Try Again
             </Button>

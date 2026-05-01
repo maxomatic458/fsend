@@ -1,8 +1,19 @@
-import { RELAY_URL, PROTO_VERSION, DATA_CHUNK_SIZE, MAX_BUFFERED } from '../config';
-import { RelayClient } from './relay';
-import { createOfferer, applyAnswer, waitConnected } from './webrtc';
-import { sendControlMessage, ControlDecoder } from './protocol';
-import { buildFileTree, flattenTree, applySkip, treeSize, treeSkip } from './fileTree';
+import {
+  RELAY_URL,
+  PROTO_VERSION,
+  DATA_CHUNK_SIZE,
+  MAX_BUFFERED,
+} from "../config";
+import { RelayClient } from "./relay";
+import { createOfferer, applyAnswer, waitConnected } from "./webrtc";
+import { sendControlMessage, ControlDecoder } from "./protocol";
+import {
+  buildFileTree,
+  flattenTree,
+  applySkip,
+  treeSize,
+  treeSkip,
+} from "./fileTree";
 import type {
   SelectedEntry,
   FilesAvailable,
@@ -10,18 +21,25 @@ import type {
   ReceiverToSender,
   SenderToReceiver,
   ConnectionInfo,
-} from './types';
+} from "./types";
 
 export interface SenderCallbacks {
   onCode: (code: string) => void;
   onWaitingPeer: () => void;
   onHandshaking: () => void;
   onWaitingAccept: () => void;
-  onTransferring: (entries: Array<{ name: string; size: number; skip: number; isDir: boolean }>) => void;
+  onTransferring: (
+    entries: Array<{
+      name: string;
+      size: number;
+      skip: number;
+      isDir: boolean;
+    }>,
+  ) => void;
   onProgress: (bytes: number) => void;
   onComplete: () => void;
   onError: (error: string) => void;
-  onConnectionType: (type: 'direct' | 'relay' | 'unknown') => void;
+  onConnectionType: (type: "direct" | "relay" | "unknown") => void;
 }
 
 export async function runSender(
@@ -56,34 +74,39 @@ export async function runSender(
     const { connection, offerSdp } = await createOfferer();
     pc = connection.pc;
 
-    // Close relay + pc immediately when aborted, unblocking all pending awaits
-    abort.addEventListener('abort', () => { relay?.close(); pc?.close(); });
+    abort.addEventListener("abort", () => {
+      relay?.close();
+      pc?.close();
+    });
 
     relay.sendExchange({
-      type: 'web_rtc',
+      type: "web_rtc",
       sdp: offerSdp,
       ice_candidates: [],
     });
 
     const peerInfo = await relay.recvExchange();
     applyAnswer(pc, peerInfo.sdp);
-    await waitConnected(pc, [connection.controlChannel, connection.dataChannel]);
+    await waitConnected(pc, [
+      connection.controlChannel,
+      connection.dataChannel,
+    ]);
     if (abort.aborted) return;
 
-    // Disconnect detection: use data channel 'close' event instead of
-    // pc.connectionState to avoid false positives from transient 'disconnected' state.
     const disconnectPromise = new Promise<never>((_, reject) => {
-      connection.dataChannel.addEventListener('close', () => reject(new Error('Peer disconnected')));
+      connection.dataChannel.addEventListener("close", () =>
+        reject(new Error("Peer disconnected")),
+      );
     });
-    disconnectPromise.catch(() => {}); // suppress unhandled rejection after transfer completes
+    disconnectPromise.catch(() => {});
 
-    // Set up control channel decoder
     const decoder = new ControlDecoder();
     const controlMessages: ReceiverToSender[] = [];
     let controlResolve: (() => void) | null = null;
 
     connection.controlChannel.onmessage = async (ev) => {
-      const data = ev.data instanceof ArrayBuffer ? ev.data : await ev.data.arrayBuffer();
+      const data =
+        ev.data instanceof ArrayBuffer ? ev.data : await ev.data.arrayBuffer();
       const msg = await decoder.onMessage(data);
       if (msg) {
         controlMessages.push(msg as ReceiverToSender);
@@ -92,44 +115,43 @@ export async function runSender(
     };
 
     const waitControl = (): Promise<ReceiverToSender> => {
-      const inner = controlMessages.length > 0
-        ? Promise.resolve(controlMessages.shift()!)
-        : new Promise<ReceiverToSender>((resolve) => {
-            controlResolve = () => {
-              controlResolve = null;
-              resolve(controlMessages.shift()!);
-            };
-          });
+      const inner =
+        controlMessages.length > 0
+          ? Promise.resolve(controlMessages.shift()!)
+          : new Promise<ReceiverToSender>((resolve) => {
+              controlResolve = () => {
+                controlResolve = null;
+                resolve(controlMessages.shift()!);
+              };
+            });
       return Promise.race([inner, disconnectPromise]);
     };
 
-    // Version handshake
     await sendControlMessage(connection.controlChannel, {
-      type: 'ConnRequest',
+      type: "ConnRequest",
       version: PROTO_VERSION,
     } as SenderToReceiver);
 
     const versionResp = await waitControl();
-    if (versionResp.type === 'WrongVersion') {
+    if (versionResp.type === "WrongVersion") {
       throw new Error(`Version mismatch: peer expects ${versionResp.expected}`);
     }
-    if (versionResp.type !== 'Ok') throw new Error('Unexpected response to version handshake');
+    if (versionResp.type !== "Ok")
+      throw new Error("Unexpected response to version handshake");
 
-    // Send file info
     await sendControlMessage(connection.controlChannel, {
-      type: 'FileInfo',
+      type: "FileInfo",
       files: fileTree,
     } as SenderToReceiver);
 
     callbacks.onWaitingAccept();
 
-    // Wait for accept/reject
     const acceptResp = await waitControl();
-    if (acceptResp.type === 'RejectFiles') throw new Error('Receiver rejected the files');
-    if (acceptResp.type !== 'AcceptFilesSkip') throw new Error('Unexpected response');
+    if (acceptResp.type === "RejectFiles")
+      throw new Error("Receiver rejected the files");
+    if (acceptResp.type !== "AcceptFilesSkip")
+      throw new Error("Unexpected response");
 
-    // Apply skip info
-    console.log('[sender] acceptResp skip:', JSON.stringify(acceptResp.files));
     const sendTrees: FileSendRecvTree[] = [];
     for (let i = 0; i < fileTree.length; i++) {
       const skip = acceptResp.files[i] ?? null;
@@ -138,12 +160,15 @@ export async function runSender(
     }
 
     const flatFiles = flattenTree(sendTrees);
-    console.log('[sender] flatFiles to send:', flatFiles.map(f => `${f.path} skip=${f.skip} size=${f.size}`));
     callbacks.onTransferring(
-      sendTrees.map((t) => ({ name: t.name, size: treeSize(t), skip: treeSkip(t), isDir: t.type === 'Dir' })),
+      sendTrees.map((t) => ({
+        name: t.name,
+        size: treeSize(t),
+        skip: treeSkip(t),
+        isDir: t.type === "Dir",
+      })),
     );
 
-    // Send file data
     const dc = connection.dataChannel;
     dc.bufferedAmountLowThreshold = MAX_BUFFERED / 2;
 
@@ -155,7 +180,6 @@ export async function runSender(
       while (sent < size) {
         if (abort.aborted) return;
 
-        // Backpressure
         if (dc.bufferedAmount > MAX_BUFFERED) {
           await Promise.race([
             new Promise<void>((resolve) => {
@@ -174,14 +198,12 @@ export async function runSender(
       }
     }
 
-    console.log('[sender] all data sent, waiting for receiver to close connection');
-    // Wait for the receiver to close the connection (confirming all data arrived)
+    // Wait for receiver to close, confirming all data was consumed.
     try {
       await disconnectPromise;
     } catch {
-      // Expected: receiver closed the connection
+      /* expected */
     }
-    console.log('[sender] receiver closed, calling onComplete');
     callbacks.onComplete();
   } catch (err: any) {
     if (!abort.aborted) {
@@ -193,11 +215,13 @@ export async function runSender(
   }
 }
 
-async function buildFileMap(entries: SelectedEntry[]): Promise<Map<string, File>> {
+async function buildFileMap(
+  entries: SelectedEntry[],
+): Promise<Map<string, File>> {
   const map = new Map<string, File>();
 
   for (const entry of entries) {
-    if (entry.kind === 'file') {
+    if (entry.kind === "file") {
       if (entry.handle) {
         const file = await (entry.handle as FileSystemFileHandle).getFile();
         map.set(entry.name, file);
@@ -229,11 +253,15 @@ async function collectFilesFromHandle(
 ): Promise<void> {
   for await (const [, childHandle] of handle.entries()) {
     const path = `${prefix}/${childHandle.name}`;
-    if (childHandle.kind === 'file') {
+    if (childHandle.kind === "file") {
       const file = await (childHandle as FileSystemFileHandle).getFile();
       map.set(path, file);
     } else {
-      await collectFilesFromHandle(childHandle as FileSystemDirectoryHandle, path, map);
+      await collectFilesFromHandle(
+        childHandle as FileSystemDirectoryHandle,
+        path,
+        map,
+      );
     }
   }
 }

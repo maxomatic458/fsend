@@ -20,20 +20,14 @@ use webrtc::peer_connection::RTCPeerConnection;
 
 use crate::transfer::{self, *};
 
-const CHUNK_SIZE: usize = 16384; // 16KB chunks for DataChannel messages
-
-// Fragment header: 0x00 = more fragments follow, 0x01 = last fragment.
+// Control channel messages are JSON+gzip, fragmented into 16 KB chunks with a
+// 1-byte header (0x00 = more, 0x01 = last).
+const CHUNK_SIZE: usize = 16384;
 const FRAG_MORE: u8 = 0x00;
 const FRAG_LAST: u8 = 0x01;
-// Max payload per DC message (leave 1 byte for the fragment header).
 const MAX_DC_PAYLOAD: usize = CHUNK_SIZE - 1;
 
-// --- Packet helpers over DataChannel (with fragmentation) ---
-
-async fn send_fragmented(
-    dc: &Arc<RTCDataChannel>,
-    data: &[u8],
-) -> Result<(), TransferError> {
+async fn send_fragmented(dc: &Arc<RTCDataChannel>, data: &[u8]) -> Result<(), TransferError> {
     for (i, chunk) in data.chunks(MAX_DC_PAYLOAD).enumerate() {
         let is_last = (i + 1) * MAX_DC_PAYLOAD >= data.len();
         let mut buf = Vec::with_capacity(1 + chunk.len());
@@ -46,9 +40,7 @@ async fn send_fragmented(
     Ok(())
 }
 
-async fn recv_fragmented(
-    rx: &Mutex<mpsc::Receiver<Vec<u8>>>,
-) -> Result<Vec<u8>, TransferError> {
+async fn recv_fragmented(rx: &Mutex<mpsc::Receiver<Vec<u8>>>) -> Result<Vec<u8>, TransferError> {
     let mut rx = rx.lock().await;
     let mut assembled = Vec::new();
     loop {
@@ -73,8 +65,8 @@ async fn send_packet<P: Serialize + std::fmt::Debug>(
     packet: &P,
 ) -> Result<(), TransferError> {
     tracing::debug!("webrtc sending packet: {:?}", packet);
-    let data = serde_json::to_vec(packet)
-        .map_err(|e| TransferError::WebRtc(format!("encode: {e}")))?;
+    let data =
+        serde_json::to_vec(packet).map_err(|e| TransferError::WebRtc(format!("encode: {e}")))?;
     let compressed = transfer::compress_gzip(&data).await?;
     send_fragmented(dc, &compressed).await
 }
@@ -89,8 +81,6 @@ async fn recv_packet<P: for<'de> Deserialize<'de> + std::fmt::Debug>(
     tracing::debug!("webrtc received packet: {:?}", packet);
     Ok(packet)
 }
-
-// --- WebRTC helpers ---
 
 fn rtc_config() -> RTCConfiguration {
     RTCConfiguration {
@@ -147,8 +137,6 @@ async fn get_local_sdp(pc: &Arc<RTCPeerConnection>) -> Result<String, TransferEr
         .ok_or_else(|| TransferError::WebRtc("no local description".into()))
 }
 
-// --- WebRtcTransfer ---
-
 pub struct WebRtcTransfer {
     pc: Arc<RTCPeerConnection>,
     control_dc: Option<Arc<RTCDataChannel>>,
@@ -156,12 +144,10 @@ pub struct WebRtcTransfer {
     control_rx: Mutex<mpsc::Receiver<Vec<u8>>>,
     data_rx: Mutex<mpsc::Receiver<Vec<u8>>>,
     connected: Arc<Notify>,
-    /// For the answerer: receives data channels from the offerer after connection.
     pending_dc_rx: Option<Mutex<mpsc::Receiver<Arc<RTCDataChannel>>>>,
 }
 
 impl WebRtcTransfer {
-    /// Create as the offerer (sender side). Returns (self, SDP offer).
     pub async fn create_offerer() -> Result<(Self, String), TransferError> {
         let pc = Arc::new(create_peer_connection().await?);
 
@@ -212,7 +198,6 @@ impl WebRtcTransfer {
         ))
     }
 
-    /// Set the remote SDP answer (sender side, after receiving from relay).
     pub async fn set_answer(&self, answer_sdp: &str) -> Result<(), TransferError> {
         let answer = RTCSessionDescription::answer(answer_sdp.to_string())
             .map_err(|e| TransferError::WebRtc(format!("parse answer: {e}")))?;
@@ -223,9 +208,6 @@ impl WebRtcTransfer {
         Ok(())
     }
 
-    /// Create as the answerer (receiver side). Returns (self, SDP answer).
-    /// Data channels are resolved lazily in `wait_connected` after the
-    /// answer SDP has been sent back to the offerer via the relay.
     pub async fn create_answerer(offer_sdp: &str) -> Result<(Self, String), TransferError> {
         let pc = Arc::new(create_peer_connection().await?);
 
@@ -239,7 +221,6 @@ impl WebRtcTransfer {
             Box::pin(async {})
         }));
 
-        // Collect data channels from the offerer (arrive after connection is up).
         let (dc_tx, dc_rx) = mpsc::channel::<Arc<RTCDataChannel>>(4);
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let tx = dc_tx.clone();
@@ -265,7 +246,6 @@ impl WebRtcTransfer {
         wait_ice_gathering_complete(&pc).await;
         let sdp = get_local_sdp(&pc).await?;
 
-        // Placeholder channels — real ones arrive in wait_connected().
         let (_ctrl_tx, control_rx) = mpsc::channel(1);
         let (_data_tx, data_rx) = mpsc::channel(1);
 
@@ -283,14 +263,11 @@ impl WebRtcTransfer {
         ))
     }
 
-    /// Wait for the peer connection to reach the Connected state.
-    /// For the answerer, this also resolves the pending data channels.
     pub async fn wait_connected(&mut self) -> Result<(), TransferError> {
         if self.pc.connection_state() != RTCPeerConnectionState::Connected {
             self.connected.notified().await;
         }
 
-        // Resolve pending data channels (answerer side).
         if let Some(pending) = self.pending_dc_rx.take() {
             let mut dc_rx = pending.into_inner();
             let dc1 = dc_rx
@@ -321,11 +298,15 @@ impl WebRtcTransfer {
     }
 
     fn control_dc(&self) -> &Arc<RTCDataChannel> {
-        self.control_dc.as_ref().expect("data channels not resolved; call wait_connected first")
+        self.control_dc
+            .as_ref()
+            .expect("data channels not resolved; call wait_connected first")
     }
 
     fn data_dc(&self) -> &Arc<RTCDataChannel> {
-        self.data_dc.as_ref().expect("data channels not resolved; call wait_connected first")
+        self.data_dc
+            .as_ref()
+            .expect("data channels not resolved; call wait_connected first")
     }
 
     async fn send_file_data(
@@ -454,7 +435,6 @@ impl Transfer for WebRtcTransfer {
         waiting_cb: WaitingCb<'_>,
         write_cb: DataCb<'_>,
     ) -> Result<(), TransferError> {
-        // Version handshake via control channel
         send_packet(
             self.control_dc(),
             &SenderToReceiver::ConnRequest {
@@ -471,7 +451,6 @@ impl Transfer for WebRtcTransfer {
             _ => return Err(TransferError::UnexpectedPacket),
         }
 
-        // Build file info
         let mut files_available = Vec::new();
         for path in &args.files {
             if !path.exists() {
@@ -519,7 +498,6 @@ impl Transfer for WebRtcTransfer {
 
         initial_progress_cb(&progress);
 
-        // Stream file data via the data channel
         for (path, file) in args.files.iter().zip(to_send) {
             if let Some(file) = file {
                 match file {
@@ -533,6 +511,15 @@ impl Transfer for WebRtcTransfer {
             }
         }
 
+        // Wait for receiver to close.
+        let closed = Arc::new(Notify::new());
+        let closed_clone = closed.clone();
+        self.data_dc().on_close(Box::new(move || {
+            closed_clone.notify_one();
+            Box::pin(async {})
+        }));
+        closed.notified().await;
+
         Ok(())
     }
 
@@ -543,7 +530,6 @@ impl Transfer for WebRtcTransfer {
         accept_files_cb: AcceptFilesCb<'_>,
         read_cb: DataCb<'_>,
     ) -> Result<(), TransferError> {
-        // Version handshake
         match recv_packet::<SenderToReceiver>(&self.control_rx).await? {
             SenderToReceiver::ConnRequest { version } => {
                 if version != PROTO_VERSION {
@@ -619,7 +605,6 @@ impl Transfer for WebRtcTransfer {
         )
         .await?;
 
-        // Receive file data from the data channel
         for file in to_receive.into_iter().flatten() {
             match file {
                 FileSendRecvTree::File { name, skip, size } => {

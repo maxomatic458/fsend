@@ -1,7 +1,7 @@
-import { CHUNK_SIZE, MAX_DC_PAYLOAD, FRAG_MORE, FRAG_LAST } from '../config';
+import { CHUNK_SIZE, MAX_DC_PAYLOAD, FRAG_MORE, FRAG_LAST } from "../config";
 
 export async function compressGzip(data: Uint8Array): Promise<Uint8Array> {
-  const cs = new CompressionStream('gzip');
+  const cs = new CompressionStream("gzip");
   const writer = cs.writable.getWriter();
   writer.write(data as any);
   writer.close();
@@ -17,7 +17,7 @@ export async function compressGzip(data: Uint8Array): Promise<Uint8Array> {
 }
 
 export async function decompressGzip(data: Uint8Array): Promise<Uint8Array> {
-  const ds = new DecompressionStream('gzip');
+  const ds = new DecompressionStream("gzip");
   const writer = ds.writable.getWriter();
   writer.write(data as any);
   writer.close();

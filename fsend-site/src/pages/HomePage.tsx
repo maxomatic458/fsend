@@ -1,8 +1,8 @@
-import { createSignal, Show } from 'solid-js';
-import { A, useNavigate } from '@solidjs/router';
-import { FiUpload, FiDownload } from 'solid-icons/fi';
-import { handleDrop } from '../lib/filePicker';
-import { supportsFileSystemAccess } from '../lib/fsAccess';
+import { createSignal, Show } from "solid-js";
+import { A, useNavigate } from "@solidjs/router";
+import { FiUpload, FiDownload } from "solid-icons/fi";
+import { handleDrop } from "../lib/filePicker";
+import { supportsFileSystemAccess } from "../lib/fsAccess";
 
 export function HomePage() {
   const navigate = useNavigate();
@@ -37,7 +37,7 @@ export function HomePage() {
       const entries = await handleDrop(e.dataTransfer);
       if (entries.length > 0) {
         (window as any).__fsend_pending = entries;
-        navigate('/send');
+        navigate("/send");
       }
     } finally {
       setIsProcessing(false);
@@ -56,14 +56,18 @@ export function HomePage() {
         <div class="absolute inset-0 bg-indigo-100/80 dark:bg-neutral-900/80 flex items-center justify-center z-10">
           <div class="flex flex-col items-center">
             <div class="animate-spin w-16 h-16 border-4 border-gray-300 border-t-blue-500 rounded-full" />
-            <p class="mt-4 text-gray-600 dark:text-gray-400 font-medium">Processing files...</p>
+            <p class="mt-4 text-gray-600 dark:text-gray-400 font-medium">
+              Processing files...
+            </p>
           </div>
         </div>
       </Show>
 
       <div class="max-w-lg w-full">
         <div class="text-center mb-12">
-          <h1 class="text-5xl font-bold text-gray-800 dark:text-gray-100 mb-4">fsend</h1>
+          <h1 class="text-5xl font-bold text-gray-800 dark:text-gray-100 mb-4">
+            fsend
+          </h1>
           <p class="text-sm text-gray-500 dark:text-neutral-400 mt-2 mb-6">
             Direct peer-to-peer transfers in your browser using WebRTC
           </p>
@@ -74,8 +78,8 @@ export function HomePage() {
 
         <Show when={!supportsFileSystemAccess()}>
           <div class="bg-yellow-100 dark:bg-yellow-900/40 text-yellow-800 dark:text-yellow-200 border border-yellow-300 dark:border-yellow-700 px-3 py-2 rounded-lg text-sm font-medium mb-6">
-            Your browser has limited support. Folders will be downloaded as zip files and transfer
-            resumption won't be available when receiving.
+            Your browser has limited support. Folders will be downloaded as zip
+            files and transfer resumption won't be available when receiving.
           </div>
         </Show>
 
@@ -87,12 +91,12 @@ export function HomePage() {
             <span
               class={`block box-border border-2 border-orange-900 dark:border-orange-700 rounded-xl py-3 px-6 bg-orange-100 text-orange-900 transition-all duration-150 dark:bg-orange-900/80 dark:text-orange-100 text-center ${
                 isDragging()
-                  ? 'bg-orange-200 -translate-y-0.5 dark:bg-orange-800/80'
-                  : 'group-hover:bg-orange-200 group-hover:-translate-y-0.5 dark:group-hover:bg-orange-800/80'
+                  ? "bg-orange-200 -translate-y-0.5 dark:bg-orange-800/80"
+                  : "group-hover:bg-orange-200 group-hover:-translate-y-0.5 dark:group-hover:bg-orange-800/80"
               }`}
             >
               <FiUpload class="inline-block w-5 h-5 mr-2 -mt-1" />
-              {isDragging() ? 'Drop to Send' : 'Send Files'}
+              {isDragging() ? "Drop to Send" : "Send Files"}
             </span>
           </A>
 

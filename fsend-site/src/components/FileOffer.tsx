@@ -1,9 +1,9 @@
-import { For } from 'solid-js';
-import { FiFolder, FiFile } from 'solid-icons/fi';
-import { formatBytes } from '../lib/format';
-import { totalSize, entrySize } from '../lib/fileTree';
-import type { FilesAvailable } from '../lib/types';
-import { Button } from './Button';
+import { For } from "solid-js";
+import { FiFolder, FiFile } from "solid-icons/fi";
+import { formatBytes } from "../lib/format";
+import { totalSize, entrySize } from "../lib/fileTree";
+import type { FilesAvailable } from "../lib/types";
+import { Button } from "./Button";
 
 interface FileOfferProps {
   files: FilesAvailable[];
@@ -26,7 +26,7 @@ export function FileOffer(props: FileOfferProps) {
           {(entry) => (
             <div class="flex items-center justify-between py-3 px-4">
               <div class="flex items-center gap-3">
-                {entry.type === 'Dir' ? (
+                {entry.type === "Dir" ? (
                   <FiFolder class="w-6 h-6 text-gray-500 dark:text-gray-400" />
                 ) : (
                   <FiFile class="w-6 h-6 text-gray-500 dark:text-gray-400" />
