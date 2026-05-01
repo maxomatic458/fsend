@@ -32,7 +32,7 @@ export function TransferProgress(props: TransferProgressProps) {
         </div>
         <div class="w-full bg-gray-200 dark:bg-neutral-700 rounded-full h-4">
           <div
-            class="bg-blue-600 h-4 rounded-full transition-all duration-300"
+            class="bg-blue-600 h-4 rounded-full"
             style={{ width: `${pct()}%` }}
           />
         </div>
@@ -92,7 +92,7 @@ export function TransferProgress(props: TransferProgressProps) {
                 </div>
                 <div class="w-full bg-gray-200 dark:bg-neutral-700 rounded-full h-2">
                   <div
-                    class={`h-2 rounded-full transition-all duration-300 ${
+                    class={`h-2 rounded-full ${
                       isComplete() ? "bg-green-500" : "bg-blue-400"
                     }`}
                     style={{ width: `${entryPct()}%` }}

@@ -33,13 +33,6 @@ export function Layout(props: { children: JSX.Element }) {
               <FiGithub class="w-4 h-4" />
               GitHub
             </a>
-            <a
-              href="mailto:contact@fsend.sh"
-              class="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100 transition text-sm flex items-center gap-1"
-            >
-              <FiMail class="w-4 h-4" />
-              Contact
-            </a>
           </div>
         </div>
       </footer>
