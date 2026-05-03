@@ -14,7 +14,7 @@ use self::iroh::IrohTransfer;
 use relay::{ConnectionInfo, Protocol, RelayClient};
 use transfer::{FilesAvailable, ReceiveArgs, SendArgs, Transfer};
 
-const DEFAULT_RELAY_URL: &str = "ws://127.0.0.1:3001/ws";
+const DEFAULT_RELAY_URL: &str = "ws://relay.fsend.sh/ws";
 
 #[derive(Parser)]
 struct Args {
