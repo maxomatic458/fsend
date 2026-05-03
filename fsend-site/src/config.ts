@@ -1,5 +1,5 @@
 export const RELAY_URL =
-  import.meta.env.VITE_RELAY_URL ?? "ws://relay.fsend.sh/ws";
+  import.meta.env.VITE_RELAY_URL ?? "wss://relay.fsend.sh/ws";
 
 export const STUN_SERVERS = [
   "stun:stun.l.google.com:19302",
