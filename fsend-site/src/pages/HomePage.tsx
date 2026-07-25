@@ -1,5 +1,6 @@
 import { createSignal, Show } from "solid-js";
 import { A, useNavigate } from "@solidjs/router";
+import { Title, Meta, Link } from "@solidjs/meta";
 import { FiUpload, FiDownload } from "solid-icons/fi";
 import { handleDrop } from "../lib/filePicker";
 import { supportsFileSystemAccess } from "../lib/fsAccess";
@@ -52,6 +53,13 @@ export function HomePage() {
       onDragOver={onDragOver}
       onDrop={onDrop}
     >
+      <Title>fsend — Free P2P File Transfer in Your Browser</Title>
+      <Meta
+        name="description"
+        content="Send files of any size directly between devices, peer-to-peer over WebRTC. End-to-end encrypted, no uploads, no accounts, no size limits. Free and open source."
+      />
+      <Link rel="canonical" href="https://fsend.sh/" />
+
       <Show when={isProcessing()}>
         <div class="absolute inset-0 bg-indigo-100/80 dark:bg-neutral-900/80 flex items-center justify-center z-10">
           <div class="flex flex-col items-center">
@@ -95,7 +103,7 @@ export function HomePage() {
                   : "group-hover:bg-orange-200 group-hover:-translate-y-0.5 dark:group-hover:bg-orange-800/80"
               }`}
             >
-              <FiUpload class="inline-block w-5 h-5 mr-2 -mt-1" />
+              <FiUpload class="inline-block w-5 h-5 mr-2 -mt-1" aria-hidden="true" />
               {isDragging() ? "Drop to Send" : "Send Files"}
             </span>
           </A>
@@ -105,11 +113,20 @@ export function HomePage() {
             class="bg-blue-950 dark:bg-blue-900 rounded-xl border-none cursor-pointer font-bold text-lg group"
           >
             <span class="block box-border border-2 border-blue-900 dark:border-blue-700 rounded-xl py-3 px-6 bg-blue-100 text-blue-900 transition-all duration-150 group-hover:bg-blue-200 group-hover:-translate-y-0.5 dark:bg-blue-900/80 dark:text-blue-100 dark:group-hover:bg-blue-800/80 text-center">
-              <FiDownload class="inline-block w-5 h-5 mr-2 -mt-1" />
+              <FiDownload class="inline-block w-5 h-5 mr-2 -mt-1" aria-hidden="true" />
               Receive Files
             </span>
           </A>
         </div>
+
+        <p class="text-center text-sm mt-8">
+          <A
+            href="/about"
+            class="text-indigo-600 dark:text-indigo-400 hover:underline"
+          >
+            How it works
+          </A>
+        </p>
       </div>
     </div>
   );

@@ -20,6 +20,7 @@
     "vite-plugin-solid": "^2.11.8"
   },
   "dependencies": {
+    "@solidjs/meta": "^0.29.4",
     "@solidjs/router": "^0.16.1",
     "jszip": "^3.10.1",
     "qrcode-generator": "^2.0.4",

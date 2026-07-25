@@ -1,5 +1,6 @@
 import { createSignal, onCleanup, onMount, Show } from "solid-js";
 import { useNavigate } from "@solidjs/router";
+import { Title, Meta, Link } from "@solidjs/meta";
 import { FiArrowLeft, FiSend, FiFile, FiFolder, FiPlus } from "solid-icons/fi";
 import type { SelectedEntry } from "../lib/types";
 import { pickFiles, pickDirectory, handleDrop } from "../lib/filePicker";
@@ -178,6 +179,13 @@ export function SendPage() {
       onDragOver={onDragOver}
       onDrop={onDrop}
     >
+      <Title>Send Files — fsend</Title>
+      <Meta
+        name="description"
+        content="Drag and drop files or folders to send them directly to another device. No uploads to a server — the transfer is peer-to-peer over WebRTC, end-to-end encrypted."
+      />
+      <Link rel="canonical" href="https://fsend.sh/send" />
+
       {/* Full-page drag overlay */}
       <div
         class={`absolute inset-4 border-2 border-dashed rounded-xl z-10 flex items-center justify-center pointer-events-none transition-all duration-200 ${

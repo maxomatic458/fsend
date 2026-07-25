@@ -1,5 +1,6 @@
 import { createSignal, onCleanup, onMount, Show } from "solid-js";
 import { useNavigate, useParams } from "@solidjs/router";
+import { Title, Meta, Link } from "@solidjs/meta";
 import { FiArrowLeft, FiDownload, FiFolder, FiLink } from "solid-icons/fi";
 import type { FilesAvailable } from "../lib/types";
 import { supportsFileSystemAccess } from "../lib/fsAccess";
@@ -146,6 +147,13 @@ export function ReceivePage() {
 
   return (
     <div class="flex-1 bg-indigo-100 dark:bg-neutral-900 py-8 px-4 transition-colors">
+      <Title>Receive Files — fsend</Title>
+      <Meta
+        name="description"
+        content="Enter a session code to receive files directly from the sender's device over an encrypted peer-to-peer WebRTC connection. No accounts, no size limits."
+      />
+      <Link rel="canonical" href="https://fsend.sh/receive" />
+
       <div class="max-w-2xl mx-auto">
         {/* Page header */}
         <button

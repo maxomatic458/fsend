@@ -3,6 +3,7 @@ import { Layout } from "./components/Layout";
 import { HomePage } from "./pages/HomePage";
 import { SendPage } from "./pages/SendPage";
 import { ReceivePage } from "./pages/ReceivePage";
+import { AboutPage } from "./pages/AboutPage";
 
 export default function App() {
   return (
@@ -36,6 +37,14 @@ export default function App() {
         component={() => (
           <Layout>
             <ReceivePage />
+          </Layout>
+        )}
+      />
+      <Route
+        path="/about"
+        component={() => (
+          <Layout>
+            <AboutPage />
           </Layout>
         )}
       />

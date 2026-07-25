@@ -20,10 +20,16 @@ export function Layout(props: { children: JSX.Element }) {
 
       <footer class="bg-indigo-200 dark:bg-neutral-800 border-t border-indigo-300 dark:border-neutral-700 py-6 px-4 transition-colors">
         <div class="max-w-4xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-4">
-          <div class="text-sm text-gray-600 dark:text-gray-400">
-            fsend - Peer-to-peer file sharing
-          </div>
+          <p class="text-sm text-gray-600 dark:text-gray-400">
+            fsend — Peer-to-peer file sharing
+          </p>
           <div class="flex items-center gap-6">
+            <A
+              href="/about"
+              class="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100 transition text-sm"
+            >
+              About
+            </A>
             <a
               href="https://github.com/maxomatic458/fsend"
               target="_blank"
