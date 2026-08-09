@@ -1,6 +1,7 @@
 import { createSignal, onCleanup, onMount, Show } from "solid-js";
 import { useNavigate, useParams } from "@solidjs/router";
 import { Title, Meta, Link } from "@solidjs/meta";
+import { SITE_URL } from "../lib/links";
 import { FiArrowLeft, FiDownload, FiFolder, FiLink } from "solid-icons/fi";
 import type { FilesAvailable } from "../lib/types";
 import { supportsFileSystemAccess } from "../lib/fsAccess";
@@ -8,6 +9,8 @@ import { pickSaveDirectory } from "../lib/filePicker";
 import { runReceiver } from "../lib/receiver";
 import { runFallbackReceiver } from "../lib/fallbackReceiver";
 import { createProgressTracker } from "../primitives/createProgressTracker";
+import { createWindowDropTarget } from "../primitives/createWindowDropTarget";
+import { createExitGuard } from "../primitives/createExitGuard";
 import { FileOffer } from "../components/FileOffer";
 import { TransferProgress } from "../components/TransferProgress";
 import { ErrorCard } from "../components/ErrorCard";
@@ -135,10 +138,20 @@ export function ReceivePage() {
     rejectFn()?.();
   };
 
+  createWindowDropTarget(() => {});
+
+  const leaveWithoutPrompt = createExitGuard(
+    () => state() === "transferring",
+    "A download is still running. Leaving now will cancel it. Leave anyway?",
+  );
+
   const goBack = () => {
     abortController.abort();
     navigate("/");
   };
+
+  // The user clicked Cancel — they already know, so don't ask again.
+  const cancelTransfer = () => leaveWithoutPrompt(goBack);
 
   const handleTryAgain = () => {
     setError("");
@@ -146,30 +159,30 @@ export function ReceivePage() {
   };
 
   return (
-    <div class="flex-1 bg-indigo-100 dark:bg-neutral-900 py-8 px-4 transition-colors">
+    <div class="flex-1 bg-canvas py-8 px-4">
       <Title>Receive Files — fsend</Title>
       <Meta
         name="description"
         content="Enter a session code to receive files directly from the sender's device over an encrypted peer-to-peer WebRTC connection. No accounts, no size limits."
       />
-      <Link rel="canonical" href="https://fsend.sh/receive" />
+      <Link rel="canonical" href={`${SITE_URL}/receive`} />
 
       <div class="max-w-2xl mx-auto">
         {/* Page header */}
         <button
           onClick={goBack}
-          class="mb-6 text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 flex items-center gap-2 transition-colors cursor-pointer"
+          class="mb-6 text-azure hover:text-azure-hi flex items-center gap-2 transition-colors cursor-pointer"
         >
           <FiArrowLeft class="w-4 h-4" /> Back
         </button>
-        <h1 class="text-3xl font-bold text-gray-800 dark:text-gray-100 mb-8">
+        <h1 class="text-3xl font-bold text-ink mb-8">
           Receive Files
         </h1>
 
         {/* State: input */}
         <Show when={state() === "input"}>
           <Show when={!hasNativeFS}>
-            <div class="bg-yellow-100 dark:bg-yellow-900/40 text-yellow-800 dark:text-yellow-200 border border-yellow-300 dark:border-yellow-700 px-3 py-2 rounded-lg text-sm font-medium mb-4">
+            <div class="bg-warn-bg text-warn-ink border border-warn-line px-3 py-2 rounded-lg text-sm font-medium mb-4">
               Your browser doesn't support the File System Access API. Files
               will be downloaded as a zip archive. Transfer resumption won't be
               available.
@@ -177,12 +190,12 @@ export function ReceivePage() {
           </Show>
 
           <Card class="mb-6">
-            <h2 class="text-xl font-semibold mb-4 text-gray-800 dark:text-gray-100">
+            <h2 class="text-xl font-semibold mb-4 text-ink">
               Enter Share Code
             </h2>
 
             <div class="mb-6">
-              <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+              <label class="block text-sm font-medium text-ink-muted mb-2">
                 Code from sender
               </label>
               <input
@@ -190,18 +203,18 @@ export function ReceivePage() {
                 value={code()}
                 onInput={(e) => setCode(formatCode(e.currentTarget.value))}
                 placeholder="ABCD1234"
-                class="w-full p-4 border dark:border-neutral-600 rounded-lg text-2xl font-mono text-center tracking-widest uppercase bg-white dark:bg-neutral-700 text-gray-800 dark:text-gray-100"
+                class="w-full p-4 border border-line rounded-lg text-2xl font-mono text-center tracking-widest uppercase bg-surface-2 text-ink"
                 maxLength={8}
               />
             </div>
 
             <Show when={hasNativeFS}>
               <div class="mb-6">
-                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                <label class="block text-sm font-medium text-ink-muted mb-2">
                   Download Location
                 </label>
                 <div class="flex gap-2">
-                  <div class="flex-1 p-3 border dark:border-neutral-600 rounded-lg bg-gray-50 dark:bg-neutral-700 text-gray-800 dark:text-gray-200">
+                  <div class="flex-1 p-3 border border-line rounded-lg bg-surface-2 text-ink">
                     {dirHandle() ? dirHandle()!.name : "No directory selected"}
                   </div>
                   <Button variant="blue" onClick={selectSaveDir}>
@@ -212,7 +225,7 @@ export function ReceivePage() {
                   </Button>
                 </div>
 
-                <label class="flex items-center gap-2 mt-3 text-sm text-gray-500 dark:text-neutral-400">
+                <label class="flex items-center gap-2 mt-3 text-sm text-ink-dim">
                   <input
                     type="checkbox"
                     checked={resume()}
@@ -225,7 +238,7 @@ export function ReceivePage() {
             </Show>
 
             <Show when={!hasNativeFS}>
-              <div class="mb-6 p-3 bg-gray-50 dark:bg-neutral-700 rounded-lg text-gray-600 dark:text-gray-300 text-sm">
+              <div class="mb-6 p-3 bg-surface-2 rounded-lg text-ink-muted text-sm">
                 <FiDownload class="w-4 h-4 inline-block mr-2" />
                 Files will be automatically downloaded to your Downloads folder
               </div>
@@ -251,9 +264,9 @@ export function ReceivePage() {
         <Show when={state() === "connecting"}>
           <Card class="text-center">
             <div class="flex justify-center mb-4">
-              <div class="animate-spin w-12 h-12 border-4 border-gray-300 border-t-blue-500 rounded-full" />
+              <div class="animate-spin w-12 h-12 border-4 border-line border-t-azure rounded-full" />
             </div>
-            <p class="text-gray-600 dark:text-gray-400 mb-4">
+            <p class="text-ink-muted mb-4">
               Connecting to sender...
             </p>
             <Button variant="gray" onClick={goBack}>
@@ -266,9 +279,9 @@ export function ReceivePage() {
         <Show when={state() === "handshaking"}>
           <Card class="text-center">
             <div class="flex justify-center mb-4">
-              <div class="animate-spin w-12 h-12 border-4 border-gray-300 border-t-blue-500 rounded-full" />
+              <div class="animate-spin w-12 h-12 border-4 border-line border-t-azure rounded-full" />
             </div>
-            <p class="text-gray-600 dark:text-gray-400">
+            <p class="text-ink-muted">
               Establishing connection...
             </p>
           </Card>
@@ -288,7 +301,7 @@ export function ReceivePage() {
         {/* State: transferring / completed */}
         <Show when={state() === "transferring" || state() === "completed"}>
           <Show when={!hasNativeFS}>
-            <div class="bg-yellow-100 dark:bg-yellow-900/40 text-yellow-800 dark:text-yellow-200 border border-yellow-300 dark:border-yellow-700 px-3 py-2 rounded-lg text-sm font-medium mb-4">
+            <div class="bg-warn-bg text-warn-ink border border-warn-line px-3 py-2 rounded-lg text-sm font-medium mb-4">
               Your browser does not support the Native Filesystem API. The
               entire download ({formatBytes(tracker.progress.totalSize)}) needs
               to be saved to memory first. Ensure you have enough free system
@@ -325,15 +338,15 @@ export function ReceivePage() {
             <Show when={state() === "transferring"}>
               <div class="mt-6 text-center">
                 <Show when={hasNativeFS}>
-                  <p class="text-sm text-gray-500 dark:text-gray-400 mb-3">
+                  <p class="text-sm text-ink-dim mb-3">
                     Canceling will save progress and allow resuming later
                   </p>
-                  <Button variant="red" onClick={goBack}>
+                  <Button variant="red" onClick={cancelTransfer}>
                     Cancel Transfer
                   </Button>
                 </Show>
                 <Show when={!hasNativeFS}>
-                  <p class="text-sm text-gray-500 dark:text-gray-400">
+                  <p class="text-sm text-ink-dim">
                     Please keep this page open until the transfer completes
                   </p>
                 </Show>
@@ -346,12 +359,12 @@ export function ReceivePage() {
                   All files received successfully!
                 </p>
                 <Show when={hasNativeFS && dirHandle()}>
-                  <p class="text-gray-600 dark:text-gray-400 mb-4">
+                  <p class="text-ink-muted mb-4">
                     Files saved to: {dirHandle()?.name}
                   </p>
                 </Show>
                 <Show when={!hasNativeFS}>
-                  <p class="text-gray-600 dark:text-gray-400 mb-4">
+                  <p class="text-ink-muted mb-4">
                     Files downloaded to your Downloads folder
                   </p>
                 </Show>

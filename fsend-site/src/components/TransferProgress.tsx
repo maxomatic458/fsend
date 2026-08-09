@@ -22,34 +22,34 @@ export function TransferProgress(props: TransferProgressProps) {
     <div class="w-full">
       <div class="mb-6">
         <div class="flex justify-between items-center mb-2">
-          <span class="text-lg font-semibold text-gray-800 dark:text-gray-100">
+          <span class="text-lg font-semibold text-ink">
             Overall Progress
           </span>
-          <span class="text-sm text-gray-600 dark:text-gray-400">
+          <span class="text-sm text-ink-muted">
             {formatBytes(props.progress.totalTransferred)} /{" "}
             {formatBytes(props.progress.totalSize)}
           </span>
         </div>
-        <div class="w-full bg-gray-200 dark:bg-neutral-700 rounded-full h-4">
+        <div class="w-full bg-track rounded-full h-4">
           <div
-            class="bg-blue-600 h-4 rounded-full"
+            class="bg-azure h-4 rounded-full"
             style={{ width: `${pct()}%` }}
           />
         </div>
         <div class="flex justify-between items-center mt-2">
-          <div class="text-2xl font-bold text-blue-600 dark:text-blue-400">
+          <div class="text-2xl font-bold text-azure">
             {Math.round(pct())}%
           </div>
           <Show when={props.progress.speed > 0}>
             <div class="text-right">
-              <div class="text-sm font-medium text-gray-700 dark:text-gray-300">
+              <div class="text-sm font-medium text-ink-muted">
                 {props.speedLabel ?? "Speed"}:{" "}
                 {formatSpeed(props.progress.speed)}
               </div>
               <Show
                 when={props.progress.eta > 0 && props.progress.eta < Infinity}
               >
-                <div class="text-sm text-gray-500 dark:text-gray-400">
+                <div class="text-sm text-ink-dim">
                   ETA: {formatTime(props.progress.eta)}
                 </div>
               </Show>
@@ -59,12 +59,12 @@ export function TransferProgress(props: TransferProgressProps) {
       </div>
 
       <Show when={props.status}>
-        <div class="text-center mb-4 text-gray-600 dark:text-gray-400 capitalize">
+        <div class="text-center mb-4 text-ink-muted capitalize">
           {props.status}
         </div>
       </Show>
 
-      <div class="border dark:border-neutral-700 rounded-lg p-4 max-h-80 overflow-y-auto space-y-4">
+      <div class="border border-line rounded-lg p-4 max-h-80 overflow-y-auto space-y-4">
         <For each={props.progress.entries}>
           {(entry) => {
             const entryPct = () =>
@@ -78,22 +78,22 @@ export function TransferProgress(props: TransferProgressProps) {
                 <div class="flex items-center justify-between">
                   <div class="flex items-center gap-2">
                     {entry.isDir ? (
-                      <FiFolder class="w-5 h-5 text-gray-500 dark:text-gray-400" />
+                      <FiFolder class="w-5 h-5 text-ink-dim" />
                     ) : (
-                      <FiFile class="w-5 h-5 text-gray-500 dark:text-gray-400" />
+                      <FiFile class="w-5 h-5 text-ink-dim" />
                     )}
-                    <span class="font-medium truncate max-w-xs text-gray-800 dark:text-gray-100">
+                    <span class="font-medium truncate max-w-xs text-ink">
                       {entry.name}
                     </span>
                   </div>
-                  <span class="text-sm text-gray-600 dark:text-gray-400">
+                  <span class="text-sm text-ink-muted">
                     {formatBytes(entry.transferred)} / {formatBytes(entry.size)}
                   </span>
                 </div>
-                <div class="w-full bg-gray-200 dark:bg-neutral-700 rounded-full h-2">
+                <div class="w-full bg-track rounded-full h-2">
                   <div
                     class={`h-2 rounded-full ${
-                      isComplete() ? "bg-green-500" : "bg-blue-400"
+                      isComplete() ? "bg-green-500" : "bg-azure"
                     }`}
                     style={{ width: `${entryPct()}%` }}
                   />

@@ -1,11 +1,14 @@
 import { createSignal, onCleanup, onMount, Show } from "solid-js";
 import { useNavigate } from "@solidjs/router";
 import { Title, Meta, Link } from "@solidjs/meta";
-import { FiArrowLeft, FiSend, FiFile, FiFolder, FiPlus } from "solid-icons/fi";
+import { SITE_URL } from "../lib/links";
+import { FiArrowLeft, FiSend, FiFile, FiFolder } from "solid-icons/fi";
 import type { SelectedEntry } from "../lib/types";
 import { pickFiles, pickDirectory, handleDrop } from "../lib/filePicker";
 import { runSender } from "../lib/sender";
 import { createProgressTracker } from "../primitives/createProgressTracker";
+import { createWindowDropTarget } from "../primitives/createWindowDropTarget";
+import { createExitGuard } from "../primitives/createExitGuard";
 import { SESSION_EXPIRY_SEC } from "../config";
 import { FileList } from "../components/FileList";
 import { ShareCode } from "../components/ShareCode";
@@ -38,9 +41,7 @@ export function SendPage() {
   const [connectionType, setConnectionType] = createSignal<string>("unknown");
   const [fileTotalSize, setFileTotalSize] = createSignal(0);
   const [startTime, setStartTime] = createSignal(0);
-  const [isDragging, setIsDragging] = createSignal(false);
   const [isProcessing, setIsProcessing] = createSignal(false);
-  let dragCounter = 0;
 
   const abortController = new AbortController();
 
@@ -91,38 +92,23 @@ export function SendPage() {
     } catch {}
   };
 
-  // Drag-and-drop handlers for the full page
-  const onDragEnter = (e: DragEvent) => {
-    e.preventDefault();
+  // Drag-and-drop across the window
+  const dragActive = createWindowDropTarget(async (data) => {
     if (state() !== "selecting") return;
-    dragCounter++;
-    setIsDragging(true);
-  };
-
-  const onDragLeave = (e: DragEvent) => {
-    e.preventDefault();
-    dragCounter--;
-    if (dragCounter <= 0) {
-      dragCounter = 0;
-      setIsDragging(false);
-    }
-  };
-
-  const onDragOver = (e: DragEvent) => e.preventDefault();
-
-  const onDrop = async (e: DragEvent) => {
-    e.preventDefault();
-    dragCounter = 0;
-    setIsDragging(false);
-    if (state() !== "selecting" || !e.dataTransfer) return;
     setIsProcessing(true);
     try {
-      const dropped = await handleDrop(e.dataTransfer);
+      const dropped = await handleDrop(data);
       if (dropped.length > 0) addFiles(dropped);
     } finally {
       setIsProcessing(false);
     }
-  };
+  });
+  const isDragging = () => dragActive() && state() === "selecting";
+
+  createExitGuard(
+    () => state() === "transferring",
+    "A transfer is still running. Leaving now will cancel it. Leave anyway?",
+  );
 
   const startSending = () => {
     if (entries().length === 0) return;
@@ -172,54 +158,30 @@ export function SendPage() {
   const elapsed = () => Math.floor((Date.now() - startTime()) / 1000);
 
   return (
-    <div
-      class="flex-1 bg-indigo-100 dark:bg-neutral-900 py-8 px-4 transition-colors relative"
-      onDragEnter={onDragEnter}
-      onDragLeave={onDragLeave}
-      onDragOver={onDragOver}
-      onDrop={onDrop}
-    >
+    <div class="flex-1 bg-canvas py-8 px-4 relative">
       <Title>Send Files — fsend</Title>
       <Meta
         name="description"
         content="Drag and drop files or folders to send them directly to another device. No uploads to a server — the transfer is peer-to-peer over WebRTC, end-to-end encrypted."
       />
-      <Link rel="canonical" href="https://fsend.sh/send" />
-
-      {/* Full-page drag overlay */}
-      <div
-        class={`absolute inset-4 border-2 border-dashed rounded-xl z-10 flex items-center justify-center pointer-events-none transition-all duration-200 ${
-          isDragging()
-            ? "opacity-100 bg-blue-500/50 dark:bg-blue-500/10 border-blue-400/50 dark:border-blue-400/40"
-            : "opacity-0 bg-transparent border-transparent"
-        }`}
-      >
-        <div
-          class={`text-center text-blue-500/70 dark:text-blue-400/70 transition-opacity duration-200 ${
-            isDragging() ? "opacity-100" : "opacity-0"
-          }`}
-        >
-          <FiPlus class="w-12 h-12 mx-auto mb-3" />
-          <div class="text-xl font-medium">Drop files or folders here</div>
-        </div>
-      </div>
+      <Link rel="canonical" href={`${SITE_URL}/send`} />
 
       <div class="max-w-2xl mx-auto relative z-0">
         {/* Page header */}
         <button
           onClick={goBack}
-          class="mb-6 text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 flex items-center gap-2 transition-colors cursor-pointer"
+          class="mb-6 text-azure hover:text-azure-hi flex items-center gap-2 transition-colors cursor-pointer"
         >
           <FiArrowLeft class="w-4 h-4" /> Back
         </button>
-        <h1 class="text-3xl font-bold text-gray-800 dark:text-gray-100 mb-8">
+        <h1 class="text-3xl font-bold text-ink mb-8">
           Send Files
         </h1>
 
         {/* State: selecting */}
         <Show when={state() === "selecting"}>
           <Card class="mb-6">
-            <h2 class="text-xl font-semibold mb-4 text-gray-800 dark:text-gray-100">
+            <h2 class="text-xl font-semibold mb-4 text-ink">
               Select Files or Directories
             </h2>
 
@@ -229,23 +191,34 @@ export function SendPage() {
                 onRemove={removeEntry}
                 totalSize={fileTotalSize()}
               />
-              <hr class="border-gray-200 dark:border-neutral-700 mb-6" />
+              <hr class="border-line mb-6" />
             </Show>
 
-            {/* Drag-drop zone inside the card */}
-            <div class="border-2 border-dashed rounded-lg p-8 mb-6 text-center border-gray-300 dark:border-neutral-600">
+            <div
+              class={`border-2 border-dashed rounded-lg p-8 mb-6 text-center transition-colors duration-150 ${
+                isDragging() ? "border-azure bg-azure/5" : "border-line"
+              }`}
+            >
               <Show
                 when={!isProcessing()}
                 fallback={
-                  <div class="text-blue-600 dark:text-blue-400 flex flex-col items-center">
-                    <div class="animate-spin w-12 h-12 border-4 border-gray-300 border-t-blue-500 rounded-full" />
+                  <div class="text-azure flex flex-col items-center">
+                    <div class="animate-spin w-12 h-12 border-4 border-line border-t-azure rounded-full" />
                     <div class="font-medium mt-3">Processing files...</div>
                   </div>
                 }
               >
-                <div class="text-gray-500 dark:text-gray-400">
+                <div
+                  class={`transition-colors duration-150 ${
+                    isDragging() ? "text-azure" : "text-ink-dim"
+                  }`}
+                >
                   <FiFolder class="w-10 h-10 mx-auto mb-2" />
-                  <div>Drag and drop files or folders</div>
+                  <div>
+                    {isDragging()
+                      ? "Drop to add"
+                      : "Drag and drop files or folders"}
+                  </div>
                 </div>
               </Show>
             </div>
@@ -292,9 +265,9 @@ export function SendPage() {
         <Show when={state() === "connecting"}>
           <Card class="text-center">
             <div class="flex justify-center mb-4">
-              <div class="animate-spin w-12 h-12 border-4 border-gray-300 border-t-blue-500 rounded-full" />
+              <div class="animate-spin w-12 h-12 border-4 border-line border-t-azure rounded-full" />
             </div>
-            <p class="text-gray-600 dark:text-gray-400 mb-4">
+            <p class="text-ink-muted mb-4">
               Creating session...
             </p>
             <Button variant="gray" onClick={goBack}>
@@ -319,9 +292,9 @@ export function SendPage() {
         <Show when={state() === "handshaking"}>
           <Card class="text-center">
             <div class="flex justify-center mb-4">
-              <div class="animate-spin w-12 h-12 border-4 border-gray-300 border-t-blue-500 rounded-full" />
+              <div class="animate-spin w-12 h-12 border-4 border-line border-t-azure rounded-full" />
             </div>
-            <p class="text-gray-600 dark:text-gray-400">
+            <p class="text-ink-muted">
               Establishing connection...
             </p>
           </Card>
@@ -331,9 +304,9 @@ export function SendPage() {
         <Show when={state() === "waitingAccept"}>
           <Card class="text-center">
             <div class="flex justify-center mb-4">
-              <div class="animate-spin w-12 h-12 border-4 border-gray-300 border-t-blue-500 rounded-full" />
+              <div class="animate-spin w-12 h-12 border-4 border-line border-t-azure rounded-full" />
             </div>
-            <p class="text-gray-600 dark:text-gray-400">
+            <p class="text-ink-muted">
               Waiting for receiver to accept...
             </p>
           </Card>
@@ -370,7 +343,7 @@ export function SendPage() {
 
             <Show when={state() === "transferring"}>
               <div class="mt-6 text-center">
-                <p class="text-sm text-gray-500 dark:text-gray-400 mb-3">
+                <p class="text-sm text-ink-dim mb-3">
                   Please keep this page open until the transfer completes
                 </p>
               </div>
