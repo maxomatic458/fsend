@@ -123,6 +123,78 @@ export function waitConnected(
   });
 }
 
+export interface DisconnectWatcher {
+  /// Rejects once the peer is gone.
+  promise: Promise<never>;
+  isDown: () => boolean;
+  /// Stop watching
+  stop: () => void;
+}
+
+const DISCONNECT_GRACE_MS = 3000;
+
+export function watchDisconnect(
+  pc: RTCPeerConnection,
+  channels: RTCDataChannel[],
+): DisconnectWatcher {
+  let down = false;
+  let stopped = false;
+  let graceTimer: ReturnType<typeof setTimeout> | undefined;
+  let fail!: () => void;
+
+  const promise = new Promise<never>((_, reject) => {
+    fail = () => {
+      if (down || stopped) return;
+      down = true;
+      reject(new Error("Peer disconnected"));
+    };
+  });
+  // Nothing may be awaiting this yet
+  promise.catch(() => {});
+
+  const isFatal = (s: string) => s === "failed" || s === "closed";
+  // Either transport being down is enough
+  const isDown = () =>
+    isFatal(pc.connectionState) ||
+    isFatal(pc.iceConnectionState) ||
+    pc.connectionState === "disconnected" ||
+    pc.iceConnectionState === "disconnected";
+
+  const onState = () => {
+    if (stopped) return;
+    if (isFatal(pc.connectionState) || isFatal(pc.iceConnectionState)) {
+      clearTimeout(graceTimer);
+      fail();
+    } else if (isDown()) {
+      clearTimeout(graceTimer);
+      graceTimer = setTimeout(() => {
+        if (isDown()) fail();
+      }, DISCONNECT_GRACE_MS);
+    } else {
+      clearTimeout(graceTimer);
+      graceTimer = undefined;
+    }
+  };
+
+  const onChannelClose = () => fail();
+
+  pc.addEventListener("connectionstatechange", onState);
+  pc.addEventListener("iceconnectionstatechange", onState);
+  for (const ch of channels) ch.addEventListener("close", onChannelClose);
+
+  return {
+    promise,
+    isDown: () => down,
+    stop: () => {
+      stopped = true;
+      clearTimeout(graceTimer);
+      pc.removeEventListener("connectionstatechange", onState);
+      pc.removeEventListener("iceconnectionstatechange", onState);
+      for (const ch of channels) ch.removeEventListener("close", onChannelClose);
+    },
+  };
+}
+
 export async function getConnectionType(
   pc: RTCPeerConnection,
 ): Promise<"direct" | "relay" | "unknown"> {

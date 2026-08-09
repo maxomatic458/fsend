@@ -9,6 +9,7 @@ import { runSender } from "../lib/sender";
 import { createProgressTracker } from "../primitives/createProgressTracker";
 import { createWindowDropTarget } from "../primitives/createWindowDropTarget";
 import { createExitGuard } from "../primitives/createExitGuard";
+import { ConfirmDialog } from "../components/ConfirmDialog";
 import { SESSION_EXPIRY_SEC } from "../config";
 import { FileList } from "../components/FileList";
 import { ShareCode } from "../components/ShareCode";
@@ -43,7 +44,9 @@ export function SendPage() {
   const [startTime, setStartTime] = createSignal(0);
   const [isProcessing, setIsProcessing] = createSignal(false);
 
-  const abortController = new AbortController();
+  // Recreated per attempt: an AbortController stays aborted forever, so a
+  // cancelled session would otherwise poison every retry after it.
+  let abortController = new AbortController();
 
   onMount(() => {
     const pending = (window as any).__fsend_pending as
@@ -105,13 +108,11 @@ export function SendPage() {
   });
   const isDragging = () => dragActive() && state() === "selecting";
 
-  createExitGuard(
-    () => state() === "transferring",
-    "A transfer is still running. Leaving now will cancel it. Leave anyway?",
-  );
+  const exitGuard = createExitGuard(() => state() === "transferring");
 
   const startSending = () => {
     if (entries().length === 0) return;
+    if (abortController.signal.aborted) abortController = new AbortController();
     setState("connecting");
     setStartTime(Date.now());
 
@@ -143,7 +144,6 @@ export function SendPage() {
   };
 
   const goBack = () => {
-    abortController.abort();
     navigate("/");
   };
 
@@ -159,6 +159,16 @@ export function SendPage() {
 
   return (
     <div class="flex-1 bg-canvas py-8 px-4 relative">
+      <ConfirmDialog
+        open={exitGuard.isPrompting()}
+        title="Leave while sending?"
+        message="The transfer is still running. Leaving this page cancels it, and the receiver will have to start over."
+        confirmLabel="Leave and cancel"
+        cancelLabel="Keep sending"
+        onConfirm={exitGuard.confirm}
+        onCancel={exitGuard.cancel}
+      />
+
       <Title>Send Files — fsend</Title>
       <Meta
         name="description"

@@ -1,6 +1,8 @@
 import { RELAY_URL, PROTO_VERSION } from "../config";
 import { RelayClient } from "./relay";
-import { createAnswerer, waitConnected } from "./webrtc";
+import { createAnswerer, waitConnected,
+  watchDisconnect,
+} from "./webrtc";
 import { sendControlMessage, ControlDecoder } from "./protocol";
 import { flattenTree, toSendRecvTree, treeSize } from "./fileTree";
 import type {
@@ -48,13 +50,8 @@ export async function runFallbackReceiver(
     await waitConnected(pc, [controlChannel, dataChannel]);
     if (abort.aborted) return;
 
-    let transferDone = false;
-    const disconnectPromise = new Promise<never>((_, reject) => {
-      dataChannel.addEventListener("close", () => {
-        if (!transferDone) reject(new Error("Peer disconnected"));
-      });
-    });
-    disconnectPromise.catch(() => {});
+    const peer = watchDisconnect(pc, [controlChannel, dataChannel]);
+    const disconnectPromise = peer.promise;
 
     callbacks.onHandshaking();
 
@@ -179,7 +176,7 @@ export async function runFallbackReceiver(
     });
 
     await Promise.race([dataPromise, disconnectPromise]);
-    transferDone = true;
+    peer.stop();
     pc?.close();
 
     const hasDirectories = offeredFiles.some((f) => f.type === "Dir");

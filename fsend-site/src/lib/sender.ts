@@ -5,7 +5,12 @@ import {
   MAX_BUFFERED,
 } from "../config";
 import { RelayClient } from "./relay";
-import { createOfferer, applyAnswer, waitConnected } from "./webrtc";
+import {
+  createOfferer,
+  applyAnswer,
+  waitConnected,
+  watchDisconnect,
+} from "./webrtc";
 import { sendControlMessage, ControlDecoder } from "./protocol";
 import {
   buildFileTree,
@@ -93,12 +98,11 @@ export async function runSender(
     ]);
     if (abort.aborted) return;
 
-    const disconnectPromise = new Promise<never>((_, reject) => {
-      connection.dataChannel.addEventListener("close", () =>
-        reject(new Error("Peer disconnected")),
-      );
-    });
-    disconnectPromise.catch(() => {});
+    const peer = watchDisconnect(pc, [
+      connection.controlChannel,
+      connection.dataChannel,
+    ]);
+    const disconnectPromise = peer.promise;
 
     const decoder = new ControlDecoder();
     const controlMessages: ReceiverToSender[] = [];
@@ -179,6 +183,7 @@ export async function runSender(
       let sent = skip;
       while (sent < size) {
         if (abort.aborted) return;
+        if (peer.isDown()) throw new Error("Peer disconnected");
 
         if (dc.bufferedAmount > MAX_BUFFERED) {
           await Promise.race([

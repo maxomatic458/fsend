@@ -1,6 +1,8 @@
 import { RELAY_URL, PROTO_VERSION } from "../config";
 import { RelayClient } from "./relay";
-import { createAnswerer, waitConnected } from "./webrtc";
+import { createAnswerer, waitConnected,
+  watchDisconnect,
+} from "./webrtc";
 import { sendControlMessage, ControlDecoder } from "./protocol";
 import { flattenTree, applySkip, treeSize, treeSkip } from "./fileTree";
 import { getExistingFileSizes } from "./fsAccess";
@@ -74,13 +76,8 @@ export async function runReceiver(
     await waitConnected(pc, [controlChannel, dataChannel]);
     if (abort.aborted) return;
 
-    let transferDone = false;
-    const disconnectPromise = new Promise<never>((_, reject) => {
-      dataChannel.addEventListener("close", () => {
-        if (!transferDone) reject(new Error("Peer disconnected"));
-      });
-    });
-    disconnectPromise.catch(() => {});
+    const peer = watchDisconnect(pc, [controlChannel, dataChannel]);
+    const disconnectPromise = peer.promise;
 
     callbacks.onHandshaking();
 
@@ -270,7 +267,7 @@ export async function runReceiver(
     });
 
     await Promise.race([dataPromise, disconnectPromise]);
-    transferDone = true;
+    peer.stop();
     pc?.close();
     callbacks.onComplete();
   } catch (err: any) {

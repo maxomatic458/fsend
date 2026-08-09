@@ -11,6 +11,7 @@ import { runFallbackReceiver } from "../lib/fallbackReceiver";
 import { createProgressTracker } from "../primitives/createProgressTracker";
 import { createWindowDropTarget } from "../primitives/createWindowDropTarget";
 import { createExitGuard } from "../primitives/createExitGuard";
+import { ConfirmDialog } from "../components/ConfirmDialog";
 import { FileOffer } from "../components/FileOffer";
 import { TransferProgress } from "../components/TransferProgress";
 import { ErrorCard } from "../components/ErrorCard";
@@ -44,7 +45,8 @@ export function ReceivePage() {
   const [connectionType, setConnectionType] = createSignal<string>("unknown");
   const [resume, setResume] = createSignal(false);
 
-  const abortController = new AbortController();
+  // Recreated per attempt — see SendPage.
+  let abortController = new AbortController();
 
   onMount(() => {
     if (params.code) {
@@ -73,6 +75,7 @@ export function ReceivePage() {
 
   const startReceiving = () => {
     if (code().length === 0) return;
+    if (abortController.signal.aborted) abortController = new AbortController();
     setState("connecting");
 
     const callbacks = {
@@ -140,18 +143,14 @@ export function ReceivePage() {
 
   createWindowDropTarget(() => {});
 
-  const leaveWithoutPrompt = createExitGuard(
-    () => state() === "transferring",
-    "A download is still running. Leaving now will cancel it. Leave anyway?",
-  );
+  const exitGuard = createExitGuard(() => state() === "transferring");
 
   const goBack = () => {
-    abortController.abort();
     navigate("/");
   };
 
   // The user clicked Cancel — they already know, so don't ask again.
-  const cancelTransfer = () => leaveWithoutPrompt(goBack);
+  const cancelTransfer = () => exitGuard.withoutPrompt(goBack);
 
   const handleTryAgain = () => {
     setError("");
@@ -160,6 +159,16 @@ export function ReceivePage() {
 
   return (
     <div class="flex-1 bg-canvas py-8 px-4">
+      <ConfirmDialog
+        open={exitGuard.isPrompting()}
+        title="Leave while downloading?"
+        message="The download is still running. Leaving this page cancels it."
+        confirmLabel="Leave and cancel"
+        cancelLabel="Keep downloading"
+        onConfirm={exitGuard.confirm}
+        onCancel={exitGuard.cancel}
+      />
+
       <Title>Receive Files — fsend</Title>
       <Meta
         name="description"
