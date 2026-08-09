@@ -123,6 +123,10 @@
 :root {
   color-scheme: light;
 
+  /* Header height. The landing hero subtracts exactly this to fill the
+     viewport, so the two must stay in step — both read this variable. */
+  --app-header-h: 3.5rem;
+
   --canvas: #f7f5f2;
   --surface: #ffffff;
   --surface-2: #f1eeea;
@@ -196,11 +200,49 @@
     "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
+@layer components {
+  /*
+   * Fills everything below the header, so the sections underneath sit past the
+   * fold and are only reachable by scrolling. Declared twice on purpose: svh
+   * where supported (mobile browser chrome then can't push content off-screen),
+   * with vh as the fallback for older engines.
+   */
+  .fills-viewport {
+    min-height: calc(100vh - var(--app-header-h));
+    min-height: calc(100svh - var(--app-header-h));
+  }
+
+  /* Drifts just enough to catch the eye without becoming a distraction. */
+  .scroll-hint {
+    animation: scroll-hint 2.6s ease-in-out infinite;
+  }
+}
+
+@keyframes scroll-hint {
+  0%,
+  100% {
+    transform: translateY(-3px);
+    opacity: 0.7;
+  }
+  50% {
+    transform: translateY(3px);
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scroll-hint {
+    animation: none;
+    opacity: 0.8;
+  }
+}
+
 @layer base {
   html {
     scroll-behavior: smooth;
-    /* clear the sticky header when jumping to #how / #security / #faq */
-    scroll-padding-top: 5.5rem;
+    /* breathing room when jumping to #how / #faq — the header no longer
+       overlaps content, so this just avoids a flush-to-the-edge landing */
+    scroll-padding-top: 2rem;
   }
 
   body {

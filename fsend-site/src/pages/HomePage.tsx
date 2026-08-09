@@ -161,8 +161,8 @@ export function HomePage() {
         </div>
       </Show>
 
-      <section class="px-5 sm:px-6 pt-16 sm:pt-24 pb-16 sm:pb-22 flex flex-col items-center text-center">
-        <div class="flex items-center gap-4 sm:gap-6 mb-4">
+      <section class="fills-viewport relative px-5 sm:px-6 pt-10 pb-20 flex flex-col items-center justify-center text-center">
+        <div class="flex items-center gap-2 sm:gap-3 mb-4">
           <Logo class="w-[62px] sm:w-[82px]" />
           <h1 class="text-5xl sm:text-6xl font-bold tracking-[-0.025em]">
             fsend
@@ -232,6 +232,25 @@ export function HomePage() {
             Drop a file anywhere on this page to start
           </p>
         </div>
+
+        <a
+          href="#how"
+          aria-label="Scroll to how it works"
+          class="absolute bottom-4 left-1/2 -translate-x-1/2 p-2 text-ink-dim hover:text-ink transition-colors"
+        >
+          <svg
+            viewBox="0 0 28 9"
+            class="scroll-hint w-10"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.75"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M1.5 1.5 L14 7.5 L26.5 1.5" />
+          </svg>
+        </a>
       </section>
 
       <section
