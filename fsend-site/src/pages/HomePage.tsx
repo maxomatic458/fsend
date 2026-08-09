@@ -2,8 +2,8 @@ import { createSignal, For, Show, type JSX } from "solid-js";
 import { A, useNavigate } from "@solidjs/router";
 import { Title, Meta, Link } from "@solidjs/meta";
 import { FiUpload, FiDownload } from "solid-icons/fi";
-import { handleDrop } from "../lib/filePicker";
-import { supportsFileSystemAccess } from "../lib/fsAccess";
+import { handleDrop } from "../lib/files/source";
+import { detectStorage } from "../lib/files/storage";
 import {
   GITHUB_URL,
   MDN_FS_API,
@@ -128,6 +128,7 @@ function Eyebrow(props: { children: string }) {
 
 export function HomePage() {
   const navigate = useNavigate();
+  const storage = detectStorage();
   const [isProcessing, setIsProcessing] = createSignal(false);
 
   const isDragging = createWindowDropTarget(async (data) => {
@@ -184,7 +185,7 @@ export function HomePage() {
         </div>
 
         <div class="w-full max-w-[560px] mt-10 flex flex-col gap-3.5">
-          <Show when={!supportsFileSystemAccess()}>
+          <Show when={storage.kind !== "disk"}>
             <div class="flex gap-3 items-start text-left bg-warn-bg border border-warn-line text-warn-ink rounded-lg px-4 py-3.5 text-sm leading-relaxed">
               <div>
                 Your browser has limited support. Folders will be downloaded as

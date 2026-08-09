@@ -3,7 +3,7 @@ import type {
   FilesToSkip,
   FileSendRecvTree,
   SelectedEntry,
-} from "./types";
+} from "../types";
 
 export async function buildFileTree(
   entries: SelectedEntry[],
@@ -58,7 +58,6 @@ function dirTreeFromFileList(
   name: string,
   files: { relativePath: string; file: File }[],
 ): FilesAvailable {
-  const root: Map<string, FilesAvailable> = new Map();
   const dirs: Map<string, FilesAvailable[]> = new Map();
 
   for (const { relativePath, file } of files) {

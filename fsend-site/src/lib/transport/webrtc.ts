@@ -1,4 +1,4 @@
-import { STUN_SERVERS } from "../config";
+import { STUN_SERVERS } from "../../config";
 
 export interface WebRtcConnection {
   pc: RTCPeerConnection;
@@ -120,6 +120,27 @@ export function waitConnected(
     }
 
     check();
+  });
+}
+
+/// Waits for the channels queued data to drain.
+export function flushChannel(
+  channel: RTCDataChannel,
+  timeoutMs = 1000,
+): Promise<void> {
+  if (channel.readyState !== "open" || channel.bufferedAmount === 0) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    const done = () => {
+      clearInterval(poll);
+      clearTimeout(timer);
+      resolve();
+    };
+    const poll = setInterval(() => {
+      if (channel.readyState !== "open" || channel.bufferedAmount === 0) done();
+    }, 10);
+    const timer = setTimeout(done, timeoutMs);
   });
 }
 

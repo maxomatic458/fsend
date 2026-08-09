@@ -1,164 +1,62 @@
-import { createSignal, onCleanup, onMount, Show } from "solid-js";
+import { onMount, Show } from "solid-js";
 import { useNavigate } from "@solidjs/router";
 import { Title, Meta, Link } from "@solidjs/meta";
-import { SITE_URL } from "../lib/links";
 import { FiArrowLeft, FiSend, FiFile, FiFolder } from "solid-icons/fi";
+import { SITE_URL } from "../lib/links";
+import { pickFiles, pickDirectory, handleDrop } from "../lib/files/source";
 import type { SelectedEntry } from "../lib/types";
-import { pickFiles, pickDirectory, handleDrop } from "../lib/filePicker";
-import { runSender } from "../lib/sender";
-import { createProgressTracker } from "../primitives/createProgressTracker";
+import { createSendSession } from "../primitives/createSendSession";
 import { createWindowDropTarget } from "../primitives/createWindowDropTarget";
 import { createExitGuard } from "../primitives/createExitGuard";
 import { ConfirmDialog } from "../components/ConfirmDialog";
-import { SESSION_EXPIRY_SEC } from "../config";
 import { FileList } from "../components/FileList";
 import { ShareCode } from "../components/ShareCode";
 import { TransferProgress } from "../components/TransferProgress";
 import { ErrorCard } from "../components/ErrorCard";
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
-import { formatBytes, formatTime } from "../lib/format";
-import { buildFileTree, totalSize as computeTotalSize } from "../lib/fileTree";
-
-type SendState =
-  | "selecting"
-  | "connecting"
-  | "waiting"
-  | "handshaking"
-  | "waitingAccept"
-  | "transferring"
-  | "completed"
-  | "error";
+import { formatBytes } from "../lib/format";
 
 export function SendPage() {
   const navigate = useNavigate();
-  const tracker = createProgressTracker();
-
-  const [state, setState] = createSignal<SendState>("selecting");
-  const [entries, setEntries] = createSignal<SelectedEntry[]>([]);
-  const [shareCode, setShareCode] = createSignal("");
-  const [expiresAt, setExpiresAt] = createSignal(0);
-  const [error, setError] = createSignal("");
-  const [connectionType, setConnectionType] = createSignal<string>("unknown");
-  const [fileTotalSize, setFileTotalSize] = createSignal(0);
-  const [startTime, setStartTime] = createSignal(0);
-  const [isProcessing, setIsProcessing] = createSignal(false);
-
-  // Recreated per attempt: an AbortController stays aborted forever, so a
-  // cancelled session would otherwise poison every retry after it.
-  let abortController = new AbortController();
+  const send = createSendSession();
 
   onMount(() => {
     const pending = (window as any).__fsend_pending as
       | SelectedEntry[]
       | undefined;
-    if (pending && pending.length > 0) {
-      setEntries(pending);
-      updateTotalSize(pending);
+    if (pending?.length) {
+      send.add(pending);
       delete (window as any).__fsend_pending;
     }
   });
 
-  onCleanup(() => {
-    abortController.abort();
-    tracker.cleanup();
+  const dragActive = createWindowDropTarget(async (data) => {
+    if (send.state() !== "selecting") return;
+    const dropped = await handleDrop(data);
+    if (dropped.length > 0) send.add(dropped);
   });
+  const isDragging = () => dragActive() && send.state() === "selecting";
 
-  const updateTotalSize = async (items: SelectedEntry[]) => {
-    const tree = await buildFileTree(items);
-    setFileTotalSize(computeTotalSize(tree));
-  };
+  const exitGuard = createExitGuard(send.isTransferring);
 
-  const addFiles = (newEntries: SelectedEntry[]) => {
-    const updated = [...entries(), ...newEntries];
-    setEntries(updated);
-    updateTotalSize(updated);
-  };
-
-  const removeEntry = (index: number) => {
-    const updated = entries().filter((_, i) => i !== index);
-    setEntries(updated);
-    updateTotalSize(updated);
-  };
-
-  const handleAddFiles = async () => {
+  const addFiles = async () => {
     try {
       const picked = await pickFiles();
-      if (picked.length > 0) addFiles(picked);
+      if (picked.length > 0) send.add(picked);
     } catch {}
   };
 
-  const handleAddDirectory = async () => {
+  const addFolder = async () => {
     try {
-      const entry = await pickDirectory();
-      addFiles([entry]);
+      send.add([await pickDirectory()]);
     } catch {}
   };
 
-  // Drag-and-drop across the window
-  const dragActive = createWindowDropTarget(async (data) => {
-    if (state() !== "selecting") return;
-    setIsProcessing(true);
-    try {
-      const dropped = await handleDrop(data);
-      if (dropped.length > 0) addFiles(dropped);
-    } finally {
-      setIsProcessing(false);
-    }
-  });
-  const isDragging = () => dragActive() && state() === "selecting";
-
-  const exitGuard = createExitGuard(() => state() === "transferring");
-
-  const startSending = () => {
-    if (entries().length === 0) return;
-    if (abortController.signal.aborted) abortController = new AbortController();
-    setState("connecting");
-    setStartTime(Date.now());
-
-    runSender(
-      entries(),
-      {
-        onCode: (code) => {
-          setShareCode(code);
-          setExpiresAt(Date.now() + SESSION_EXPIRY_SEC * 1000);
-          setState("waiting");
-        },
-        onWaitingPeer: () => {},
-        onHandshaking: () => setState("handshaking"),
-        onWaitingAccept: () => setState("waitingAccept"),
-        onTransferring: (items) => {
-          tracker.initialize(items);
-          setState("transferring");
-        },
-        onProgress: (bytes) => tracker.recordBytes(bytes),
-        onComplete: () => setState("completed"),
-        onError: (msg) => {
-          setError(msg);
-          setState("error");
-        },
-        onConnectionType: (type) => setConnectionType(type),
-      },
-      abortController.signal,
-    );
-  };
-
-  const goBack = () => {
-    navigate("/");
-  };
-
-  const reset = () => {
-    setState("selecting");
-    setEntries([]);
-    setShareCode("");
-    setError("");
-    setFileTotalSize(0);
-  };
-
-  const elapsed = () => Math.floor((Date.now() - startTime()) / 1000);
+  const goBack = () => navigate("/");
 
   return (
-    <div class="flex-1 bg-canvas py-8 px-4 relative">
+    <div class="flex-1 bg-canvas py-8 px-4">
       <ConfirmDialog
         open={exitGuard.isPrompting()}
         title="Leave while sending?"
@@ -176,30 +74,26 @@ export function SendPage() {
       />
       <Link rel="canonical" href={`${SITE_URL}/send`} />
 
-      <div class="max-w-2xl mx-auto relative z-0">
-        {/* Page header */}
+      <div class="max-w-2xl mx-auto">
         <button
           onClick={goBack}
           class="mb-6 text-azure hover:text-azure-hi flex items-center gap-2 transition-colors cursor-pointer"
         >
           <FiArrowLeft class="w-4 h-4" /> Back
         </button>
-        <h1 class="text-3xl font-bold text-ink mb-8">
-          Send Files
-        </h1>
+        <h1 class="text-3xl font-bold text-ink mb-8">Send Files</h1>
 
-        {/* State: selecting */}
-        <Show when={state() === "selecting"}>
+        <Show when={send.state() === "selecting"}>
           <Card class="mb-6">
             <h2 class="text-xl font-semibold mb-4 text-ink">
               Select Files or Directories
             </h2>
 
-            <Show when={entries().length > 0}>
+            <Show when={send.entries().length > 0}>
               <FileList
-                entries={entries()}
-                onRemove={removeEntry}
-                totalSize={fileTotalSize()}
+                entries={send.entries()}
+                onRemove={send.remove}
+                totalSize={send.selectionSize()}
               />
               <hr class="border-line mb-6" />
             </Show>
@@ -209,46 +103,28 @@ export function SendPage() {
                 isDragging() ? "border-azure bg-azure/5" : "border-line"
               }`}
             >
-              <Show
-                when={!isProcessing()}
-                fallback={
-                  <div class="text-azure flex flex-col items-center">
-                    <div class="animate-spin w-12 h-12 border-4 border-line border-t-azure rounded-full" />
-                    <div class="font-medium mt-3">Processing files...</div>
-                  </div>
-                }
+              <div
+                class={`transition-colors duration-150 ${
+                  isDragging() ? "text-azure" : "text-ink-dim"
+                }`}
               >
-                <div
-                  class={`transition-colors duration-150 ${
-                    isDragging() ? "text-azure" : "text-ink-dim"
-                  }`}
-                >
-                  <FiFolder class="w-10 h-10 mx-auto mb-2" />
-                  <div>
-                    {isDragging()
-                      ? "Drop to add"
-                      : "Drag and drop files or folders"}
-                  </div>
+                <FiFolder class="w-10 h-10 mx-auto mb-2" />
+                <div>
+                  {isDragging()
+                    ? "Drop to add"
+                    : "Drag and drop files or folders"}
                 </div>
-              </Show>
+              </div>
             </div>
 
             <div class="flex gap-4">
-              <Button
-                variant="blue"
-                onClick={handleAddFiles}
-                class="flex-1 py-3"
-              >
+              <Button variant="blue" onClick={addFiles} class="flex-1 py-3">
                 <span class="flex items-center justify-center gap-2">
                   <FiFile class="w-5 h-5" />
                   Add Files
                 </span>
               </Button>
-              <Button
-                variant="green"
-                onClick={handleAddDirectory}
-                class="flex-1 py-3"
-              >
+              <Button variant="green" onClick={addFolder} class="flex-1 py-3">
                 <span class="flex items-center justify-center gap-2">
                   <FiFolder class="w-5 h-5" />
                   Add Folder
@@ -256,10 +132,10 @@ export function SendPage() {
               </Button>
             </div>
 
-            <Show when={entries().length > 0}>
+            <Show when={send.entries().length > 0}>
               <Button
                 variant="orange"
-                onClick={startSending}
+                onClick={send.start}
                 class="w-full py-3 mt-6"
               >
                 <span class="flex items-center justify-center gap-2">
@@ -271,98 +147,53 @@ export function SendPage() {
           </Card>
         </Show>
 
-        {/* State: connecting */}
-        <Show when={state() === "connecting"}>
-          <Card class="text-center">
-            <div class="flex justify-center mb-4">
-              <div class="animate-spin w-12 h-12 border-4 border-line border-t-azure rounded-full" />
-            </div>
-            <p class="text-ink-muted mb-4">
-              Creating session...
-            </p>
-            <Button variant="gray" onClick={goBack}>
-              Cancel
-            </Button>
-          </Card>
+        <Show when={send.state() === "connecting"}>
+          <Busy label="Creating session..." onCancel={goBack} />
         </Show>
 
-        {/* State: waiting for peer */}
-        <Show when={state() === "waiting"}>
+        <Show when={send.state() === "waiting"}>
           <ShareCode
-            code={shareCode()}
-            expiresAt={expiresAt()}
-            onCancel={() => {
-              abortController.abort();
-              reset();
-            }}
+            code={send.shareCode()}
+            expiresAt={send.expiresAt()}
+            onCancel={send.cancel}
           />
         </Show>
 
-        {/* State: handshaking */}
-        <Show when={state() === "handshaking"}>
-          <Card class="text-center">
-            <div class="flex justify-center mb-4">
-              <div class="animate-spin w-12 h-12 border-4 border-line border-t-azure rounded-full" />
-            </div>
-            <p class="text-ink-muted">
-              Establishing connection...
-            </p>
-          </Card>
+        <Show when={send.state() === "handshaking"}>
+          <Busy label="Establishing connection..." />
         </Show>
 
-        {/* State: waiting accept */}
-        <Show when={state() === "waitingAccept"}>
-          <Card class="text-center">
-            <div class="flex justify-center mb-4">
-              <div class="animate-spin w-12 h-12 border-4 border-line border-t-azure rounded-full" />
-            </div>
-            <p class="text-ink-muted">
-              Waiting for receiver to accept...
-            </p>
-          </Card>
+        <Show when={send.state() === "waitingAccept"}>
+          <Busy label="Waiting for receiver to accept..." />
         </Show>
 
-        {/* State: transferring / completed */}
-        <Show when={state() === "transferring" || state() === "completed"}>
+        <Show
+          when={send.state() === "transferring" || send.state() === "completed"}
+        >
           <Card>
-            <Show when={connectionType() !== "unknown"}>
-              <div class="flex items-center justify-center gap-2 mb-4">
-                <div
-                  class={`w-3 h-3 rounded-full ${connectionType() === "direct" ? "bg-green-500" : "bg-yellow-500"}`}
-                />
-                <span
-                  class={`text-sm font-medium ${
-                    connectionType() === "direct"
-                      ? "text-green-600 dark:text-green-400"
-                      : "text-yellow-600 dark:text-yellow-400"
-                  }`}
-                >
-                  {connectionType() === "direct"
-                    ? "Direct Connection"
-                    : "Relay Connection"}
-                </span>
-              </div>
-            </Show>
             <TransferProgress
-              progress={tracker.progress}
+              progress={send.progress}
               status={
-                state() === "completed" ? "Transfer Complete!" : "Sending..."
+                send.state() === "completed"
+                  ? "Transfer Complete!"
+                  : "Sending..."
               }
               speedLabel="Upload"
             />
 
-            <Show when={state() === "transferring"}>
-              <div class="mt-6 text-center">
-                <p class="text-sm text-ink-dim mb-3">
-                  Please keep this page open until the transfer completes
-                </p>
-              </div>
+            <Show when={send.state() === "transferring"}>
+              <p class="mt-6 text-center text-sm text-ink-dim">
+                Please keep this page open until the transfer completes
+              </p>
             </Show>
 
-            <Show when={state() === "completed"}>
+            <Show when={send.state() === "completed"}>
               <div class="mt-6 text-center">
                 <p class="text-green-600 dark:text-green-400 font-semibold text-lg mb-4">
                   All files sent successfully!
+                </p>
+                <p class="text-ink-dim text-sm mb-4">
+                  {formatBytes(send.progress.totalTransferred)} transferred
                 </p>
                 <Button variant="blue" onClick={goBack}>
                   Back to Home
@@ -372,18 +203,33 @@ export function SendPage() {
           </Card>
         </Show>
 
-        {/* State: error */}
-        <Show when={state() === "error"}>
+        <Show when={send.state() === "error"}>
           <ErrorCard class="text-center">
             <p class="text-red-600 dark:text-red-400 font-semibold mb-4">
-              {error()}
+              {send.error()}
             </p>
-            <Button variant="red" onClick={reset}>
+            <Button variant="red" onClick={send.reset}>
               Try Again
             </Button>
           </ErrorCard>
         </Show>
       </div>
     </div>
+  );
+}
+
+function Busy(props: { label: string; onCancel?: () => void }) {
+  return (
+    <Card class="text-center">
+      <div class="flex justify-center mb-4">
+        <div class="animate-spin w-12 h-12 border-4 border-line border-t-azure rounded-full" />
+      </div>
+      <p class="text-ink-muted mb-4">{props.label}</p>
+      <Show when={props.onCancel}>
+        <Button variant="gray" onClick={props.onCancel!}>
+          Cancel
+        </Button>
+      </Show>
+    </Card>
   );
 }

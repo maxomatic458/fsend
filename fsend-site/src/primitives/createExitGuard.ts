@@ -7,7 +7,7 @@ export interface ExitGuard {
   cancel: () => void;
   withoutPrompt: (leave: () => void) => void;
 }
-1
+
 export function createExitGuard(isBlocking: () => boolean) {
   const [pendingRetry, setPendingRetry] = createSignal<(() => void) | null>(
     null,

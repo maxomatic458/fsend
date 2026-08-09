@@ -4,7 +4,7 @@ import {
   fragment,
   Defragmenter,
 } from "./compression";
-import type { SenderToReceiver, ReceiverToSender } from "./types";
+import type { SenderToReceiver, ReceiverToSender } from "../types";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();

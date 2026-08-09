@@ -1,14 +1,9 @@
-import { createSignal, onCleanup, onMount, Show } from "solid-js";
+import { Show } from "solid-js";
 import { useNavigate, useParams } from "@solidjs/router";
 import { Title, Meta, Link } from "@solidjs/meta";
-import { SITE_URL } from "../lib/links";
 import { FiArrowLeft, FiDownload, FiFolder, FiLink } from "solid-icons/fi";
-import type { FilesAvailable } from "../lib/types";
-import { supportsFileSystemAccess } from "../lib/fsAccess";
-import { pickSaveDirectory } from "../lib/filePicker";
-import { runReceiver } from "../lib/receiver";
-import { runFallbackReceiver } from "../lib/fallbackReceiver";
-import { createProgressTracker } from "../primitives/createProgressTracker";
+import { SITE_URL } from "../lib/links";
+import { createReceiveSession } from "../primitives/createReceiveSession";
 import { createWindowDropTarget } from "../primitives/createWindowDropTarget";
 import { createExitGuard } from "../primitives/createExitGuard";
 import { ConfirmDialog } from "../components/ConfirmDialog";
@@ -19,143 +14,18 @@ import { Button } from "../components/Button";
 import { Card } from "../components/Card";
 import { formatBytes } from "../lib/format";
 
-type ReceiveState =
-  | "input"
-  | "connecting"
-  | "handshaking"
-  | "offered"
-  | "transferring"
-  | "completed"
-  | "error";
-
 export function ReceivePage() {
   const navigate = useNavigate();
   const params = useParams<{ code?: string }>();
-  const tracker = createProgressTracker();
-  const hasNativeFS = supportsFileSystemAccess();
+  const receive = createReceiveSession(params.code ?? "");
+  const toDisk = receive.storage.kind === "disk";
 
-  const [state, setState] = createSignal<ReceiveState>("input");
-  const [code, setCode] = createSignal("");
-  const [error, setError] = createSignal("");
-  const [offeredFiles, setOfferedFiles] = createSignal<FilesAvailable[]>([]);
-  const [acceptFn, setAcceptFn] = createSignal<(() => void) | null>(null);
-  const [rejectFn, setRejectFn] = createSignal<(() => void) | null>(null);
-  const [dirHandle, setDirHandle] =
-    createSignal<FileSystemDirectoryHandle | null>(null);
-  const [connectionType, setConnectionType] = createSignal<string>("unknown");
-  const [resume, setResume] = createSignal(false);
-
-  // Recreated per attempt — see SendPage.
-  let abortController = new AbortController();
-
-  onMount(() => {
-    if (params.code) {
-      setCode(params.code.toUpperCase());
-    }
-  });
-
-  onCleanup(() => {
-    abortController.abort();
-    tracker.cleanup();
-  });
-
-  const formatCode = (input: string) => {
-    return input
-      .toUpperCase()
-      .replace(/[^A-Z0-9]/g, "")
-      .slice(0, 8);
-  };
-
-  const selectSaveDir = async () => {
-    try {
-      const handle = await pickSaveDirectory();
-      setDirHandle(handle);
-    } catch {}
-  };
-
-  const startReceiving = () => {
-    if (code().length === 0) return;
-    if (abortController.signal.aborted) abortController = new AbortController();
-    setState("connecting");
-
-    const callbacks = {
-      onConnecting: () => setState("connecting"),
-      onHandshaking: () => setState("handshaking"),
-      onFilesOffered: (
-        files: FilesAvailable[],
-        accept: () => void,
-        reject: () => void,
-      ) => {
-        setOfferedFiles(files);
-        setAcceptFn(() => accept);
-        setRejectFn(() => reject);
-        setState("offered");
-      },
-      onTransferring: (
-        items: Array<{
-          name: string;
-          size: number;
-          skip: number;
-          isDir: boolean;
-        }>,
-      ) => {
-        tracker.initialize(items);
-        setState("transferring");
-      },
-      onProgress: (bytes: number) => tracker.recordBytes(bytes),
-      onComplete: () => setState("completed"),
-      onError: (msg: string) => {
-        setError(msg);
-        setState("error");
-      },
-      onConnectionType: (type: "direct" | "relay" | "unknown") =>
-        setConnectionType(type),
-    };
-
-    if (hasNativeFS && dirHandle()) {
-      runReceiver(
-        code(),
-        dirHandle()!,
-        resume(),
-        callbacks,
-        abortController.signal,
-      );
-    } else {
-      runFallbackReceiver(code(), callbacks, abortController.signal);
-    }
-  };
-
-  const handleAccept = async () => {
-    if (hasNativeFS && !dirHandle()) {
-      try {
-        const handle = await pickSaveDirectory();
-        setDirHandle(handle);
-      } catch {
-        return;
-      }
-    }
-    acceptFn()?.();
-  };
-
-  const handleReject = () => {
-    rejectFn()?.();
-  };
 
   createWindowDropTarget(() => {});
+  const exitGuard = createExitGuard(receive.isTransferring);
 
-  const exitGuard = createExitGuard(() => state() === "transferring");
-
-  const goBack = () => {
-    navigate("/");
-  };
-
-  // The user clicked Cancel — they already know, so don't ask again.
+  const goBack = () => navigate("/");
   const cancelTransfer = () => exitGuard.withoutPrompt(goBack);
-
-  const handleTryAgain = () => {
-    setError("");
-    setState("input");
-  };
 
   return (
     <div class="flex-1 bg-canvas py-8 px-4">
@@ -177,31 +47,25 @@ export function ReceivePage() {
       <Link rel="canonical" href={`${SITE_URL}/receive`} />
 
       <div class="max-w-2xl mx-auto">
-        {/* Page header */}
         <button
           onClick={goBack}
           class="mb-6 text-azure hover:text-azure-hi flex items-center gap-2 transition-colors cursor-pointer"
         >
           <FiArrowLeft class="w-4 h-4" /> Back
         </button>
-        <h1 class="text-3xl font-bold text-ink mb-8">
-          Receive Files
-        </h1>
+        <h1 class="text-3xl font-bold text-ink mb-8">Receive Files</h1>
 
-        {/* State: input */}
-        <Show when={state() === "input"}>
-          <Show when={!hasNativeFS}>
+        <Show when={receive.state() === "input"}>
+          <Show when={!toDisk}>
             <div class="bg-warn-bg text-warn-ink border border-warn-line px-3 py-2 rounded-lg text-sm font-medium mb-4">
-              Your browser doesn't support the File System Access API. Files
-              will be downloaded as a zip archive. Transfer resumption won't be
-              available.
+              This browser can't write straight to disk, so the transfer is held
+              in memory and saved at the end. Large transfers are limited by
+              available RAM, and an interrupted one can't be resumed.
             </div>
           </Show>
 
           <Card class="mb-6">
-            <h2 class="text-xl font-semibold mb-4 text-ink">
-              Enter Share Code
-            </h2>
+            <h2 class="text-xl font-semibold mb-4 text-ink">Enter Share Code</h2>
 
             <div class="mb-6">
               <label class="block text-sm font-medium text-ink-muted mb-2">
@@ -209,24 +73,32 @@ export function ReceivePage() {
               </label>
               <input
                 type="text"
-                value={code()}
-                onInput={(e) => setCode(formatCode(e.currentTarget.value))}
+                value={receive.code()}
+                onInput={(e) => receive.setCode(e.currentTarget.value)}
                 placeholder="ABCD1234"
                 class="w-full p-4 border border-line rounded-lg text-2xl font-mono text-center tracking-widest uppercase bg-surface-2 text-ink"
                 maxLength={8}
               />
             </div>
 
-            <Show when={hasNativeFS}>
+            <Show
+              when={toDisk}
+              fallback={
+                <div class="mb-6 p-3 bg-surface-2 rounded-lg text-ink-muted text-sm">
+                  <FiDownload class="w-4 h-4 inline-block mr-2" />
+                  Files will be downloaded to your Downloads folder
+                </div>
+              }
+            >
               <div class="mb-6">
                 <label class="block text-sm font-medium text-ink-muted mb-2">
                   Download Location
                 </label>
                 <div class="flex gap-2">
                   <div class="flex-1 p-3 border border-line rounded-lg bg-surface-2 text-ink">
-                    {dirHandle() ? dirHandle()!.name : "No directory selected"}
+                    {receive.folder()?.name ?? "No directory selected"}
                   </div>
-                  <Button variant="blue" onClick={selectSaveDir}>
+                  <Button variant="blue" onClick={receive.chooseFolder}>
                     <span class="flex items-center gap-2">
                       <FiFolder class="w-4 h-4" />
                       Select Folder
@@ -237,8 +109,8 @@ export function ReceivePage() {
                 <label class="flex items-center gap-2 mt-3 text-sm text-ink-dim">
                   <input
                     type="checkbox"
-                    checked={resume()}
-                    onChange={(e) => setResume(e.currentTarget.checked)}
+                    checked={receive.resume()}
+                    onChange={(e) => receive.setResume(e.currentTarget.checked)}
                     class="rounded"
                   />
                   Resume interrupted transfer
@@ -246,137 +118,85 @@ export function ReceivePage() {
               </div>
             </Show>
 
-            <Show when={!hasNativeFS}>
-              <div class="mb-6 p-3 bg-surface-2 rounded-lg text-ink-muted text-sm">
-                <FiDownload class="w-4 h-4 inline-block mr-2" />
-                Files will be automatically downloaded to your Downloads folder
-              </div>
-            </Show>
-
             <Button
               variant="green"
-              onClick={startReceiving}
-              disabled={
-                !code() || code().length !== 8 || (hasNativeFS && !dirHandle())
-              }
+              onClick={receive.start}
+              disabled={!receive.isReady()}
               class="w-full py-3"
             >
               <span class="flex items-center justify-center gap-2">
                 <FiLink class="w-5 h-5" />
-                Connect & Receive
+                Connect &amp; Receive
               </span>
             </Button>
           </Card>
         </Show>
 
-        {/* State: connecting */}
-        <Show when={state() === "connecting"}>
-          <Card class="text-center">
-            <div class="flex justify-center mb-4">
-              <div class="animate-spin w-12 h-12 border-4 border-line border-t-azure rounded-full" />
-            </div>
-            <p class="text-ink-muted mb-4">
-              Connecting to sender...
-            </p>
-            <Button variant="gray" onClick={goBack}>
-              Cancel
-            </Button>
-          </Card>
+        <Show when={receive.state() === "connecting"}>
+          <Busy label="Connecting to sender..." onCancel={goBack} />
         </Show>
 
-        {/* State: handshaking */}
-        <Show when={state() === "handshaking"}>
-          <Card class="text-center">
-            <div class="flex justify-center mb-4">
-              <div class="animate-spin w-12 h-12 border-4 border-line border-t-azure rounded-full" />
-            </div>
-            <p class="text-ink-muted">
-              Establishing connection...
-            </p>
-          </Card>
+        <Show when={receive.state() === "handshaking"}>
+          <Busy label="Establishing connection..." />
         </Show>
 
-        {/* State: offered */}
-        <Show when={state() === "offered"}>
+        <Show when={receive.state() === "offered"}>
           <Card>
             <FileOffer
-              files={offeredFiles()}
-              onAccept={handleAccept}
-              onReject={handleReject}
+              files={receive.offered()}
+              onAccept={receive.acceptOffer}
+              onReject={receive.rejectOffer}
             />
           </Card>
         </Show>
 
-        {/* State: transferring / completed */}
-        <Show when={state() === "transferring" || state() === "completed"}>
-          <Show when={!hasNativeFS}>
-            <div class="bg-warn-bg text-warn-ink border border-warn-line px-3 py-2 rounded-lg text-sm font-medium mb-4">
-              Your browser does not support the Native Filesystem API. The
-              entire download ({formatBytes(tracker.progress.totalSize)}) needs
-              to be saved to memory first. Ensure you have enough free system
-              memory.
-            </div>
-          </Show>
+        <Show
+          when={
+            receive.state() === "transferring" ||
+            receive.state() === "completed"
+          }
+        >
           <Card>
-            <Show when={connectionType() !== "unknown"}>
-              <div class="flex items-center justify-center gap-2 mb-4">
-                <div
-                  class={`w-3 h-3 rounded-full ${connectionType() === "direct" ? "bg-green-500" : "bg-yellow-500"}`}
-                />
-                <span
-                  class={`text-sm font-medium ${
-                    connectionType() === "direct"
-                      ? "text-green-600 dark:text-green-400"
-                      : "text-yellow-600 dark:text-yellow-400"
-                  }`}
-                >
-                  {connectionType() === "direct"
-                    ? "Direct Connection"
-                    : "Relay Connection"}
-                </span>
-              </div>
-            </Show>
             <TransferProgress
-              progress={tracker.progress}
+              progress={receive.progress}
               status={
-                state() === "completed" ? "Download Complete!" : "Receiving..."
+                receive.state() === "completed"
+                  ? "Download Complete!"
+                  : "Receiving..."
               }
               speedLabel="Download"
             />
 
-            <Show when={state() === "transferring"}>
+            <Show when={receive.state() === "transferring"}>
               <div class="mt-6 text-center">
-                <Show when={hasNativeFS}>
+                <Show
+                  when={toDisk}
+                  fallback={
+                    <p class="text-sm text-ink-dim">
+                      Please keep this page open until the transfer completes
+                    </p>
+                  }
+                >
                   <p class="text-sm text-ink-dim mb-3">
-                    Canceling will save progress and allow resuming later
+                    Canceling will keep what has arrived so far, so you can
+                    resume later
                   </p>
                   <Button variant="red" onClick={cancelTransfer}>
                     Cancel Transfer
                   </Button>
                 </Show>
-                <Show when={!hasNativeFS}>
-                  <p class="text-sm text-ink-dim">
-                    Please keep this page open until the transfer completes
-                  </p>
-                </Show>
               </div>
             </Show>
 
-            <Show when={state() === "completed"}>
+            <Show when={receive.state() === "completed"}>
               <div class="mt-6 text-center">
                 <p class="text-green-600 dark:text-green-400 font-semibold text-lg mb-4">
                   All files received successfully!
                 </p>
-                <Show when={hasNativeFS && dirHandle()}>
-                  <p class="text-ink-muted mb-4">
-                    Files saved to: {dirHandle()?.name}
-                  </p>
-                </Show>
-                <Show when={!hasNativeFS}>
-                  <p class="text-ink-muted mb-4">
-                    Files downloaded to your Downloads folder
-                  </p>
-                </Show>
+                <p class="text-ink-muted mb-4">
+                  {formatBytes(receive.progress.totalTransferred)}{" "}
+                  {toDisk ? `saved to ${receive.folder()?.name}` : "downloaded"}
+                </p>
                 <Button variant="blue" onClick={goBack}>
                   Back to Home
                 </Button>
@@ -385,18 +205,33 @@ export function ReceivePage() {
           </Card>
         </Show>
 
-        {/* State: error */}
-        <Show when={state() === "error"}>
+        <Show when={receive.state() === "error"}>
           <ErrorCard class="text-center">
             <p class="text-red-600 dark:text-red-400 font-semibold mb-4">
-              {error()}
+              {receive.error()}
             </p>
-            <Button variant="red" onClick={handleTryAgain}>
+            <Button variant="red" onClick={receive.retry}>
               Try Again
             </Button>
           </ErrorCard>
         </Show>
       </div>
     </div>
+  );
+}
+
+function Busy(props: { label: string; onCancel?: () => void }) {
+  return (
+    <Card class="text-center">
+      <div class="flex justify-center mb-4">
+        <div class="animate-spin w-12 h-12 border-4 border-line border-t-azure rounded-full" />
+      </div>
+      <p class="text-ink-muted mb-4">{props.label}</p>
+      <Show when={props.onCancel}>
+        <Button variant="gray" onClick={props.onCancel!}>
+          Cancel
+        </Button>
+      </Show>
+    </Card>
   );
 }

@@ -1,7 +1,7 @@
 import { For } from "solid-js";
 import { FiFolder, FiFile } from "solid-icons/fi";
 import { formatBytes } from "../lib/format";
-import { totalSize, entrySize } from "../lib/fileTree";
+import { totalSize, entrySize } from "../lib/files/tree";
 import type { FilesAvailable } from "../lib/types";
 import { Button } from "./Button";
 
