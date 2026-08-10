@@ -23,10 +23,10 @@ export function Layout(props: { children: JSX.Element }) {
             href={GITHUB_URL}
             target="_blank"
             rel="noopener noreferrer"
-            class="p-1.5 rounded-lg hover:text-ink hover:bg-surface-2 transition-colors"
+            class="p-2 rounded-lg hover:text-ink hover:bg-surface-2 transition-colors"
             aria-label="fsend on GitHub"
           >
-            <FiGithub class="w-[18px] h-[18px]" />
+            <FiGithub class="w-5 h-5" />
           </a>
           <ThemeToggle />
         </nav>

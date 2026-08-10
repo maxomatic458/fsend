@@ -22,13 +22,13 @@ export function ThemeToggle() {
   return (
     <button
       onClick={toggle}
-      class="p-1.5 rounded-lg text-ink-dim hover:text-ink hover:bg-surface-2 transition-colors cursor-pointer"
+      class="p-2 rounded-lg text-ink-dim hover:text-ink hover:bg-surface-2 transition-colors cursor-pointer"
       aria-label={dark() ? "Switch to light theme" : "Switch to dark theme"}
     >
       {dark() ? (
-        <FiSun class="w-[18px] h-[18px]" />
+        <FiSun class="w-5 h-5" />
       ) : (
-        <FiMoon class="w-[18px] h-[18px]" />
+        <FiMoon class="w-5 h-5" />
       )}
     </button>
   );
