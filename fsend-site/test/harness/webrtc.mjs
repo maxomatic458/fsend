@@ -166,7 +166,11 @@ export class FakePeerConnection extends FakeEventTarget {
     offerer._remote = this;
 
     for (const [label, ch] of offerer._channels) {
-      const mirror = new FakeDataChannel(label, this._latency, this._instantDrain);
+      const mirror = new FakeDataChannel(
+        label,
+        this._latency,
+        this._instantDrain,
+      );
       mirror._peer = ch;
       ch._peer = mirror;
       this._channels.set(label, mirror);
@@ -188,7 +192,8 @@ export class FakePeerConnection extends FakeEventTarget {
       }
       for (const [, mirror] of this._channels) mirror._emit("open", {});
       for (const pc of [offerer, this]) pc._emit("connectionstatechange", {});
-      for (const pc of [offerer, this]) pc._emit("iceconnectionstatechange", {});
+      for (const pc of [offerer, this])
+        pc._emit("iceconnectionstatechange", {});
     }, this._latency);
   }
 
@@ -238,7 +243,10 @@ export class FakeRTCSessionDescription {
   }
 }
 
-export function installWebRtc(globals, { latencyMs = 0, instantDrain = false } = {}) {
+export function installWebRtc(
+  globals,
+  { latencyMs = 0, instantDrain = false } = {},
+) {
   globals.RTCPeerConnection = class extends FakePeerConnection {
     constructor(config) {
       super(config, latencyMs, instantDrain);

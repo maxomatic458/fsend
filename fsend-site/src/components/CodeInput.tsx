@@ -9,7 +9,8 @@ export function CodeInput(props: {
   onComplete?: () => void;
 }) {
   const [focused, setFocused] = createSignal(false);
-  const chars = () => props.value.padEnd(LENGTH, " ").slice(0, LENGTH).split("");
+  const chars = () =>
+    props.value.padEnd(LENGTH, " ").slice(0, LENGTH).split("");
   const caret = () => Math.min(props.value.length, LENGTH - 1);
 
   const set = (raw: string) => {

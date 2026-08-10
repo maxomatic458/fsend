@@ -38,7 +38,8 @@ class FakeWebSocket {
 
   _deliver(obj) {
     setTimeout(() => {
-      if (this.readyState === 1) this.onmessage?.({ data: JSON.stringify(obj) });
+      if (this.readyState === 1)
+        this.onmessage?.({ data: JSON.stringify(obj) });
     }, 0);
   }
 
@@ -81,7 +82,10 @@ class FakeWebSocket {
       const session = sessions.get(this._session);
       if (!session) return;
       const peer = this._role === "sender" ? session.receiver : session.sender;
-      peer?._deliver({ type: "exchange", connection_info: msg.connection_info });
+      peer?._deliver({
+        type: "exchange",
+        connection_info: msg.connection_info,
+      });
       return;
     }
   }

@@ -48,10 +48,7 @@ function pickViaInput(opts: {
           kind: "directory",
           name: root,
           files: picked.map((file) => ({
-            relativePath: file.webkitRelativePath
-              .split("/")
-              .slice(1)
-              .join("/"),
+            relativePath: file.webkitRelativePath.split("/").slice(1).join("/"),
             file,
           })),
         },
@@ -74,7 +71,11 @@ export async function handleDrop(
       if (!handle) continue;
       entries.push(
         handle.kind === "file"
-          ? { kind: "file", name: handle.name, handle: handle as FileSystemFileHandle }
+          ? {
+              kind: "file",
+              name: handle.name,
+              handle: handle as FileSystemFileHandle,
+            }
           : {
               kind: "directory",
               name: handle.name,

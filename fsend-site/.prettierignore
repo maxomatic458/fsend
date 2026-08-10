@@ -1,0 +1,8 @@
+dist
+node_modules
+test/.build
+public/fonts
+*.woff2
+*.png
+*.svg
+bun.lock

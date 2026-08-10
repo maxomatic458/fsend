@@ -9,7 +9,6 @@ export interface TransferEntry {
   isDir: boolean;
 }
 
-
 export type TransferEvent =
   /// Sender only
   | { type: "code"; code: string }

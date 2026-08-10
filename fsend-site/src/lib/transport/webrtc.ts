@@ -211,7 +211,8 @@ export function watchDisconnect(
       clearTimeout(graceTimer);
       pc.removeEventListener("connectionstatechange", onState);
       pc.removeEventListener("iceconnectionstatechange", onState);
-      for (const ch of channels) ch.removeEventListener("close", onChannelClose);
+      for (const ch of channels)
+        ch.removeEventListener("close", onChannelClose);
     },
   };
 }

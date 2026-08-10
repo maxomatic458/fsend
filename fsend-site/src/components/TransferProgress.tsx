@@ -34,17 +34,13 @@ export function TransferProgress(props: TransferProgressProps) {
           <Show when={props.progress.speed > 0}>
             <div>
               {formatSpeed(props.progress.speed)}
-              <Show
-                when={props.connection && props.connection !== "unknown"}
-              >
+              <Show when={props.connection && props.connection !== "unknown"}>
                 {" "}
                 · {props.connection}
               </Show>
             </div>
           </Show>
-          <Show
-            when={props.progress.eta > 0 && props.progress.eta < Infinity}
-          >
+          <Show when={props.progress.eta > 0 && props.progress.eta < Infinity}>
             <div>{formatTime(props.progress.eta)} remaining</div>
           </Show>
         </div>
@@ -83,8 +79,7 @@ export function TransferProgress(props: TransferProgressProps) {
                     <span class="text-[15px] truncate">{entry.name}</span>
                   </div>
                   <span class="font-mono text-[12.5px] text-ink-dim shrink-0">
-                    {formatBytes(entry.transferred)} /{" "}
-                    {formatBytes(entry.size)}
+                    {formatBytes(entry.transferred)} / {formatBytes(entry.size)}
                   </span>
                 </div>
                 <div class="h-[3px] rounded-sm bg-track overflow-hidden">

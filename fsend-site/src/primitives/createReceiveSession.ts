@@ -60,39 +60,45 @@ export function createReceiveSession(initialCode = "") {
         ? storage.createSink(folder()!)
         : storage.createSink();
 
-    runReceive(code(), sink, resume(), (event) => {
-      switch (event.type) {
-        case "connecting":
-          setState("connecting");
-          break;
-        case "handshaking":
-          setState("handshaking");
-          break;
-        case "offered":
-          setOffered(event.files);
-          accept = event.accept;
-          reject = event.reject;
-          setState("offered");
-          break;
-        case "transferring":
-          tracker.initialize(event.entries);
-          setState("transferring");
-          break;
-        case "progress":
-          tracker.recordBytes(event.bytes);
-          break;
-        case "connectionType":
-          setConnection(event.kind);
-          break;
-        case "complete":
-          setState("completed");
-          break;
-        case "error":
-          setError(event.message);
-          setState("error");
-          break;
-      }
-    }, abortController.signal);
+    runReceive(
+      code(),
+      sink,
+      resume(),
+      (event) => {
+        switch (event.type) {
+          case "connecting":
+            setState("connecting");
+            break;
+          case "handshaking":
+            setState("handshaking");
+            break;
+          case "offered":
+            setOffered(event.files);
+            accept = event.accept;
+            reject = event.reject;
+            setState("offered");
+            break;
+          case "transferring":
+            tracker.initialize(event.entries);
+            setState("transferring");
+            break;
+          case "progress":
+            tracker.recordBytes(event.bytes);
+            break;
+          case "connectionType":
+            setConnection(event.kind);
+            break;
+          case "complete":
+            setState("completed");
+            break;
+          case "error":
+            setError(event.message);
+            setState("error");
+            break;
+        }
+      },
+      abortController.signal,
+    );
   };
 
   const acceptOffer = async () => {

@@ -49,12 +49,18 @@ async function transfer(spec, { mode = "file", resume = false, dir } = {}) {
   const send = makeRecorder();
   const recv = makeRecorder();
 
-  const senderDone = runSend(makeEntries(spec, mode), send.emit,
+  const senderDone = runSend(
+    makeEntries(spec, mode),
+    send.emit,
     new AbortController().signal,
   );
 
   const code = await waitFor(() => send.record.code, { label: "share code" });
-  const receiverDone = runReceive(code, createDiskSink(dirHandle), resume, recv.emit,
+  const receiverDone = runReceive(
+    code,
+    createDiskSink(dirHandle),
+    resume,
+    recv.emit,
     new AbortController().signal,
   );
 
@@ -91,7 +97,10 @@ describe("complete transfers (File System Access API)", () => {
   });
 
   test("files chosen through picker handles transfer identically", async () => {
-    const spec = { "picked.bin": bytes(3000, 21), folder: { "x.dat": bytes(900, 22) } };
+    const spec = {
+      "picked.bin": bytes(3000, 21),
+      folder: { "x.dat": bytes(900, 22) },
+    };
     const { dirHandle } = await transfer(spec, { mode: "handle" });
     assertFiles(dirHandle.snapshot(), expectedSnapshot(spec));
   });
@@ -103,7 +112,11 @@ describe("complete transfers (File System Access API)", () => {
 
     assert.equal(send.error, null);
     assert.equal(recv.error, null);
-    assert.equal(recv.progress, 3_000_000, "receiver progress should match size");
+    assert.equal(
+      recv.progress,
+      3_000_000,
+      "receiver progress should match size",
+    );
     assertFiles(dirHandle.snapshot(), expectedSnapshot(spec));
   });
 
@@ -118,11 +131,17 @@ describe("complete transfers (fallback, no File System Access API)", () => {
   async function fallbackTransfer(spec) {
     const send = makeRecorder();
     const recv = makeRecorder();
-    const senderDone = runSend(makeEntries(spec), send.emit,
+    const senderDone = runSend(
+      makeEntries(spec),
+      send.emit,
       new AbortController().signal,
     );
     const code = await waitFor(() => send.record.code, { label: "share code" });
-    const receiverDone = runReceive(code, createDownloadSink(), false, recv.emit,
+    const receiverDone = runReceive(
+      code,
+      createDownloadSink(),
+      false,
+      recv.emit,
       new AbortController().signal,
     );
     await Promise.all([senderDone, receiverDone]);
@@ -143,7 +162,9 @@ describe("complete transfers (fallback, no File System Access API)", () => {
   });
 
   test("a folder is delivered as a zip", async () => {
-    const spec = { bundle: { "a.txt": bytes(300, 51), "b.txt": bytes(400, 52) } };
+    const spec = {
+      bundle: { "a.txt": bytes(300, 51), "b.txt": bytes(400, 52) },
+    };
     const { send, recv } = await fallbackTransfer(spec);
 
     assert.equal(send.error, null);
@@ -168,11 +189,17 @@ describe("interrupted transfers", () => {
     const send = makeRecorder();
     const recv = makeRecorder();
 
-    const senderDone = runSend(makeEntries(spec), send.emit,
+    const senderDone = runSend(
+      makeEntries(spec),
+      send.emit,
       new AbortController().signal,
     );
     const code = await waitFor(() => send.record.code, { label: "share code" });
-    const receiverDone = runReceive(code, createDiskSink(new MemoryDirectoryHandle()), false, recv.emit,
+    const receiverDone = runReceive(
+      code,
+      createDiskSink(new MemoryDirectoryHandle()),
+      false,
+      recv.emit,
       new AbortController().signal,
     );
 
@@ -255,11 +282,17 @@ describe("interrupted transfers", () => {
     const send = makeRecorder();
     const recv = makeRecorder();
 
-    const senderDone = runSend(makeEntries(spec), send.emit,
+    const senderDone = runSend(
+      makeEntries(spec),
+      send.emit,
       new AbortController().signal,
     );
     const code = await waitFor(() => send.record.code, { label: "share code" });
-    const receiverDone = runReceive(code, createDiskSink(new MemoryDirectoryHandle()), false, recv.emit,
+    const receiverDone = runReceive(
+      code,
+      createDiskSink(new MemoryDirectoryHandle()),
+      false,
+      recv.emit,
       new AbortController().signal,
     );
 
@@ -280,11 +313,17 @@ describe("interrupted transfers", () => {
     const send = makeRecorder();
     const recv = makeRecorder({ onOffered: (e) => e.reject() });
 
-    const senderDone = runSend(makeEntries(spec), send.emit,
+    const senderDone = runSend(
+      makeEntries(spec),
+      send.emit,
       new AbortController().signal,
     );
     const code = await waitFor(() => send.record.code, { label: "share code" });
-    const receiverDone = runReceive(code, createDiskSink(new MemoryDirectoryHandle()), false, recv.emit,
+    const receiverDone = runReceive(
+      code,
+      createDiskSink(new MemoryDirectoryHandle()),
+      false,
+      recv.emit,
       new AbortController().signal,
     );
 
@@ -332,11 +371,19 @@ describe("resuming an interrupted download", () => {
     {
       const send = makeRecorder();
       const recv = makeRecorder();
-      const senderDone = runSend(makeEntries(spec), send.emit,
+      const senderDone = runSend(
+        makeEntries(spec),
+        send.emit,
         new AbortController().signal,
       );
-      const code = await waitFor(() => send.record.code, { label: "share code" });
-      const receiverDone = runReceive(code, createDiskSink(dirHandle), false, recv.emit,
+      const code = await waitFor(() => send.record.code, {
+        label: "share code",
+      });
+      const receiverDone = runReceive(
+        code,
+        createDiskSink(dirHandle),
+        false,
+        recv.emit,
         new AbortController().signal,
       );
 
@@ -360,11 +407,19 @@ describe("resuming an interrupted download", () => {
     // Second attempt, with resume on: only the remainder should be sent.
     const send2 = makeRecorder();
     const recv2 = makeRecorder();
-    const senderDone2 = runSend(makeEntries(spec), send2.emit,
+    const senderDone2 = runSend(
+      makeEntries(spec),
+      send2.emit,
       new AbortController().signal,
     );
-    const code2 = await waitFor(() => send2.record.code, { label: "share code" });
-    const receiverDone2 = runReceive(code2, createDiskSink(dirHandle), true, recv2.emit,
+    const code2 = await waitFor(() => send2.record.code, {
+      label: "share code",
+    });
+    const receiverDone2 = runReceive(
+      code2,
+      createDiskSink(dirHandle),
+      true,
+      recv2.emit,
       new AbortController().signal,
     );
     await Promise.all([senderDone2, receiverDone2]);

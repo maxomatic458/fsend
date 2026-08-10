@@ -93,9 +93,7 @@ async function existingFor(
       const skip = await existingFor(sub, child);
       if (skip) files.push(skip);
     }
-    return files.length > 0
-      ? { type: "Dir", name: offered.name, files }
-      : null;
+    return files.length > 0 ? { type: "Dir", name: offered.name, files } : null;
   } catch {
     return null;
   }

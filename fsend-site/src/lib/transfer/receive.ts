@@ -4,11 +4,7 @@ import { getConnectionType } from "../transport/webrtc";
 import { flattenTree, applySkip, treeSize, treeSkip } from "../files/tree";
 import type { TransferSink } from "./sinks";
 import type { TransferListener } from "./events";
-import type {
-  FilesToSkip,
-  FileSendRecvTree,
-  ReceiverToSender,
-} from "../types";
+import type { FilesToSkip, FileSendRecvTree, ReceiverToSender } from "../types";
 
 /// Receives a transfer into `sink`.
 export async function runReceive(

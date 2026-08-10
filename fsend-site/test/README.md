@@ -1,7 +1,6 @@
 # Transfer test suite (this is completely ai generated)
 
-Runs the real `runSender` / `runReceiver` / `runFallbackReceiver` against an
-in-process fake browser. No headless browser, no network, no relay server —
+Runs the real `runSend` / `runReceive` against an in-process fake browser. No headless browser, no network, no relay server —
 the whole suite finishes in about two seconds.
 
 ```bash
@@ -19,12 +18,12 @@ to drift out of sync.
 
 `test/harness/` provides the four browser APIs the transfer code touches:
 
-| Module          | Stands in for | Notes |
-| --------------- | ------------- | ----- |
-| `webrtc.mjs`    | `RTCPeerConnection`, `RTCDataChannel` | Loopback pair. Messages are copied and delivered asynchronously in order; `bufferedAmount` rises and falls so backpressure is real. Exposes `simulateAbruptDisconnect()` — the peer vanishes with no graceful close, which a browser will not do on command. |
-| `relay.mjs`     | `WebSocket` + fsend-relay | Speaks the same JSON protocol as `src/lib/types.ts`: session creation, join, peer-joined, SDP exchange. |
-| `fs-access.mjs` | File System Access API | In-memory directories and files. Writables commit as they go, so an abandoned one leaves partial data behind — which is what resume reads. `snapshot()` flattens a tree to `{ path: bytes }`. |
-| `dom.mjs`       | Object URLs, anchor download, `FileReader` | Captures what would have been downloaded. `FileReader` is needed because jszip reads Blob input through it. |
+| Module          | Stands in for                              | Notes                                                                                                                                                                                                                                                        |
+| --------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `webrtc.mjs`    | `RTCPeerConnection`, `RTCDataChannel`      | Loopback pair. Messages are copied and delivered asynchronously in order; `bufferedAmount` rises and falls so backpressure is real. Exposes `simulateAbruptDisconnect()` — the peer vanishes with no graceful close, which a browser will not do on command. |
+| `relay.mjs`     | `WebSocket` + fsend-relay                  | Speaks the same JSON protocol as `src/lib/types.ts`: session creation, join, peer-joined, SDP exchange.                                                                                                                                                      |
+| `fs-access.mjs` | File System Access API                     | In-memory directories and files. Writables commit as they go, so an abandoned one leaves partial data behind — which is what resume reads. `snapshot()` flattens a tree to `{ path: bytes }`.                                                                |
+| `dom.mjs`       | Object URLs, anchor download, `FileReader` | Captures what would have been downloaded. `FileReader` is needed because jszip reads Blob input through it.                                                                                                                                                  |
 
 ## Coverage
 
@@ -32,9 +31,11 @@ to drift out of sync.
   folder, picker-handle sources, a file past `MAX_BUFFERED` (backpressure), an
   empty file.
 - **Complete transfers (fallback):** single-file direct download, folder as a
-  zip, multiple loose files as a zip.
-- **Interrupted:** receiver's tab disappears mid-send, sender's tab disappears
-  mid-receive, offer rejected, sender aborted.
+  zip, multiple loose files as a zip. Same `runReceive`, driven by a download
+  sink instead of a disk sink.
+- **Interrupted:** receiver's tab disappears mid-send, the same with a send
+  buffer that never fills (which isolates the per-chunk disconnect check),
+  sender's tab disappears mid-receive, offer rejected, sender aborted.
 - **Resume:** a cut-off download continues and ends byte-perfect, sending only
   the remainder; resuming with nothing on disk transfers everything.
 - **Relay:** unknown share code surfaces an error.
@@ -62,5 +63,8 @@ reproduces exactly.
   abrupt departure never sends.
 - A rejected offer reached the sender as "peer disconnected", because the
   receiver tore the connection down before the message drained.
-- `watchDisconnect` treated the peer as healthy whenever *either* transport
+- `watchDisconnect` treated the peer as healthy whenever _either_ transport
   still read `connected`, so a stale value masked a real drop.
+- Mutation testing found the interruption test was passing only via the
+  backpressure path: removing the sender's per-chunk disconnect check left the
+  suite green. `instantDrain` on the fake channel closed that hole.

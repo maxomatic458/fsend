@@ -59,7 +59,7 @@ export function createWindowDropTarget(onFiles: (data: DataTransfer) => void) {
     if (passThrough(e)) return;
     e.preventDefault();
     clear();
-  
+
     const data = e.dataTransfer;
     if (data && data.files.length > 0) onFiles(data);
   };

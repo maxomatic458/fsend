@@ -63,38 +63,42 @@ export function createSendSession() {
     if (abortController.signal.aborted) abortController = new AbortController();
     setState("connecting");
 
-    runSend(entries(), (event) => {
-      switch (event.type) {
-        case "code":
-          setShareCode(event.code);
-          setExpiresAt(Date.now() + SESSION_EXPIRY_SEC * 1000);
-          setState("waiting");
-          break;
-        case "handshaking":
-          setState("handshaking");
-          break;
-        case "waitingAccept":
-          setState("waitingAccept");
-          break;
-        case "transferring":
-          tracker.initialize(event.entries);
-          setState("transferring");
-          break;
-        case "progress":
-          tracker.recordBytes(event.bytes);
-          break;
-        case "connectionType":
-          setConnection(event.kind);
-          break;
-        case "complete":
-          setState("completed");
-          break;
-        case "error":
-          setError(event.message);
-          setState("error");
-          break;
-      }
-    }, abortController.signal);
+    runSend(
+      entries(),
+      (event) => {
+        switch (event.type) {
+          case "code":
+            setShareCode(event.code);
+            setExpiresAt(Date.now() + SESSION_EXPIRY_SEC * 1000);
+            setState("waiting");
+            break;
+          case "handshaking":
+            setState("handshaking");
+            break;
+          case "waitingAccept":
+            setState("waitingAccept");
+            break;
+          case "transferring":
+            tracker.initialize(event.entries);
+            setState("transferring");
+            break;
+          case "progress":
+            tracker.recordBytes(event.bytes);
+            break;
+          case "connectionType":
+            setConnection(event.kind);
+            break;
+          case "complete":
+            setState("completed");
+            break;
+          case "error":
+            setError(event.message);
+            setState("error");
+            break;
+        }
+      },
+      abortController.signal,
+    );
   };
 
   const cancel = () => {

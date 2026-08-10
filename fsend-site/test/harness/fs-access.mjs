@@ -35,9 +35,7 @@ class MemoryWritable {
     this._handle = handle;
     this._pos = 0;
     this._closed = false;
-    this._buf = keepExistingData
-      ? Array.from(handle.bytes)
-      : [];
+    this._buf = keepExistingData ? Array.from(handle.bytes) : [];
   }
 
   async seek(pos) {

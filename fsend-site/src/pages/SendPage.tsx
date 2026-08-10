@@ -23,8 +23,7 @@ export function SendPage() {
 
   onMount(() => {
     const pending = (window as any).__fsend_pending as
-      | SelectedEntry[]
-      | undefined;
+      SelectedEntry[] | undefined;
     if (pending?.length) {
       send.add(pending);
       delete (window as any).__fsend_pending;
@@ -76,7 +75,7 @@ export function SendPage() {
 
       <div class="max-w-2xl mx-auto flex flex-col gap-6">
         <TransferHeader
-          title="Send files"
+          title="Send Files"
           steps={["Choose", "Share code", "Transfer"]}
           current={send.step()}
           accent="flame"

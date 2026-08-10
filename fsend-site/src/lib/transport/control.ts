@@ -1,7 +1,6 @@
 import { sendControlMessage, ControlDecoder } from "./protocol";
 import { flushChannel } from "./webrtc";
 
-
 // The control channel as a typed request/response stream
 export interface ControlChannel<In, Out> {
   /// Resolves with the next message, or rejects if the peer disconnects.

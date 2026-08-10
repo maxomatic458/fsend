@@ -11,7 +11,10 @@ export { MemoryDirectoryHandle, getDownloads };
 
 let peerConnections = [];
 
-export function installBrowserEnv({ latencyMs = 0, instantDrain = false } = {}) {
+export function installBrowserEnv({
+  latencyMs = 0,
+  instantDrain = false,
+} = {}) {
   installDom(globalThis);
   installRelay(globalThis);
   peerConnections = installWebRtc(globalThis, { latencyMs, instantDrain });
@@ -177,7 +180,10 @@ export function makeRecorder({ onOffered } = {}) {
   return { record, emit };
 }
 
-export function waitFor(predicate, { timeout = 5000, label = "condition" } = {}) {
+export function waitFor(
+  predicate,
+  { timeout = 5000, label = "condition" } = {},
+) {
   return new Promise((resolve, reject) => {
     const started = Date.now();
     const tick = () => {

@@ -21,7 +21,6 @@ export function ReceivePage() {
   const receive = createReceiveSession(params.code ?? "");
   const toDisk = receive.storage.kind === "disk";
 
-
   createWindowDropTarget(() => {});
   const exitGuard = createExitGuard(receive.isTransferring);
 
@@ -49,7 +48,7 @@ export function ReceivePage() {
 
       <div class="max-w-2xl mx-auto flex flex-col gap-6">
         <TransferHeader
-          title="Receive files"
+          title="Receive Files"
           steps={["Enter code", "Connect", "Receive"]}
           current={receive.step()}
           accent="azure"
@@ -64,9 +63,7 @@ export function ReceivePage() {
               onComplete={() => receive.isReady() && receive.start()}
             />
 
-            <p class="text-sm text-ink-dim">
-              Paste the sender's link instead
-            </p>
+            <p class="text-sm text-ink-dim">Paste the sender's link instead</p>
 
             <Show when={toDisk}>
               <div class="w-full flex flex-col gap-3">

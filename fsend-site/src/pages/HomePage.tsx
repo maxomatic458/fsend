@@ -4,12 +4,7 @@ import { Title, Meta, Link } from "@solidjs/meta";
 import { FiUpload, FiDownload } from "solid-icons/fi";
 import { handleDrop } from "../lib/files/source";
 import { detectStorage } from "../lib/files/storage";
-import {
-  GITHUB_URL,
-  MDN_FS_API,
-  MDN_WEBRTC,
-  SITE_URL,
-} from "../lib/links";
+import { GITHUB_URL, MDN_FS_API, MDN_WEBRTC, SITE_URL } from "../lib/links";
 import { createWindowDropTarget } from "../primitives/createWindowDropTarget";
 import { Logo } from "../components/Logo";
 
@@ -43,7 +38,9 @@ const STEPS = [
     accent: "text-flame",
     title: "Share the code",
     body: (
-      <>You get a one-time code and a QR link. Share either with the receiver.</>
+      <>
+        You get a one-time code and a QR link. Share either with the receiver.
+      </>
     ),
   },
   {
@@ -82,7 +79,8 @@ const FAQ_ITEMS = [
     q: "Can fsend see my files?",
     a: (
       <>
-        No — fsend uses end to end encrypted <Ext href={MDN_WEBRTC}>WebRTC</Ext> data channels. File data never touches our servers.
+        No — fsend uses end to end encrypted <Ext href={MDN_WEBRTC}>WebRTC</Ext>{" "}
+        data channels. File data never touches our servers.
       </>
     ),
   },
@@ -102,8 +100,8 @@ const FAQ_ITEMS = [
     q: "Can I use it outside the browser?",
     a: (
       <>
-        Yes — fsend is available as a command-line tool. You can find the installation instructions on{" "}
-        <Ext href={GITHUB_URL}>GitHub</Ext>
+        Yes — fsend is available as a command-line tool. You can find the
+        installation instructions on <Ext href={GITHUB_URL}>GitHub</Ext>.
       </>
     ),
   },
