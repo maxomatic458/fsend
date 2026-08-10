@@ -1,5 +1,5 @@
 import type { JSX } from "solid-js";
-import { Router, Route, Navigate } from "@solidjs/router";
+import { Router, Route } from "@solidjs/router";
 import { Layout } from "./components/Layout";
 import { HomePage } from "./pages/HomePage";
 import { SendPage } from "./pages/SendPage";
@@ -18,7 +18,6 @@ export default function App() {
       <Route path="/send" component={page(SendPage)} />
       <Route path="/receive" component={page(ReceivePage)} />
       <Route path="/receive/:code" component={page(ReceivePage)} />
-      <Route path="*" component={() => <Navigate href="/" />} />
     </Router>
   );
 }

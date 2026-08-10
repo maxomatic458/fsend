@@ -118,6 +118,13 @@ export function createReceiveSession(initialCode = "") {
     progress: tracker.progress,
     isReady,
     isTransferring: () => state() === "transferring",
+    /** Which of Enter code / Connect / Receive is in progress. */
+    step: () => {
+      const s = state();
+      if (s === "input") return 0;
+      if (s === "transferring" || s === "completed") return 2;
+      return 1;
+    },
     chooseFolder,
     start,
     acceptOffer,

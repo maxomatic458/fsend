@@ -1,7 +1,7 @@
 import { createSignal, onCleanup } from "solid-js";
 import { runSend } from "../lib/transfer/send";
 import { collectFiles } from "../lib/files/source";
-import { buildFileTree, totalSize } from "../lib/files/tree";
+import { buildFileTree, totalSize, entrySize } from "../lib/files/tree";
 import { SESSION_EXPIRY_SEC } from "../config";
 import { createProgressTracker } from "./createProgressTracker";
 import type { SelectedEntry } from "../lib/types";
@@ -27,6 +27,9 @@ export function createSendSession() {
   const [error, setError] = createSignal("");
   const [connection, setConnection] = createSignal<ConnectionKind>("unknown");
   const [selectionSize, setSelectionSize] = createSignal(0);
+  // Aligned with entries(); derived from the same tree as the total so the
+  // rows and the summary can never disagree.
+  const [entrySizes, setEntrySizes] = createSignal<number[]>([]);
 
   // Recreated per attempt: an AbortController stays aborted forever, so one
   // cancelled session would otherwise poison every retry after it.
@@ -38,7 +41,9 @@ export function createSendSession() {
   });
 
   const refreshSize = async (items: SelectedEntry[]) => {
-    setSelectionSize(totalSize(await buildFileTree(items)));
+    const tree = await buildFileTree(items);
+    setSelectionSize(totalSize(tree));
+    setEntrySizes(tree.map(entrySize));
   };
 
   const add = (added: SelectedEntry[]) => {
@@ -103,6 +108,7 @@ export function createSendSession() {
     setShareCode("");
     setError("");
     setSelectionSize(0);
+    setEntrySizes([]);
   };
 
   return {
@@ -113,8 +119,16 @@ export function createSendSession() {
     error,
     connection,
     selectionSize,
+    entrySizes,
     progress: tracker.progress,
     isTransferring: () => state() === "transferring",
+    /** Which of Choose / Share code / Transfer is in progress. */
+    step: () => {
+      const s = state();
+      if (s === "selecting") return 0;
+      if (s === "transferring" || s === "completed") return 2;
+      return 1;
+    },
     add,
     remove,
     start,

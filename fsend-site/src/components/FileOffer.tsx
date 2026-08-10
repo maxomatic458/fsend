@@ -3,7 +3,6 @@ import { FiFolder, FiFile } from "solid-icons/fi";
 import { formatBytes } from "../lib/format";
 import { totalSize, entrySize } from "../lib/files/tree";
 import type { FilesAvailable } from "../lib/types";
-import { Button } from "./Button";
 
 interface FileOfferProps {
   files: FilesAvailable[];
@@ -12,49 +11,71 @@ interface FileOfferProps {
 }
 
 export function FileOffer(props: FileOfferProps) {
-  return (
-    <div>
-      <h3 class="text-lg font-semibold mb-3 text-ink">
-        Incoming Files
-      </h3>
-      <p class="text-sm text-ink-dim mb-4">
-        The sender wants to share the following files with you:
-      </p>
+  const count = () => props.files.length;
+  const dirs = () => props.files.filter((f) => f.type === "Dir").length;
 
-      <div class="border border-line rounded-lg divide-y divide-line max-h-60 overflow-y-auto mb-4">
+  const headline = () => {
+    const n = count();
+    if (dirs() === n && n > 0) {
+      return `The sender wants to share ${n} folder${n === 1 ? "" : "s"}`;
+    }
+    if (dirs() > 0) return `The sender wants to share ${n} items`;
+    return `The sender wants to share ${n} file${n === 1 ? "" : "s"}`;
+  };
+
+  const summary = () => {
+    const n = count();
+    if (dirs() === n && n > 0) return `${n} folder${n === 1 ? "" : "s"}`;
+    if (dirs() > 0) return `${n} items`;
+    return `${n} file${n === 1 ? "" : "s"}`;
+  };
+
+  return (
+    <div class="w-full max-w-[620px] mx-auto flex flex-col gap-4.5 pt-5">
+      <div class="flex flex-col items-center gap-1.5 text-center">
+        <h2 class="text-xl font-bold">{headline()}</h2>
+        <p class="text-sm text-ink-dim">
+          Accepting starts the transfer straight away.
+        </p>
+      </div>
+
+      <div class="flex flex-col border-t border-line max-h-80 overflow-y-auto">
         <For each={props.files}>
           {(entry) => (
-            <div class="flex items-center justify-between py-3 px-4">
-              <div class="flex items-center gap-3">
+            <div class="flex items-center justify-between gap-4 py-3.5 px-1 border-b border-line">
+              <div class="flex items-center gap-3 min-w-0">
                 {entry.type === "Dir" ? (
-                  <FiFolder class="w-6 h-6 text-ink-dim" />
+                  <FiFolder class="w-4 h-4 text-ink-faint shrink-0" />
                 ) : (
-                  <FiFile class="w-6 h-6 text-ink-dim" />
+                  <FiFile class="w-4 h-4 text-ink-faint shrink-0" />
                 )}
-                <span class="font-medium text-ink">
-                  {entry.name}
-                </span>
+                <span class="text-[15.5px] truncate">{entry.name}</span>
               </div>
-              <span class="text-sm text-ink-dim">
+              <span class="font-mono text-[13px] text-ink-dim shrink-0">
                 {formatBytes(entrySize(entry))}
               </span>
             </div>
           )}
         </For>
+        <div class="flex items-center justify-between py-3 px-1 font-mono text-xs text-ink-faint">
+          <span>{summary()}</span>
+          <span>total {formatBytes(totalSize(props.files))}</span>
+        </div>
       </div>
 
-      <div class="flex justify-between items-center">
-        <span class="text-sm font-medium text-ink-muted">
-          Total: {formatBytes(totalSize(props.files))}
-        </span>
-        <div class="flex gap-3">
-          <Button variant="red" onClick={props.onReject}>
-            Reject
-          </Button>
-          <Button variant="green" onClick={props.onAccept}>
-            Accept
-          </Button>
-        </div>
+      <div class="flex gap-2.5">
+        <button
+          onClick={props.onAccept}
+          class="flex-1 py-3.5 rounded-lg border border-blue-700 dark:border-blue-600 bg-blue-100 dark:bg-blue-800/80 text-blue-900 dark:text-blue-50 font-bold text-base hover:bg-blue-200 dark:hover:bg-blue-700/80 transition-colors cursor-pointer"
+        >
+          Accept &amp; receive
+        </button>
+        <button
+          onClick={props.onReject}
+          class="px-6 py-3.5 rounded-lg border border-line text-ink-muted font-semibold text-base hover:bg-surface-2 hover:text-ink transition-colors cursor-pointer"
+        >
+          Reject
+        </button>
       </div>
     </div>
   );

@@ -1,5 +1,6 @@
 import { PROTO_VERSION, DATA_CHUNK_SIZE, MAX_BUFFERED } from "../../config";
 import { openSenderSession } from "../transport/session";
+import { getConnectionType } from "../transport/webrtc";
 import {
   buildFileTree,
   flattenTree,
@@ -33,6 +34,11 @@ export async function runSend(
     });
     if (!session) return;
     const { control, dataChannel, peer, disconnected } = session;
+
+    // TODO
+    getConnectionType(session.pc)
+      .then((kind) => emit({ type: "connectionType", kind }))
+      .catch(() => {});
 
     // handshake
     await control.send({

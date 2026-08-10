@@ -5,42 +5,50 @@ import type { SelectedEntry } from "../lib/types";
 
 interface FileListProps {
   entries: SelectedEntry[];
+  // Aligned with `entries`; may lag by a tick while a tree is being built.
+  sizes: number[];
   onRemove: (index: number) => void;
   totalSize: number;
 }
 
+/// The chosen files
 export function FileList(props: FileListProps) {
   return (
     <Show when={props.entries.length > 0}>
-      <div class="mb-6">
-        <div class="border border-line rounded-lg divide-y divide-line max-h-60 overflow-y-auto">
-          <For each={props.entries}>
-            {(entry, i) => (
-              <div class="flex items-center justify-between py-3 px-4 hover:bg-surface-2">
-                <div class="flex items-center gap-3">
-                  {entry.kind === "directory" ? (
-                    <FiFolder class="w-6 h-6 text-ink-dim" />
-                  ) : (
-                    <FiFile class="w-6 h-6 text-ink-dim" />
-                  )}
-                  <div>
-                    <div class="font-medium text-ink">
-                      {entry.name}
-                    </div>
-                  </div>
-                </div>
+      <div class="flex flex-col border-t border-line max-h-72 overflow-y-auto">
+        <For each={props.entries}>
+          {(entry, i) => (
+            <div class="flex items-center justify-between gap-3 py-3.5 px-1 border-b border-line">
+              <div class="flex items-center gap-3 min-w-0">
+                {entry.kind === "directory" ? (
+                  <FiFolder class="w-4 h-4 text-ink-faint shrink-0" />
+                ) : (
+                  <FiFile class="w-4 h-4 text-ink-faint shrink-0" />
+                )}
+                <span class="text-[15.5px] truncate">{entry.name}</span>
+              </div>
+              <div class="flex items-center gap-2 shrink-0">
+                <Show when={props.sizes[i()] !== undefined}>
+                  <span class="font-mono text-[13px] text-ink-dim">
+                    {formatBytes(props.sizes[i()])}
+                  </span>
+                </Show>
                 <button
                   onClick={() => props.onRemove(i())}
-                  class="text-red-500 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300 p-2"
+                  class="text-ink-faint hover:text-red-500 transition-colors p-1 cursor-pointer"
+                  aria-label={`Remove ${entry.name}`}
                 >
-                  <FiX class="w-5 h-5" />
+                  <FiX class="w-4 h-4" />
                 </button>
               </div>
-            )}
-          </For>
-        </div>
-        <div class="text-right text-ink-muted mt-2">
-          Total: {formatBytes(props.totalSize)}
+            </div>
+          )}
+        </For>
+        <div class="flex items-center justify-between py-3 px-1 font-mono text-xs text-ink-faint">
+          <span>
+            {props.entries.length} item{props.entries.length === 1 ? "" : "s"}
+          </span>
+          <span>total {formatBytes(props.totalSize)}</span>
         </div>
       </div>
     </Show>

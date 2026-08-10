@@ -1,7 +1,7 @@
 import { onMount, Show } from "solid-js";
 import { useNavigate } from "@solidjs/router";
 import { Title, Meta, Link } from "@solidjs/meta";
-import { FiArrowLeft, FiSend, FiFile, FiFolder } from "solid-icons/fi";
+import { FiSend } from "solid-icons/fi";
 import { SITE_URL } from "../lib/links";
 import { pickFiles, pickDirectory, handleDrop } from "../lib/files/source";
 import type { SelectedEntry } from "../lib/types";
@@ -9,13 +9,13 @@ import { createSendSession } from "../primitives/createSendSession";
 import { createWindowDropTarget } from "../primitives/createWindowDropTarget";
 import { createExitGuard } from "../primitives/createExitGuard";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import { TransferHeader } from "../components/StepIndicator";
+import { Logo } from "../components/Logo";
 import { FileList } from "../components/FileList";
 import { ShareCode } from "../components/ShareCode";
 import { TransferProgress } from "../components/TransferProgress";
 import { ErrorCard } from "../components/ErrorCard";
 import { Button } from "../components/Button";
-import { Card } from "../components/Card";
-import { formatBytes } from "../lib/format";
 
 export function SendPage() {
   const navigate = useNavigate();
@@ -57,6 +57,12 @@ export function SendPage() {
 
   return (
     <div class="flex-1 bg-canvas py-8 px-4">
+      <div
+        class={`fixed inset-2 rounded-xl border pointer-events-none z-40 transition-opacity duration-150 ${
+          isDragging() ? "opacity-100 border-flame/50" : "opacity-0 border-transparent"
+        }`}
+      />
+
       <ConfirmDialog
         open={exitGuard.isPrompting()}
         title="Leave while sending?"
@@ -74,77 +80,89 @@ export function SendPage() {
       />
       <Link rel="canonical" href={`${SITE_URL}/send`} />
 
-      <div class="max-w-2xl mx-auto">
-        <button
-          onClick={goBack}
-          class="mb-6 text-azure hover:text-azure-hi flex items-center gap-2 transition-colors cursor-pointer"
-        >
-          <FiArrowLeft class="w-4 h-4" /> Back
-        </button>
-        <h1 class="text-3xl font-bold text-ink mb-8">Send Files</h1>
+      <div class="max-w-2xl mx-auto flex flex-col gap-6">
+        <TransferHeader
+          title="Send files"
+          steps={["Choose", "Share code", "Transfer"]}
+          current={send.step()}
+          accent="flame"
+          onBack={goBack}
+        />
 
         <Show when={send.state() === "selecting"}>
-          <Card class="mb-6">
-            <h2 class="text-xl font-semibold mb-4 text-ink">
-              Select Files or Directories
-            </h2>
-
-            <Show when={send.entries().length > 0}>
-              <FileList
-                entries={send.entries()}
-                onRemove={send.remove}
-                totalSize={send.selectionSize()}
+          <div class="flex flex-col items-center gap-3 pt-10 pb-2">
+            <Show when={send.entries().length === 0}>
+              <Logo
+                tint="flame"
+                class={`w-14 mb-1.5 transition-opacity duration-150 ${
+                  isDragging() ? "opacity-100" : "opacity-80"
+                }`}
               />
-              <hr class="border-line mb-6" />
-            </Show>
-
-            <div
-              class={`border-2 border-dashed rounded-lg p-8 mb-6 text-center transition-colors duration-150 ${
-                isDragging() ? "border-azure bg-azure/5" : "border-line"
-              }`}
-            >
-              <div
-                class={`transition-colors duration-150 ${
-                  isDragging() ? "text-azure" : "text-ink-dim"
+              <h2
+                class={`text-2xl font-bold text-center transition-colors duration-150 ${
+                  isDragging() ? "text-flame" : ""
                 }`}
               >
-                <FiFolder class="w-10 h-10 mx-auto mb-2" />
-                <div>
-                  {isDragging()
-                    ? "Drop to add"
-                    : "Drag and drop files or folders"}
-                </div>
-              </div>
-            </div>
+                {isDragging()
+                  ? "Drop to add them"
+                  : "Drop files anywhere on this page"}
+              </h2>
+              <p class="text-[14.5px] text-ink-dim text-center">
+                Any size · nothing is uploaded to a server
+              </p>
+            </Show>
 
-            <div class="flex gap-4">
-              <Button variant="blue" onClick={addFiles} class="flex-1 py-3">
-                <span class="flex items-center justify-center gap-2">
-                  <FiFile class="w-5 h-5" />
-                  Add Files
-                </span>
-              </Button>
-              <Button variant="green" onClick={addFolder} class="flex-1 py-3">
-                <span class="flex items-center justify-center gap-2">
-                  <FiFolder class="w-5 h-5" />
-                  Add Folder
-                </span>
-              </Button>
+            <Show when={send.entries().length > 0}>
+              <div class="w-full max-w-[620px]">
+                <FileList
+                  entries={send.entries()}
+                  sizes={send.entrySizes()}
+                  onRemove={send.remove}
+                  totalSize={send.selectionSize()}
+                />
+              </div>
+              <p
+                class={`text-sm transition-colors duration-150 ${
+                  isDragging() ? "text-flame" : "text-ink-faint"
+                }`}
+              >
+                {isDragging()
+                  ? "Drop to add them"
+                  : "or drop more files anywhere on this page"}
+              </p>
+            </Show>
+
+            <div class="flex flex-wrap justify-center gap-2.5 mt-4">
+              <button
+                onClick={addFiles}
+                class={`px-5 py-3 rounded-lg font-bold text-[15px] transition-colors cursor-pointer border ${
+                  send.entries().length === 0
+                    ? "border-orange-700 dark:border-orange-600 bg-orange-100 dark:bg-orange-900/70 text-orange-900 dark:text-orange-50 hover:bg-orange-200 dark:hover:bg-orange-800/70"
+                    : "border-line text-ink hover:bg-surface-2"
+                }`}
+              >
+                Browse files
+              </button>
+              <button
+                onClick={addFolder}
+                class="px-5 py-3 rounded-lg border border-line text-ink font-semibold text-[15px] hover:bg-surface-2 transition-colors cursor-pointer"
+              >
+                Browse folder
+              </button>
             </div>
 
             <Show when={send.entries().length > 0}>
-              <Button
-                variant="orange"
+              <button
                 onClick={send.start}
-                class="w-full py-3 mt-6"
+                class="w-full max-w-[620px] mt-2 py-4 rounded-lg border border-orange-700 dark:border-orange-600 bg-orange-100 dark:bg-orange-900/70 text-orange-900 dark:text-orange-50 font-bold text-base hover:bg-orange-200 dark:hover:bg-orange-800/70 transition-colors cursor-pointer"
               >
                 <span class="flex items-center justify-center gap-2">
                   <FiSend class="w-5 h-5" />
-                  Generate Share Code
+                  Generate share code
                 </span>
-              </Button>
+              </button>
             </Show>
-          </Card>
+          </div>
         </Show>
 
         <Show when={send.state() === "connecting"}>
@@ -170,37 +188,27 @@ export function SendPage() {
         <Show
           when={send.state() === "transferring" || send.state() === "completed"}
         >
-          <Card>
-            <TransferProgress
-              progress={send.progress}
-              status={
-                send.state() === "completed"
-                  ? "Transfer Complete!"
-                  : "Sending..."
-              }
-              speedLabel="Upload"
-            />
+          <TransferProgress
+            progress={send.progress}
+            verb="sent"
+            connection={send.connection()}
+            hint={
+              send.state() === "transferring"
+                ? "Keep this tab open until the transfer finishes."
+                : undefined
+            }
+          />
 
-            <Show when={send.state() === "transferring"}>
-              <p class="mt-6 text-center text-sm text-ink-dim">
-                Please keep this page open until the transfer completes
+          <Show when={send.state() === "completed"}>
+            <div class="text-center">
+              <p class="text-green-600 dark:text-green-400 font-semibold text-lg mb-4">
+                All files sent successfully!
               </p>
-            </Show>
-
-            <Show when={send.state() === "completed"}>
-              <div class="mt-6 text-center">
-                <p class="text-green-600 dark:text-green-400 font-semibold text-lg mb-4">
-                  All files sent successfully!
-                </p>
-                <p class="text-ink-dim text-sm mb-4">
-                  {formatBytes(send.progress.totalTransferred)} transferred
-                </p>
-                <Button variant="blue" onClick={goBack}>
-                  Back to Home
-                </Button>
-              </div>
-            </Show>
-          </Card>
+              <Button variant="blue" onClick={goBack}>
+                Back to Home
+              </Button>
+            </div>
+          </Show>
         </Show>
 
         <Show when={send.state() === "error"}>
@@ -218,18 +226,20 @@ export function SendPage() {
   );
 }
 
+/** Spinner + label for every "waiting on the other side" state. */
 function Busy(props: { label: string; onCancel?: () => void }) {
   return (
-    <Card class="text-center">
-      <div class="flex justify-center mb-4">
-        <div class="animate-spin w-12 h-12 border-4 border-line border-t-azure rounded-full" />
-      </div>
-      <p class="text-ink-muted mb-4">{props.label}</p>
+    <div class="flex flex-col items-center gap-4 pt-10 text-center">
+      <div class="animate-spin w-10 h-10 border-2 border-line border-t-azure rounded-full" />
+      <p class="text-ink-muted">{props.label}</p>
       <Show when={props.onCancel}>
-        <Button variant="gray" onClick={props.onCancel!}>
+        <button
+          onClick={props.onCancel!}
+          class="px-5 py-2.5 rounded-lg border border-line text-ink-muted font-semibold text-sm hover:bg-surface-2 hover:text-ink transition-colors cursor-pointer"
+        >
           Cancel
-        </Button>
+        </button>
       </Show>
-    </Card>
+    </div>
   );
 }

@@ -1,5 +1,6 @@
 import { PROTO_VERSION } from "../../config";
 import { openReceiverSession } from "../transport/session";
+import { getConnectionType } from "../transport/webrtc";
 import { flattenTree, applySkip, treeSize, treeSkip } from "../files/tree";
 import type { TransferSink } from "./sinks";
 import type { TransferListener } from "./events";
@@ -27,6 +28,10 @@ export async function runReceive(
     });
     if (!session) return;
     const { control, dataChannel, disconnected } = session;
+
+    getConnectionType(session.pc)
+      .then((kind) => emit({ type: "connectionType", kind }))
+      .catch(() => {});
 
     // handshake
     const request = await control.next();
