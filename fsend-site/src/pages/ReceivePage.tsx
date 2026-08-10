@@ -123,6 +123,7 @@ export function ReceivePage() {
         <Show when={receive.state() === "offered"}>
           <FileOffer
             files={receive.offered()}
+            inMemory={!toDisk}
             onAccept={receive.acceptOffer}
             onReject={receive.rejectOffer}
           />

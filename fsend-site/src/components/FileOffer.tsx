@@ -1,4 +1,4 @@
-import { For } from "solid-js";
+import { For, Show } from "solid-js";
 import { FiFolder, FiFile } from "solid-icons/fi";
 import { formatBytes } from "../lib/format";
 import { totalSize, entrySize } from "../lib/files/tree";
@@ -6,6 +6,8 @@ import type { FilesAvailable } from "../lib/types";
 
 interface FileOfferProps {
   files: FilesAvailable[];
+  /// True when the browser has no File System Access API
+  inMemory?: boolean;
   onAccept: () => void;
   onReject: () => void;
 }
@@ -62,6 +64,14 @@ export function FileOffer(props: FileOfferProps) {
           <span>total {formatBytes(totalSize(props.files))}</span>
         </div>
       </div>
+
+      <Show when={props.inMemory}>
+        <div class="bg-warn-bg text-warn-ink border border-warn-line rounded-lg px-4 py-3 text-sm leading-relaxed">
+          Ensure you have {formatBytes(totalSize(props.files))} of free system
+          memory — this browser holds the whole transfer in memory until it is
+          saved.
+        </div>
+      </Show>
 
       <div class="flex gap-2.5">
         <button

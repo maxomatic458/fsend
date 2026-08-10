@@ -57,12 +57,6 @@ export function SendPage() {
 
   return (
     <div class="flex-1 bg-canvas py-8 px-4">
-      <div
-        class={`fixed inset-2 rounded-xl border pointer-events-none z-40 transition-opacity duration-150 ${
-          isDragging() ? "opacity-100 border-flame/50" : "opacity-0 border-transparent"
-        }`}
-      />
-
       <ConfirmDialog
         open={exitGuard.isPrompting()}
         title="Leave while sending?"
