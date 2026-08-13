@@ -6,8 +6,8 @@ export interface TransferSink {
   readonly canResume: boolean;
   /** Bytes already present per offered entry, so the sender can skip them. */
   existing(offered: FilesAvailable[]): Promise<(FilesToSkip | null)[]>;
-  /** Begin a file; `skip` bytes of it are already accounted for. */
-  open(path: string, skip: number): Promise<void>;
+  /** Begin a file; `skipBytes` of it are already accounted for. */
+  open(path: string, skipBytes: number): Promise<void>;
   write(chunk: Uint8Array): Promise<void>;
   /** Finish the file opened by the last `open`. Safe to call with none open. */
   closeFile(): Promise<void>;
@@ -34,7 +34,7 @@ export function createDiskSink(
       return result;
     },
 
-    async open(path, skip) {
+    async open(path, skipBytes) {
       const parts = path.split("/");
       let dir = dirHandle;
       for (let i = 0; i < parts.length - 1; i++) {
@@ -43,8 +43,8 @@ export function createDiskSink(
       const file = await dir.getFileHandle(parts[parts.length - 1], {
         create: true,
       });
-      writable = await file.createWritable({ keepExistingData: skip > 0 });
-      if (skip > 0) await writable.seek(skip);
+      writable = await file.createWritable({ keepExistingData: skipBytes > 0 });
+      if (skipBytes > 0) await writable.seek(skipBytes);
     },
 
     async write(chunk) {

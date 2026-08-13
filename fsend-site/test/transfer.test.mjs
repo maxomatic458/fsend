@@ -106,7 +106,7 @@ describe("complete transfers (File System Access API)", () => {
   });
 
   test("a file larger than the send buffer still completes", async () => {
-    // Comfortably past MAX_BUFFERED so the backpressure path is exercised.
+    // Comfortably past MAX_BUFFERED_BYTES so the backpressure path is exercised.
     const spec = { "big.bin": bytes(3_000_000, 31) };
     const { dirHandle, send, recv } = await transfer(spec);
 

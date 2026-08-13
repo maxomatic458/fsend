@@ -89,6 +89,7 @@ export function createReceiveSession(initialCode = "") {
             setConnection(event.kind);
             break;
           case "complete":
+            tracker.complete();
             setState("completed");
             break;
           case "error":

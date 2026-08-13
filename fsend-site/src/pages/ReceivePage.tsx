@@ -161,7 +161,7 @@ export function ReceivePage() {
                 All files received successfully!
               </p>
               <p class="text-ink-muted mb-4">
-                {formatBytes(receive.progress.totalTransferred)}{" "}
+                {formatBytes(receive.progress.totalTransferredBytes)}{" "}
                 {toDisk ? `saved to ${receive.folder()?.name}` : "downloaded"}
               </p>
               <Button variant="blue" onClick={goBack}>

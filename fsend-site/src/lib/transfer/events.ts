@@ -4,8 +4,9 @@ export type ConnectionKind = "direct" | "relay" | "unknown";
 
 export interface TransferEntry {
   name: string;
-  size: number;
-  skip: number;
+  sizeBytes: number;
+  // Bytes that were already present on receiver and skipped.
+  skipBytes: number;
   isDir: boolean;
 }
 

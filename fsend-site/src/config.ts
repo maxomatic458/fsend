@@ -13,7 +13,7 @@ export const MAX_DC_PAYLOAD = CHUNK_SIZE - 1;
 export const FRAG_MORE = 0x00;
 export const FRAG_LAST = 0x01;
 
-export const DATA_CHUNK_SIZE = 16383;
-export const MAX_BUFFERED = 1_048_576;
+export const DATA_CHUNK_BYTES = 16383;
+export const MAX_BUFFERED_BYTES = 1_048_576;
 
-export const SESSION_EXPIRY_SEC = 300;
+export const SESSION_EXPIRY_SECS = 300;

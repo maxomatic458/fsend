@@ -4,7 +4,7 @@ import qrcode from "qrcode-generator";
 
 interface ShareCodeProps {
   code: string;
-  expiresAt: number;
+  expiresAtMs: number;
   onCancel?: () => void;
 }
 
@@ -27,7 +27,7 @@ export function ShareCode(props: ShareCodeProps) {
   createEffect(() => {
     const update = () =>
       setSecondsLeft(
-        Math.max(0, Math.floor((props.expiresAt - Date.now()) / 1000)),
+        Math.max(0, Math.floor((props.expiresAtMs - Date.now()) / 1000)),
       );
     update();
     const id = setInterval(update, 1000);

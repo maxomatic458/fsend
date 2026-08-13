@@ -1,12 +1,16 @@
-import { PROTO_VERSION, DATA_CHUNK_SIZE, MAX_BUFFERED } from "../../config";
+import {
+  PROTO_VERSION,
+  DATA_CHUNK_BYTES,
+  MAX_BUFFERED_BYTES,
+} from "../../config";
 import { openSenderSession } from "../transport/session";
 import { getConnectionType } from "../transport/webrtc";
 import {
   buildFileTree,
   flattenTree,
   applySkip,
-  treeSize,
-  treeSkip,
+  treeSizeBytes,
+  treeSkipBytes,
 } from "../files/tree";
 import { collectFiles } from "../files/source";
 import type { TransferListener } from "./events";
@@ -81,24 +85,24 @@ export async function runSend(
       type: "transferring",
       entries: trees.map((t) => ({
         name: t.name,
-        size: treeSize(t),
-        skip: treeSkip(t),
+        sizeBytes: treeSizeBytes(t),
+        skipBytes: treeSkipBytes(t),
         isDir: t.type === "Dir",
       })),
     });
 
-    dataChannel.bufferedAmountLowThreshold = MAX_BUFFERED / 2;
+    dataChannel.bufferedAmountLowThreshold = MAX_BUFFERED_BYTES / 2;
 
-    for (const { path, skip, size } of flat) {
+    for (const { path, skipBytes, sizeBytes } of flat) {
       const file = files.get(path);
       if (!file) throw new Error(`File not found: ${path}`);
 
-      let sent = skip;
-      while (sent < size) {
+      let sentBytes = skipBytes;
+      while (sentBytes < sizeBytes) {
         if (abort.aborted) return;
         if (peer.isDown()) throw new Error("Peer disconnected");
 
-        if (dataChannel.bufferedAmount > MAX_BUFFERED) {
+        if (dataChannel.bufferedAmount > MAX_BUFFERED_BYTES) {
           await Promise.race([
             new Promise<void>((resolve) => {
               dataChannel.onbufferedamountlow = () => resolve();
@@ -107,10 +111,10 @@ export async function runSend(
           ]);
         }
 
-        const end = Math.min(sent + DATA_CHUNK_SIZE, size);
-        dataChannel.send(await file.slice(sent, end).arrayBuffer());
-        emit({ type: "progress", bytes: end - sent });
-        sent = end;
+        const endBytes = Math.min(sentBytes + DATA_CHUNK_BYTES, sizeBytes);
+        dataChannel.send(await file.slice(sentBytes, endBytes).arrayBuffer());
+        emit({ type: "progress", bytes: endBytes - sentBytes });
+        sentBytes = endBytes;
       }
     }
 

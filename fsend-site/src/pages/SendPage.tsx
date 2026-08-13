@@ -110,7 +110,7 @@ export function SendPage() {
                 <FileList
                   items={send.items()}
                   onRemove={send.remove}
-                  totalSize={send.selectionSize()}
+                  totalSizeBytes={send.selectionSizeBytes()}
                 />
               </div>
               <p
@@ -164,7 +164,7 @@ export function SendPage() {
         <Show when={send.state() === "waiting"}>
           <ShareCode
             code={send.shareCode()}
-            expiresAt={send.expiresAt()}
+            expiresAtMs={send.expiresAtMs()}
             onCancel={send.cancel}
           />
         </Show>

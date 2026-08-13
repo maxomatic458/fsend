@@ -43,7 +43,7 @@ function fastFile(name, size) {
 
 /** Every row's name paired with the size shown next to it. */
 const labelled = (session) =>
-  session.items().map((item) => [item.entry.name, item.size]);
+  session.items().map((item) => [item.entry.name, item.sizeBytes]);
 
 /** Runs `body` inside a reactive root and disposes it afterwards. */
 async function withSession(body) {
@@ -78,7 +78,7 @@ describe("selection sizing", () => {
         "each row must carry its own size, whatever order they finished in",
       );
       assert.equal(
-        session.selectionSize(),
+        session.selectionSizeBytes(),
         12 * 1000 + 500,
         "total must include both the folder and the file",
       );
@@ -102,7 +102,7 @@ describe("selection sizing", () => {
         "the removed folder must not come back when its walk lands",
       );
       assert.equal(
-        session.selectionSize(),
+        session.selectionSizeBytes(),
         500 + 700,
         "total must reflect the removal, not the pre-removal selection",
       );
@@ -116,7 +116,7 @@ describe("selection sizing", () => {
 
       await sleep(400);
       assert.deepEqual(session.items(), [], "the selection must stay cleared");
-      assert.equal(session.selectionSize(), 0, "total must stay cleared");
+      assert.equal(session.selectionSizeBytes(), 0, "total must stay cleared");
     });
   });
 
@@ -129,7 +129,7 @@ describe("selection sizing", () => {
         "the row appears immediately, with no size yet",
       );
       assert.equal(
-        session.selectionSize(),
+        session.selectionSizeBytes(),
         0,
         "an unmeasured item contributes nothing to the total",
       );

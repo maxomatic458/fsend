@@ -1,7 +1,12 @@
 import { PROTO_VERSION } from "../../config";
 import { openReceiverSession } from "../transport/session";
 import { getConnectionType } from "../transport/webrtc";
-import { flattenTree, applySkip, treeSize, treeSkip } from "../files/tree";
+import {
+  flattenTree,
+  applySkip,
+  treeSizeBytes,
+  treeSkipBytes,
+} from "../files/tree";
 import type { TransferSink } from "./sinks";
 import type { TransferListener } from "./events";
 import type { FilesToSkip, FileSendRecvTree, ReceiverToSender } from "../types";
@@ -86,8 +91,8 @@ export async function runReceive(
       type: "transferring",
       entries: trees.map((t) => ({
         name: t.name,
-        size: treeSize(t),
-        skip: treeSkip(t),
+        sizeBytes: treeSizeBytes(t),
+        skipBytes: treeSkipBytes(t),
         isDir: t.type === "Dir",
       })),
     });
@@ -100,7 +105,7 @@ export async function runReceive(
 
     // data
     let fileIdx = 0;
-    let written = flat[0].skip;
+    let writtenBytes = flat[0].skipBytes;
 
     // Buffer chunks from the very first one
     const queue: Uint8Array[] = [];
@@ -109,19 +114,22 @@ export async function runReceive(
       queue.push(new Uint8Array(ev.data));
     };
 
-    await sink.open(flat[0].path, flat[0].skip);
+    await sink.open(flat[0].path, flat[0].skipBytes);
 
     const received = new Promise<void>((resolve, reject) => {
       let draining = false;
 
       /// Close finished files and open the next, returns true if the transfer is complete.
       const advance = async () => {
-        while (fileIdx < flat.length && written >= flat[fileIdx].size) {
+        while (
+          fileIdx < flat.length &&
+          writtenBytes >= flat[fileIdx].sizeBytes
+        ) {
           await sink.closeFile();
           fileIdx++;
           if (fileIdx < flat.length) {
-            written = flat[fileIdx].skip;
-            await sink.open(flat[fileIdx].path, flat[fileIdx].skip);
+            writtenBytes = flat[fileIdx].skipBytes;
+            await sink.open(flat[fileIdx].path, flat[fileIdx].skipBytes);
           }
         }
         if (fileIdx >= flat.length) {
@@ -142,7 +150,7 @@ export async function runReceive(
             const chunk = queue.shift()!;
             if (fileIdx >= flat.length) break;
             await sink.write(chunk);
-            written += chunk.length;
+            writtenBytes += chunk.length;
             emit({ type: "progress", bytes: chunk.length });
             if (await advance()) return;
           }

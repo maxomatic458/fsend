@@ -6,7 +6,7 @@ import type { SelectedItem } from "../primitives/createSendSession";
 interface FileListProps {
   items: SelectedItem[];
   onRemove: (index: number) => void;
-  totalSize: number;
+  totalSizeBytes: number;
 }
 
 /**
@@ -32,7 +32,7 @@ export function FileList(props: FileListProps) {
               </div>
               <div class="flex items-center gap-2 shrink-0">
                 <span class="font-mono text-[13px] text-ink-dim">
-                  {item.size === null ? "…" : formatBytes(item.size)}
+                  {item.sizeBytes === null ? "…" : formatBytes(item.sizeBytes)}
                 </span>
                 <button
                   onClick={() => props.onRemove(i())}
@@ -49,7 +49,7 @@ export function FileList(props: FileListProps) {
           <span>
             {props.items.length} item{props.items.length === 1 ? "" : "s"}
           </span>
-          <span>total {formatBytes(props.totalSize)}</span>
+          <span>total {formatBytes(props.totalSizeBytes)}</span>
         </div>
       </div>
     </Show>

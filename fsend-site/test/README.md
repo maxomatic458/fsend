@@ -28,7 +28,7 @@ to drift out of sync.
 ## Coverage
 
 - **Complete transfers (native FS):** single file, several files with a nested
-  folder, picker-handle sources, a file past `MAX_BUFFERED` (backpressure), an
+  folder, picker-handle sources, a file past `MAX_BUFFERED_BYTES` (backpressure), an
   empty file.
 - **Complete transfers (fallback):** single-file direct download, folder as a
   zip, multiple loose files as a zip. Same `runReceive`, driven by a download

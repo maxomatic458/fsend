@@ -1,8 +1,8 @@
 import { createMemo, createSignal, onCleanup } from "solid-js";
 import { runSend } from "../lib/transfer/send";
 import { collectFiles } from "../lib/files/source";
-import { buildFileTree, entrySize } from "../lib/files/tree";
-import { SESSION_EXPIRY_SEC } from "../config";
+import { buildFileTree, entrySizeBytes } from "../lib/files/tree";
+import { SESSION_EXPIRY_SECS } from "../config";
 import { createProgressTracker } from "./createProgressTracker";
 import type { SelectedEntry } from "../lib/types";
 import type { ConnectionKind } from "../lib/transfer/events";
@@ -11,7 +11,7 @@ import type { ConnectionKind } from "../lib/transfer/events";
 export interface SelectedItem {
   entry: SelectedEntry;
   /// null when the size is measured
-  size: number | null;
+  sizeBytes: number | null;
 }
 
 export type SendState =
@@ -30,13 +30,13 @@ export function createSendSession() {
   const [state, setState] = createSignal<SendState>("selecting");
   const [items, setItems] = createSignal<SelectedItem[]>([]);
   const [shareCode, setShareCode] = createSignal("");
-  const [expiresAt, setExpiresAt] = createSignal(0);
+  const [expiresAtMs, setExpiresAtMs] = createSignal(0);
   const [error, setError] = createSignal("");
   const [connection, setConnection] = createSignal<ConnectionKind>("unknown");
 
   const entries = createMemo(() => items().map((item) => item.entry));
-  const selectionSize = createMemo(() =>
-    items().reduce((total, item) => total + (item.size ?? 0), 0),
+  const selectionSizeBytes = createMemo(() =>
+    items().reduce((total, item) => total + (item.sizeBytes ?? 0), 0),
   );
 
   // Recreated per attempt.
@@ -50,10 +50,10 @@ export function createSendSession() {
   // Measure a single item and update its size in the list.
   const measure = async (item: SelectedItem) => {
     const [tree] = await buildFileTree([item.entry]);
-    const size = tree ? entrySize(tree) : 0;
+    const sizeBytes = tree ? entrySizeBytes(tree) : 0;
     setItems((current) =>
       current.includes(item)
-        ? current.map((each) => (each === item ? { ...each, size } : each))
+        ? current.map((each) => (each === item ? { ...each, sizeBytes } : each))
         : current,
     );
   };
@@ -62,7 +62,7 @@ export function createSendSession() {
     // Appended to list
     const pending: SelectedItem[] = added.map((entry) => ({
       entry,
-      size: null,
+      sizeBytes: null,
     }));
     setItems((current) => [...current, ...pending]);
     for (const item of pending) void measure(item);
@@ -83,7 +83,7 @@ export function createSendSession() {
         switch (event.type) {
           case "code":
             setShareCode(event.code);
-            setExpiresAt(Date.now() + SESSION_EXPIRY_SEC * 1000);
+            setExpiresAtMs(Date.now() + SESSION_EXPIRY_SECS * 1000);
             setState("waiting");
             break;
           case "handshaking":
@@ -103,6 +103,7 @@ export function createSendSession() {
             setConnection(event.kind);
             break;
           case "complete":
+            tracker.complete();
             setState("completed");
             break;
           case "error":
@@ -131,11 +132,11 @@ export function createSendSession() {
     state,
     entries,
     shareCode,
-    expiresAt,
+    expiresAtMs,
     error,
     connection,
     items,
-    selectionSize,
+    selectionSizeBytes,
     progress: tracker.progress,
     isTransferring: () => state() === "transferring",
     /** Which of Choose / Share code / Transfer is in progress. */
