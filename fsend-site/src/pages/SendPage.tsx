@@ -108,8 +108,7 @@ export function SendPage() {
             <Show when={send.entries().length > 0}>
               <div class="w-full max-w-[620px]">
                 <FileList
-                  entries={send.entries()}
-                  sizes={send.entrySizes()}
+                  items={send.items()}
                   onRemove={send.remove}
                   totalSize={send.selectionSize()}
                 />

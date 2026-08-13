@@ -1,11 +1,18 @@
-import { createSignal, onCleanup } from "solid-js";
+import { createMemo, createSignal, onCleanup } from "solid-js";
 import { runSend } from "../lib/transfer/send";
 import { collectFiles } from "../lib/files/source";
-import { buildFileTree, totalSize, entrySize } from "../lib/files/tree";
+import { buildFileTree, entrySize } from "../lib/files/tree";
 import { SESSION_EXPIRY_SEC } from "../config";
 import { createProgressTracker } from "./createProgressTracker";
 import type { SelectedEntry } from "../lib/types";
 import type { ConnectionKind } from "../lib/transfer/events";
+
+/// Selected item with its size
+export interface SelectedItem {
+  entry: SelectedEntry;
+  /// null when the size is measured
+  size: number | null;
+}
 
 export type SendState =
   | "selecting"
@@ -21,18 +28,18 @@ export function createSendSession() {
   const tracker = createProgressTracker();
 
   const [state, setState] = createSignal<SendState>("selecting");
-  const [entries, setEntries] = createSignal<SelectedEntry[]>([]);
+  const [items, setItems] = createSignal<SelectedItem[]>([]);
   const [shareCode, setShareCode] = createSignal("");
   const [expiresAt, setExpiresAt] = createSignal(0);
   const [error, setError] = createSignal("");
   const [connection, setConnection] = createSignal<ConnectionKind>("unknown");
-  const [selectionSize, setSelectionSize] = createSignal(0);
-  // Aligned with entries(); derived from the same tree as the total so the
-  // rows and the summary can never disagree.
-  const [entrySizes, setEntrySizes] = createSignal<number[]>([]);
 
-  // Recreated per attempt: an AbortController stays aborted forever, so one
-  // cancelled session would otherwise poison every retry after it.
+  const entries = createMemo(() => items().map((item) => item.entry));
+  const selectionSize = createMemo(() =>
+    items().reduce((total, item) => total + (item.size ?? 0), 0),
+  );
+
+  // Recreated per attempt.
   let abortController = new AbortController();
 
   onCleanup(() => {
@@ -40,22 +47,29 @@ export function createSendSession() {
     tracker.cleanup();
   });
 
-  const refreshSize = async (items: SelectedEntry[]) => {
-    const tree = await buildFileTree(items);
-    setSelectionSize(totalSize(tree));
-    setEntrySizes(tree.map(entrySize));
+  // Measure a single item and update its size in the list.
+  const measure = async (item: SelectedItem) => {
+    const [tree] = await buildFileTree([item.entry]);
+    const size = tree ? entrySize(tree) : 0;
+    setItems((current) =>
+      current.includes(item)
+        ? current.map((each) => (each === item ? { ...each, size } : each))
+        : current,
+    );
   };
 
   const add = (added: SelectedEntry[]) => {
-    const next = [...entries(), ...added];
-    setEntries(next);
-    refreshSize(next);
+    // Appended to list
+    const pending: SelectedItem[] = added.map((entry) => ({
+      entry,
+      size: null,
+    }));
+    setItems((current) => [...current, ...pending]);
+    for (const item of pending) void measure(item);
   };
 
   const remove = (index: number) => {
-    const next = entries().filter((_, i) => i !== index);
-    setEntries(next);
-    refreshSize(next);
+    setItems((current) => current.filter((_, i) => i !== index));
   };
 
   const start = () => {
@@ -108,11 +122,9 @@ export function createSendSession() {
 
   const reset = () => {
     setState("selecting");
-    setEntries([]);
+    setItems([]);
     setShareCode("");
     setError("");
-    setSelectionSize(0);
-    setEntrySizes([]);
   };
 
   return {
@@ -122,8 +134,8 @@ export function createSendSession() {
     expiresAt,
     error,
     connection,
+    items,
     selectionSize,
-    entrySizes,
     progress: tracker.progress,
     isTransferring: () => state() === "transferring",
     /** Which of Choose / Share code / Transfer is in progress. */
