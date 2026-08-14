@@ -30,8 +30,11 @@ export function createExitGuard(isBlocking: () => boolean) {
     event.returnValue = "";
   };
 
-  onMount(() => window.addEventListener("beforeunload", onBeforeUnload));
-  onCleanup(() => window.removeEventListener("beforeunload", onBeforeUnload));
+  // Paired inside onMount so neither runs during the build-time prerender.
+  onMount(() => {
+    window.addEventListener("beforeunload", onBeforeUnload);
+    onCleanup(() => window.removeEventListener("beforeunload", onBeforeUnload));
+  });
 
   return {
     isPrompting: () => pendingRetry() !== null,

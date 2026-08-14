@@ -6,7 +6,7 @@
   "scripts": {
     "start": "vite",
     "dev": "vite",
-    "build": "vite build",
+    "build": "vite build && vite build --ssr src/entry-server.tsx --outDir .ssg && node scripts/ssg.mjs",
     "serve": "vite preview",
     "test": "node test/run.mjs",
     "format": "prettier --write .",

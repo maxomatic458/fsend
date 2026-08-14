@@ -68,6 +68,8 @@ export function createWindowDropTarget(onFiles: (data: DataTransfer) => void) {
     if (isDragging()) clear();
   };
 
+  // Registered inside onMount so neither half runs during the build-time
+  // prerender, where there is no window to listen on.
   onMount(() => {
     window.addEventListener("dragenter", handleEnter);
     window.addEventListener("dragover", handleOver);
@@ -75,15 +77,15 @@ export function createWindowDropTarget(onFiles: (data: DataTransfer) => void) {
     window.addEventListener("dragend", clear);
     window.addEventListener("drop", handleDrop);
     window.addEventListener("mouseover", handleMouseOver);
-  });
 
-  onCleanup(() => {
-    window.removeEventListener("dragenter", handleEnter);
-    window.removeEventListener("dragover", handleOver);
-    window.removeEventListener("dragleave", handleLeave);
-    window.removeEventListener("dragend", clear);
-    window.removeEventListener("drop", handleDrop);
-    window.removeEventListener("mouseover", handleMouseOver);
+    onCleanup(() => {
+      window.removeEventListener("dragenter", handleEnter);
+      window.removeEventListener("dragover", handleOver);
+      window.removeEventListener("dragleave", handleLeave);
+      window.removeEventListener("dragend", clear);
+      window.removeEventListener("drop", handleDrop);
+      window.removeEventListener("mouseover", handleMouseOver);
+    });
   });
 
   return isDragging;

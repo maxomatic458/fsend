@@ -14,6 +14,10 @@ if (import.meta.env.DEV && !(root instanceof HTMLElement)) {
   );
 }
 
+// The prerendered markup is only there for crawlers and first paint; Solid
+// appends rather than replaces, so clear it before mounting.
+root!.textContent = "";
+
 render(
   () => (
     <MetaProvider>
