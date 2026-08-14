@@ -35,17 +35,17 @@ cargo install fsend-cli
 
 ### Webapp
 1. Open [fsend](https://fsend.sh) in your browser.
-2. Either send or receive a file
+2. Either send or receive file(s)
     * As a sender:
         1. Drag and Drop or select the file(s)/folder(s) you want to send.
-        2. Share the generated code — or the link, or the QR code — with the receiver.
+        2. Share the generated code, the link, or the QR code with the receiver.
     * As a receiver:
-        1. Enter the code provided by the sender. Pasting the sender's link works too.
-        2. On Chromium, pick the folder to save into (tick "Resume an interrupted transfer" to continue a previous attempt).
-        3. Accept the offer and the file(s)/folder(s) will start transferring.
+        1. Enter the code or link provided by the sender.
+        2. Select the download location (if your browser supports it).
+        2. Accept the offer and the file(s)/folder(s) will start downloading.
 
-Both tabs have to stay open for the whole transfer; nothing is stored in
-between.
+Both tabs have to stay open during the transfer.
+The transfer speed should be within 80-90% of `min(sender_up, receiver_down)`.
 
 ### CLI
 
