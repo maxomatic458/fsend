@@ -13,6 +13,7 @@ import { FileOffer } from "../components/FileOffer";
 import { TransferProgress } from "../components/TransferProgress";
 import { ErrorCard } from "../components/ErrorCard";
 import { Button } from "../components/Button";
+import { Busy } from "../components/Busy";
 import { formatBytes } from "../lib/format";
 
 export function ReceivePage() {
@@ -28,7 +29,7 @@ export function ReceivePage() {
   const cancelTransfer = () => exitGuard.withoutPrompt(goBack);
 
   return (
-    <div class="flex-1 bg-canvas py-8 px-4">
+    <div class="theme-azure flex-1 bg-canvas py-8 px-4">
       <ConfirmDialog
         open={exitGuard.isPrompting()}
         title="Leave while downloading?"
@@ -51,7 +52,6 @@ export function ReceivePage() {
           title="Receive Files"
           steps={["Enter code", "Connect", "Receive"]}
           current={receive.step()}
-          accent="azure"
           onBack={goBack}
         />
 
@@ -71,15 +71,15 @@ export function ReceivePage() {
                   <div class="flex-1 min-w-0 flex items-center px-4 py-3 border border-line rounded-lg bg-surface-2 text-ink truncate">
                     {receive.folder()?.name ?? "No folder selected"}
                   </div>
-                  <button
+                  <Button
                     onClick={receive.chooseFolder}
-                    class="px-5 py-3 rounded-lg border border-line text-ink font-semibold text-sm hover:bg-surface-2 transition-colors cursor-pointer whitespace-nowrap"
+                    class="whitespace-nowrap"
                   >
                     <span class="flex items-center gap-2">
                       <FiFolder class="w-4 h-4" />
                       Choose folder
                     </span>
-                  </button>
+                  </Button>
                 </div>
                 <label class="flex items-center gap-2 text-sm text-ink-dim cursor-pointer">
                   <input
@@ -93,13 +93,15 @@ export function ReceivePage() {
               </div>
             </Show>
 
-            <button
-              onClick={receive.start}
+            <Button
+              tone="accent"
+              size="lg"
+              class="w-full"
               disabled={!receive.isReady()}
-              class="w-full py-4 rounded-lg border border-blue-700 dark:border-blue-600 bg-blue-100 dark:bg-blue-800/80 text-blue-900 dark:text-blue-50 font-bold text-base hover:bg-blue-200 dark:hover:bg-blue-700/80 disabled:opacity-50 disabled:cursor-not-allowed transition-colors cursor-pointer"
+              onClick={receive.start}
             >
               Connect &amp; receive
-            </button>
+            </Button>
 
             <p class="text-[13px] text-ink-faint text-center leading-relaxed max-w-[460px]">
               {toDisk
@@ -145,26 +147,23 @@ export function ReceivePage() {
             }
             actions={
               <Show when={receive.state() === "transferring" && toDisk}>
-                <button
-                  onClick={cancelTransfer}
-                  class="px-5 py-2.5 rounded-lg border border-line text-ink-muted font-semibold text-sm hover:bg-surface-2 hover:text-ink transition-colors cursor-pointer"
-                >
+                <Button tone="ghost" size="sm" onClick={cancelTransfer}>
                   Cancel
-                </button>
+                </Button>
               </Show>
             }
           />
 
           <Show when={receive.state() === "completed"}>
             <div class="text-center">
-              <p class="text-green-600 dark:text-green-400 font-semibold text-lg mb-4">
+              <p class="text-ok font-semibold text-lg mb-4">
                 All files received successfully!
               </p>
               <p class="text-ink-muted mb-4">
                 {formatBytes(receive.progress.totalTransferredBytes)}{" "}
                 {toDisk ? `saved to ${receive.folder()?.name}` : "downloaded"}
               </p>
-              <Button variant="blue" onClick={goBack}>
+              <Button tone="accent" onClick={goBack}>
                 Back to Home
               </Button>
             </div>
@@ -172,34 +171,13 @@ export function ReceivePage() {
         </Show>
 
         <Show when={receive.state() === "error"}>
-          <ErrorCard class="text-center">
-            <p class="text-red-600 dark:text-red-400 font-semibold mb-4">
-              {receive.error()}
-            </p>
-            <Button variant="red" onClick={receive.retry}>
-              Try Again
-            </Button>
-          </ErrorCard>
+          <ErrorCard
+            class="text-center"
+            message={receive.error()}
+            onRetry={receive.retry}
+          />
         </Show>
       </div>
-    </div>
-  );
-}
-
-/** Spinner + label for every "waiting on the other side" state. */
-function Busy(props: { label: string; onCancel?: () => void }) {
-  return (
-    <div class="flex flex-col items-center gap-4 pt-10 text-center">
-      <div class="animate-spin w-10 h-10 border-2 border-line border-t-azure rounded-full" />
-      <p class="text-ink-muted">{props.label}</p>
-      <Show when={props.onCancel}>
-        <button
-          onClick={props.onCancel!}
-          class="px-5 py-2.5 rounded-lg border border-line text-ink-muted font-semibold text-sm hover:bg-surface-2 hover:text-ink transition-colors cursor-pointer"
-        >
-          Cancel
-        </button>
-      </Show>
     </div>
   );
 }

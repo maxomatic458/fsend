@@ -164,6 +164,33 @@
   --azure: #2a5ed6;
   --azure-hi: #1c46a6;
 
+  /* Tinted panel/button fills. `soft-hi` is the hover step, `deep` the shadow
+     slab behind the landing CTAs, `line`/`ink` the border and label.
+     Values are the Tailwind palette entries these replaced, verbatim, so the
+     rendered colour is unchanged: orange-100/200/700/900/950 etc. */
+  --flame-soft: oklch(95.4% 0.038 75.164);
+  --flame-soft-hi: oklch(90.1% 0.076 70.697);
+  --flame-line: oklch(55.3% 0.195 38.402);
+  --flame-ink: oklch(40.8% 0.123 38.172);
+  --flame-deep: oklch(26.6% 0.079 36.259);
+
+  --azure-soft: oklch(93.2% 0.032 255.585);
+  --azure-soft-hi: oklch(88.2% 0.059 254.128);
+  --azure-line: oklch(48.8% 0.243 264.376);
+  --azure-ink: oklch(37.9% 0.146 265.522);
+  --azure-deep: oklch(28.2% 0.091 267.935);
+
+  --danger: oklch(57.7% 0.245 27.325);
+  --danger-soft: oklch(93.6% 0.032 17.717);
+  --danger-soft-hi: oklch(88.5% 0.062 18.334);
+  --danger-line: oklch(50.5% 0.213 27.518);
+  --danger-ink: oklch(39.6% 0.141 25.723);
+  --danger-panel: oklch(97.1% 0.013 17.38);
+  --danger-panel-line: oklch(88.5% 0.062 18.334);
+
+  --ok: oklch(62.7% 0.194 149.214);
+  --ok-bar: oklch(72.3% 0.219 149.579);
+
   --warn-bg: #fbf3dd;
   --warn-line: #e0c887;
   --warn-ink: #7a5c11;
@@ -188,6 +215,31 @@
   --azure: #4d84ff;
   --azure-hi: #8aa7ff;
 
+  /* Alpha is kept in the token so these stay translucent over any surface,
+     exactly as the `bg-orange-900/70`-style classes they replace did. */
+  --flame-soft: oklch(40.8% 0.123 38.172 / 0.7);
+  --flame-soft-hi: oklch(47% 0.157 37.304 / 0.7);
+  --flame-line: oklch(64.6% 0.222 41.116);
+  --flame-ink: oklch(98% 0.016 73.684);
+  --flame-deep: oklch(40.8% 0.123 38.172);
+
+  --azure-soft: oklch(42.4% 0.199 265.638 / 0.8);
+  --azure-soft-hi: oklch(48.8% 0.243 264.376 / 0.8);
+  --azure-line: oklch(54.6% 0.245 262.881);
+  --azure-ink: oklch(97% 0.014 254.604);
+  --azure-deep: oklch(37.9% 0.146 265.522);
+
+  --danger: oklch(70.4% 0.191 22.216);
+  --danger-soft: oklch(39.6% 0.141 25.723 / 0.6);
+  --danger-soft-hi: oklch(44.4% 0.177 26.899 / 0.6);
+  --danger-line: oklch(57.7% 0.245 27.325);
+  --danger-ink: oklch(93.6% 0.032 17.717);
+  --danger-panel: oklch(39.6% 0.141 25.723 / 0.2);
+  --danger-panel-line: oklch(44.4% 0.177 26.899);
+
+  --ok: oklch(79.2% 0.209 151.711);
+  --ok-bar: oklch(72.3% 0.219 149.579);
+
   --warn-bg: #2a2109;
   --warn-line: #5c4a12;
   --warn-ink: #d7bd63;
@@ -210,6 +262,26 @@
   --color-azure: var(--azure);
   --color-azure-hi: var(--azure-hi);
 
+  /* Resolved from whichever .accent-* class is on the page container, so a
+     component can say `bg-accent-soft` without knowing which side it is on. */
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+  --color-accent-soft-hi: var(--accent-soft-hi);
+  --color-accent-line: var(--accent-line);
+  --color-accent-ink: var(--accent-ink);
+  --color-accent-deep: var(--accent-deep);
+
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-danger-soft-hi: var(--danger-soft-hi);
+  --color-danger-line: var(--danger-line);
+  --color-danger-ink: var(--danger-ink);
+  --color-danger-panel: var(--danger-panel);
+  --color-danger-panel-line: var(--danger-panel-line);
+
+  --color-ok: var(--ok);
+  --color-ok-bar: var(--ok-bar);
+
   --color-warn-bg: var(--warn-bg);
   --color-warn-line: var(--warn-line);
   --color-warn-ink: var(--warn-ink);
@@ -222,6 +294,36 @@
 }
 
 @layer components {
+  /*
+   * The two sides of the app are the same screens in different colours: send is
+   * flame, receive is azure. Putting the accent on the container rather than
+   * threading a prop down means buttons, the step rail and the progress bar all
+   * pick it up from the cascade and stay side-agnostic.
+   *
+   * Named `theme-*` rather than `accent-*`: Tailwind already generates an
+   * `accent-<color>` utility for the CSS accent-color property, and shadowing
+   * it would be a trap. Flame is the :root default so a component rendered
+   * outside a page container still resolves to something.
+   */
+  :root,
+  .theme-flame {
+    --accent: var(--flame);
+    --accent-soft: var(--flame-soft);
+    --accent-soft-hi: var(--flame-soft-hi);
+    --accent-line: var(--flame-line);
+    --accent-ink: var(--flame-ink);
+    --accent-deep: var(--flame-deep);
+  }
+
+  .theme-azure {
+    --accent: var(--azure);
+    --accent-soft: var(--azure-soft);
+    --accent-soft-hi: var(--azure-soft-hi);
+    --accent-line: var(--azure-line);
+    --accent-ink: var(--azure-ink);
+    --accent-deep: var(--azure-deep);
+  }
+
   /*
    * Fills everything below the header, so the sections underneath sit past the
    * fold and are only reachable by scrolling. Declared twice on purpose: svh

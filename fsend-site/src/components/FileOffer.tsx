@@ -2,6 +2,7 @@ import { For, Show } from "solid-js";
 import { FiFolder, FiFile } from "solid-icons/fi";
 import { formatBytes } from "../lib/format";
 import { totalSizeBytes, entrySizeBytes } from "../lib/files/tree";
+import { Button } from "./Button";
 import type { FilesAvailable } from "../lib/types";
 
 interface FileOfferProps {
@@ -74,18 +75,12 @@ export function FileOffer(props: FileOfferProps) {
       </Show>
 
       <div class="flex gap-2.5">
-        <button
-          onClick={props.onAccept}
-          class="flex-1 py-3.5 rounded-lg border border-blue-700 dark:border-blue-600 bg-blue-100 dark:bg-blue-800/80 text-blue-900 dark:text-blue-50 font-bold text-base hover:bg-blue-200 dark:hover:bg-blue-700/80 transition-colors cursor-pointer"
-        >
+        <Button tone="accent" size="lg" class="flex-1" onClick={props.onAccept}>
           Accept &amp; receive
-        </button>
-        <button
-          onClick={props.onReject}
-          class="px-6 py-3.5 rounded-lg border border-line text-ink-muted font-semibold text-base hover:bg-surface-2 hover:text-ink transition-colors cursor-pointer"
-        >
+        </Button>
+        <Button tone="ghost" size="lg" onClick={props.onReject}>
           Reject
-        </button>
+        </Button>
       </div>
     </div>
   );

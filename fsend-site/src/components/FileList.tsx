@@ -36,7 +36,7 @@ export function FileList(props: FileListProps) {
                 </span>
                 <button
                   onClick={() => props.onRemove(i())}
-                  class="text-ink-faint hover:text-red-500 transition-colors p-1 cursor-pointer"
+                  class="text-ink-faint hover:text-danger transition-colors p-1 cursor-pointer"
                   aria-label={`Remove ${item.entry.name}`}
                 >
                   <FiX class="w-4 h-4" />

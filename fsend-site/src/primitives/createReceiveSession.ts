@@ -1,9 +1,8 @@
-import { createSignal, onCleanup } from "solid-js";
+import { createSignal } from "solid-js";
 import { runReceive } from "../lib/transfer/receive";
 import { detectStorage, type Storage } from "../lib/files/storage";
-import { createProgressTracker } from "./createProgressTracker";
+import { createTransferRun, stepOf } from "./createTransferRun";
 import type { FilesAvailable } from "../lib/types";
-import type { ConnectionKind } from "../lib/transfer/events";
 
 export type ReceiveState =
   | "input"
@@ -15,27 +14,19 @@ export type ReceiveState =
   | "error";
 
 export function createReceiveSession(initialCode = "") {
-  const tracker = createProgressTracker();
+  const [state, setState] = createSignal<ReceiveState>("input");
+  const run = createTransferRun();
   const storage: Storage = detectStorage();
 
-  const [state, setState] = createSignal<ReceiveState>("input");
   const [code, setCodeRaw] = createSignal(normalizeCode(initialCode));
-  const [error, setError] = createSignal("");
   const [offered, setOffered] = createSignal<FilesAvailable[]>([]);
   const [folder, setFolder] = createSignal<FileSystemDirectoryHandle | null>(
     null,
   );
-  const [connection, setConnection] = createSignal<ConnectionKind>("unknown");
   const [resume, setResume] = createSignal(false);
 
   let accept: (() => void) | null = null;
   let reject: (() => void) | null = null;
-  let abortController = new AbortController();
-
-  onCleanup(() => {
-    abortController.abort();
-    tracker.cleanup();
-  });
 
   const chooseFolder = async () => {
     if (storage.kind !== "disk") return;
@@ -52,7 +43,7 @@ export function createReceiveSession(initialCode = "") {
 
   const start = () => {
     if (!isReady()) return;
-    if (abortController.signal.aborted) abortController = new AbortController();
+    const signal = run.beginAttempt();
     setState("connecting");
 
     const sink =
@@ -79,26 +70,26 @@ export function createReceiveSession(initialCode = "") {
             setState("offered");
             break;
           case "transferring":
-            tracker.initialize(event.entries);
+            run.tracker.initialize(event.entries);
             setState("transferring");
             break;
           case "progress":
-            tracker.recordBytes(event.bytes);
+            run.tracker.recordBytes(event.bytes);
             break;
           case "connectionType":
-            setConnection(event.kind);
+            run.setConnection(event.kind);
             break;
           case "complete":
-            tracker.complete();
+            run.tracker.complete();
             setState("completed");
             break;
           case "error":
-            setError(event.message);
+            run.setError(event.message);
             setState("error");
             break;
         }
       },
-      abortController.signal,
+      signal,
     );
   };
 
@@ -114,30 +105,25 @@ export function createReceiveSession(initialCode = "") {
   return {
     storage,
     state,
-    code,
-    setCode: (value: string) => setCodeRaw(normalizeCode(value)),
-    error,
-    offered,
-    folder,
-    connection,
-    resume,
-    setResume,
-    progress: tracker.progress,
-    isReady,
+    error: run.error,
+    connection: run.connection,
+    progress: run.progress,
     isTransferring: () => state() === "transferring",
     /** Which of Enter code / Connect / Receive is in progress. */
-    step: () => {
-      const s = state();
-      if (s === "input") return 0;
-      if (s === "transferring" || s === "completed") return 2;
-      return 1;
-    },
+    step: () => stepOf(state(), "input"),
+    code,
+    setCode: (value: string) => setCodeRaw(normalizeCode(value)),
+    offered,
+    folder,
+    resume,
+    setResume,
+    isReady,
     chooseFolder,
     start,
     acceptOffer,
     rejectOffer: () => reject?.(),
     retry: () => {
-      setError("");
+      run.setError("");
       setState("input");
     },
   };

@@ -12,7 +12,7 @@ interface ConfirmDialogProps {
 }
 
 export function ConfirmDialog(props: ConfirmDialogProps) {
-  let cancelButton: HTMLDivElement | undefined;
+  let cancelButton: HTMLButtonElement | undefined;
 
   createEffect(() => {
     if (!props.open) return;
@@ -24,7 +24,7 @@ export function ConfirmDialog(props: ConfirmDialogProps) {
     onCleanup(() => window.removeEventListener("keydown", onKey));
 
     // Move focus into the dialog so Escape and Tab behave as expected.
-    cancelButton?.querySelector("button")?.focus();
+    cancelButton?.focus();
   });
 
   return (
@@ -47,12 +47,15 @@ export function ConfirmDialog(props: ConfirmDialogProps) {
             {props.message}
           </p>
           <div class="flex justify-end gap-3">
-            <div ref={cancelButton}>
-              <Button variant="gray" onClick={props.onCancel}>
-                {props.cancelLabel}
-              </Button>
-            </div>
-            <Button variant="red" onClick={props.onConfirm}>
+            <Button
+              ref={(el) => (cancelButton = el)}
+              tone="ghost"
+              size="sm"
+              onClick={props.onCancel}
+            >
+              {props.cancelLabel}
+            </Button>
+            <Button tone="danger" size="sm" onClick={props.onConfirm}>
               {props.confirmLabel}
             </Button>
           </div>

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bunx prettier *)",
+      "Bash(bun run *)",
+      "Bash(bunx tsc *)"
+    ]
+  }
+}

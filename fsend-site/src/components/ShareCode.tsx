@@ -1,6 +1,7 @@
 import { createSignal, createEffect, onCleanup, Show } from "solid-js";
 import { FiCopy, FiCheck } from "solid-icons/fi";
 import qrcode from "qrcode-generator";
+import { Button } from "./Button";
 
 interface ShareCodeProps {
   code: string;
@@ -49,7 +50,7 @@ export function ShareCode(props: ShareCodeProps) {
     <div class="w-full max-w-[620px] mx-auto flex flex-col gap-4 pt-5">
       <div class="flex flex-col items-center gap-2">
         <p class="text-sm text-ink-dim">Give this code to the receiver</p>
-        <div class="font-mono text-4xl sm:text-[52px] font-medium tracking-[0.14em] text-flame leading-tight break-all text-center">
+        <div class="font-mono text-4xl sm:text-[52px] font-medium tracking-[0.14em] text-accent leading-tight break-all text-center">
           {props.code}
         </div>
       </div>
@@ -58,10 +59,7 @@ export function ShareCode(props: ShareCodeProps) {
         <div class="flex-1 min-w-0 flex items-center px-4 py-3 border border-line rounded-lg bg-surface-2 font-mono text-[13.5px] text-ink-muted overflow-hidden text-ellipsis whitespace-nowrap">
           {shareUrl()}
         </div>
-        <button
-          onClick={copy}
-          class="px-5 py-3 rounded-lg border border-orange-700 dark:border-orange-600 bg-orange-100 dark:bg-orange-900/70 text-orange-900 dark:text-orange-50 font-bold text-[14.5px] hover:bg-orange-200 dark:hover:bg-orange-800/70 transition-colors cursor-pointer whitespace-nowrap"
-        >
+        <Button tone="accent" onClick={copy} class="whitespace-nowrap">
           <span class="flex items-center gap-2">
             {copied() ? (
               <FiCheck class="w-4 h-4" />
@@ -70,7 +68,7 @@ export function ShareCode(props: ShareCodeProps) {
             )}
             {copied() ? "Copied!" : "Copy link"}
           </span>
-        </button>
+        </Button>
       </div>
 
       <div class="flex items-center justify-between text-[13.5px] text-ink-faint px-0.5">
@@ -98,16 +96,13 @@ export function ShareCode(props: ShareCodeProps) {
 
       <div class="flex items-center justify-between gap-4 border-t border-line pt-4 mt-1.5">
         <div class="flex items-center gap-2.5 text-sm text-ink-muted">
-          <span class="w-2 h-2 rounded-full bg-flame animate-pulse" />
+          <span class="w-2 h-2 rounded-full bg-accent animate-pulse" />
           Waiting for the receiver to connect
         </div>
         <Show when={props.onCancel}>
-          <button
-            onClick={props.onCancel}
-            class="px-5 py-2.5 rounded-lg border border-line text-ink-muted font-semibold text-sm hover:bg-surface-2 hover:text-ink transition-colors cursor-pointer"
-          >
+          <Button tone="ghost" size="sm" onClick={props.onCancel}>
             Cancel
-          </button>
+          </Button>
         </Show>
       </div>
     </div>

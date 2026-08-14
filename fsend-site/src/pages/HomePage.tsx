@@ -3,6 +3,7 @@ import { A, useNavigate } from "@solidjs/router";
 import { Title, Meta, Link } from "@solidjs/meta";
 import { FiUpload, FiDownload } from "solid-icons/fi";
 import { handleDrop } from "../lib/files/source";
+import { setPendingDrop } from "../lib/pendingDrop";
 import { detectStorage } from "../lib/files/storage";
 import { GITHUB_URL, MDN_FS_API, MDN_WEBRTC, SITE_URL } from "../lib/links";
 import { createWindowDropTarget } from "../primitives/createWindowDropTarget";
@@ -134,7 +135,7 @@ export function HomePage() {
     try {
       const entries = await handleDrop(data);
       if (entries.length > 0) {
-        (window as any).__fsend_pending = entries;
+        setPendingDrop(entries);
         navigate("/send");
       }
     } finally {
@@ -193,16 +194,17 @@ export function HomePage() {
             </div>
           </Show>
 
+          {/* The slab sits behind the face and shows through as it lifts. */}
           <A
             href="/send"
             draggable={false}
-            class="bg-orange-950 dark:bg-orange-900 rounded-xl border-none cursor-pointer font-bold text-lg group select-none"
+            class="theme-flame bg-accent-deep rounded-xl border-none cursor-pointer font-bold text-lg group select-none"
           >
             <span
-              class={`block box-border border-2 border-orange-900 dark:border-orange-700 rounded-xl py-3 px-6 bg-orange-100 text-orange-900 transition-all duration-150 dark:bg-orange-900/80 dark:text-orange-100 text-center ${
+              class={`block box-border border-2 border-accent-line rounded-xl py-3 px-6 bg-accent-soft text-accent-ink transition-all duration-150 text-center ${
                 isDragging()
-                  ? "bg-orange-200 -translate-y-0.5 dark:bg-orange-800/80"
-                  : "group-hover:bg-orange-200 group-hover:-translate-y-0.5 dark:group-hover:bg-orange-800/80"
+                  ? "bg-accent-soft-hi -translate-y-0.5"
+                  : "group-hover:bg-accent-soft-hi group-hover:-translate-y-0.5"
               }`}
             >
               <FiUpload
@@ -216,9 +218,9 @@ export function HomePage() {
           <A
             href="/receive"
             draggable={false}
-            class="bg-blue-950 dark:bg-blue-900 rounded-xl border-none cursor-pointer font-bold text-lg group select-none"
+            class="theme-azure bg-accent-deep rounded-xl border-none cursor-pointer font-bold text-lg group select-none"
           >
-            <span class="block box-border border-2 border-blue-900 dark:border-blue-700 rounded-xl py-3 px-6 bg-blue-100 text-blue-900 transition-all duration-150 group-hover:bg-blue-200 group-hover:-translate-y-0.5 dark:bg-blue-900/80 dark:text-blue-100 dark:group-hover:bg-blue-800/80 text-center">
+            <span class="block box-border border-2 border-accent-line rounded-xl py-3 px-6 bg-accent-soft text-accent-ink transition-all duration-150 group-hover:bg-accent-soft-hi group-hover:-translate-y-0.5 text-center">
               <FiDownload
                 class="inline-block w-5 h-5 mr-2 -mt-1"
                 aria-hidden="true"

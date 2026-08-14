@@ -4,7 +4,7 @@ import { Title, Meta, Link } from "@solidjs/meta";
 import { FiSend } from "solid-icons/fi";
 import { SITE_URL } from "../lib/links";
 import { pickFiles, pickDirectory, handleDrop } from "../lib/files/source";
-import type { SelectedEntry } from "../lib/types";
+import { takePendingDrop } from "../lib/pendingDrop";
 import { createSendSession } from "../primitives/createSendSession";
 import { createWindowDropTarget } from "../primitives/createWindowDropTarget";
 import { createExitGuard } from "../primitives/createExitGuard";
@@ -16,18 +16,15 @@ import { ShareCode } from "../components/ShareCode";
 import { TransferProgress } from "../components/TransferProgress";
 import { ErrorCard } from "../components/ErrorCard";
 import { Button } from "../components/Button";
+import { Busy } from "../components/Busy";
 
 export function SendPage() {
   const navigate = useNavigate();
   const send = createSendSession();
 
   onMount(() => {
-    const pending = (window as any).__fsend_pending as
-      SelectedEntry[] | undefined;
-    if (pending?.length) {
-      send.add(pending);
-      delete (window as any).__fsend_pending;
-    }
+    const pending = takePendingDrop();
+    if (pending?.length) send.add(pending);
   });
 
   const dragActive = createWindowDropTarget(async (data) => {
@@ -55,7 +52,7 @@ export function SendPage() {
   const goBack = () => navigate("/");
 
   return (
-    <div class="flex-1 bg-canvas py-8 px-4">
+    <div class="theme-flame flex-1 bg-canvas py-8 px-4">
       <ConfirmDialog
         open={exitGuard.isPrompting()}
         title="Leave while sending?"
@@ -78,7 +75,6 @@ export function SendPage() {
           title="Send Files"
           steps={["Choose", "Share code", "Transfer"]}
           current={send.step()}
-          accent="flame"
           onBack={goBack}
         />
 
@@ -93,7 +89,7 @@ export function SendPage() {
               />
               <h2
                 class={`text-2xl font-bold text-center transition-colors duration-150 ${
-                  isDragging() ? "text-flame" : ""
+                  isDragging() ? "text-accent" : ""
                 }`}
               >
                 {isDragging()
@@ -115,7 +111,7 @@ export function SendPage() {
               </div>
               <p
                 class={`text-sm transition-colors duration-150 ${
-                  isDragging() ? "text-flame" : "text-ink-faint"
+                  isDragging() ? "text-accent" : "text-ink-faint"
                 }`}
               >
                 {isDragging()
@@ -125,34 +121,29 @@ export function SendPage() {
             </Show>
 
             <div class="flex flex-wrap justify-center gap-2.5 mt-4">
-              <button
+              {/* The first selection is the primary action; once there is one,
+                  Generate share code takes over and this steps back. */}
+              <Button
+                tone={send.entries().length === 0 ? "accent" : "neutral"}
                 onClick={addFiles}
-                class={`px-5 py-3 rounded-lg font-bold text-[15px] transition-colors cursor-pointer border ${
-                  send.entries().length === 0
-                    ? "border-orange-700 dark:border-orange-600 bg-orange-100 dark:bg-orange-900/70 text-orange-900 dark:text-orange-50 hover:bg-orange-200 dark:hover:bg-orange-800/70"
-                    : "border-line text-ink hover:bg-surface-2"
-                }`}
               >
                 Browse files
-              </button>
-              <button
-                onClick={addFolder}
-                class="px-5 py-3 rounded-lg border border-line text-ink font-semibold text-[15px] hover:bg-surface-2 transition-colors cursor-pointer"
-              >
-                Browse folder
-              </button>
+              </Button>
+              <Button onClick={addFolder}>Browse folder</Button>
             </div>
 
             <Show when={send.entries().length > 0}>
-              <button
+              <Button
+                tone="accent"
+                size="lg"
+                class="w-full max-w-[620px] mt-2"
                 onClick={send.start}
-                class="w-full max-w-[620px] mt-2 py-4 rounded-lg border border-orange-700 dark:border-orange-600 bg-orange-100 dark:bg-orange-900/70 text-orange-900 dark:text-orange-50 font-bold text-base hover:bg-orange-200 dark:hover:bg-orange-800/70 transition-colors cursor-pointer"
               >
                 <span class="flex items-center justify-center gap-2">
                   <FiSend class="w-5 h-5" />
                   Generate share code
                 </span>
-              </button>
+              </Button>
             </Show>
           </div>
         </Show>
@@ -193,10 +184,10 @@ export function SendPage() {
 
           <Show when={send.state() === "completed"}>
             <div class="text-center">
-              <p class="text-green-600 dark:text-green-400 font-semibold text-lg mb-4">
+              <p class="text-ok font-semibold text-lg mb-4">
                 All files sent successfully!
               </p>
-              <Button variant="blue" onClick={goBack}>
+              <Button tone="accent" onClick={goBack}>
                 Back to Home
               </Button>
             </div>
@@ -204,34 +195,13 @@ export function SendPage() {
         </Show>
 
         <Show when={send.state() === "error"}>
-          <ErrorCard class="text-center">
-            <p class="text-red-600 dark:text-red-400 font-semibold mb-4">
-              {send.error()}
-            </p>
-            <Button variant="red" onClick={send.reset}>
-              Try Again
-            </Button>
-          </ErrorCard>
+          <ErrorCard
+            class="text-center"
+            message={send.error()}
+            onRetry={send.reset}
+          />
         </Show>
       </div>
-    </div>
-  );
-}
-
-/** Spinner + label for every "waiting on the other side" state. */
-function Busy(props: { label: string; onCancel?: () => void }) {
-  return (
-    <div class="flex flex-col items-center gap-4 pt-10 text-center">
-      <div class="animate-spin w-10 h-10 border-2 border-line border-t-azure rounded-full" />
-      <p class="text-ink-muted">{props.label}</p>
-      <Show when={props.onCancel}>
-        <button
-          onClick={props.onCancel!}
-          class="px-5 py-2.5 rounded-lg border border-line text-ink-muted font-semibold text-sm hover:bg-surface-2 hover:text-ink transition-colors cursor-pointer"
-        >
-          Cancel
-        </button>
-      </Show>
     </div>
   );
 }

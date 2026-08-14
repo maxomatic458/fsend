@@ -25,12 +25,11 @@ export interface DownloadStorage {
 
 /// The single probe for this API; nothing else should test for it.
 export function hasFileSystemAccess(): boolean {
-  let f =
+  return (
     typeof window !== "undefined" &&
     "showOpenFilePicker" in window &&
-    "showDirectoryPicker" in window;
-  console.log(f);
-  return f;
+    "showDirectoryPicker" in window
+  );
 }
 
 export function detectStorage(): Storage {

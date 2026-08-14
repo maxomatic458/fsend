@@ -122,7 +122,7 @@ export function TransferProgress(props: TransferProgressProps) {
                   <div
                     class={`h-full ${
                       entry.transferredBytes >= entry.sizeBytes
-                        ? "bg-green-500"
+                        ? "bg-ok-bar"
                         : "bg-azure"
                     }`}
                     style={{ width: `${entryPct()}%` }}

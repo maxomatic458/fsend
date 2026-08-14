@@ -47,10 +47,3 @@ export interface SelectedEntry {
   file?: File;
   files?: { relativePath: string; file: File }[];
 }
-
-export interface EntryProgress {
-  name: string;
-  kind: "file" | "directory";
-  size: number;
-  transferred: number;
-}
