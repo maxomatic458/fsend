@@ -66,5 +66,5 @@ $ fsend-cli receive 123456
 
 ## Licenses
 * fsend-relay and fsend-cli are licensed under MIT. See [LICENCE](fsend-relay/LICENCE) and [LICENCE](fsend-cli/LICENCE).
-* fsend-site is licensed under [CC BY-NC 4.0](fsend-site/LICENCE).
+* fsend-site is licensed under [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/legalcode). See [LICENCE](fsend-site/LICENCE).
 
