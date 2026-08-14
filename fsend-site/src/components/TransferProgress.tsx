@@ -80,7 +80,7 @@ export function TransferProgress(props: TransferProgressProps) {
 
       <div class="h-2 rounded bg-track overflow-hidden">
         <div
-          class="h-full bg-gradient-to-r from-azure/40 to-azure transition-[width] duration-200"
+          class="h-full bg-gradient-to-r from-azure/40 to-azure"
           style={{ width: `${pct()}%` }}
         />
       </div>
