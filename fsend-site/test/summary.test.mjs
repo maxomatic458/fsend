@@ -71,4 +71,33 @@ describe("finished transfer summary", () => {
       dispose();
     });
   });
+
+  test("restarting leaves no clock from the previous attempt", async () => {
+    await createRoot(async (dispose) => {
+      const tracker = createProgressTracker();
+      const entries = [
+        { name: "a.bin", sizeBytes: 4000, skipBytes: 0, isDir: false },
+      ];
+
+      // A cancelled or failed attempt never calls complete(), so its clock is
+      // still running when the retry starts.
+      tracker.initialize(entries);
+      tracker.recordBytes(1000);
+      tracker.initialize(entries);
+
+      tracker.complete();
+      const frozen = { ...tracker.progress };
+
+      await sleep(700); // longer than the 500ms sampling interval
+      assert.equal(
+        tracker.progress.speedBytesPerSec,
+        frozen.speedBytesPerSec,
+        "an orphaned interval from the first attempt must not keep writing",
+      );
+      assert.equal(tracker.progress.etaSecs, frozen.etaSecs);
+
+      tracker.cleanup();
+      dispose();
+    });
+  });
 });

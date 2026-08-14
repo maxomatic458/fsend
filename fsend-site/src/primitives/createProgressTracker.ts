@@ -36,7 +36,18 @@ export function createProgressTracker() {
   let currentEntryIdx = 0;
   let statsInterval: ReturnType<typeof setInterval> | undefined;
 
+  /** Stops the sampling interval. Safe to call when none is running. */
+  function stopClock() {
+    if (statsInterval) clearInterval(statsInterval);
+    statsInterval = undefined;
+  }
+
   function initialize(items: TransferEntry[]) {
+    // A cancelled or failed attempt never reaches complete(), so its interval
+    // is still running when a retry starts. Without this the old one is
+    // orphaned: it keeps sampling into the shared stats and never stops.
+    stopClock();
+
     const entries = items.map((item) => ({
       name: item.name,
       sizeBytes: item.sizeBytes,
@@ -108,13 +119,12 @@ export function createProgressTracker() {
 
   /** Stops the clock, freezing the numbers the summary is computed from. */
   function complete() {
-    if (statsInterval) clearInterval(statsInterval);
-    statsInterval = undefined;
+    stopClock();
     setProgress("endTimeMs", performance.now());
   }
 
   function cleanup() {
-    if (statsInterval) clearInterval(statsInterval);
+    stopClock();
   }
 
   return { progress, initialize, recordBytes, complete, cleanup };

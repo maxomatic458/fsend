@@ -39,7 +39,8 @@ export async function runSend(
     if (!session) return;
     const { control, dataChannel, peer, disconnected } = session;
 
-    // TODO
+    // Best effort: the direct/relay label is cosmetic, so a failure to read it
+    // must never take the transfer down with it.
     getConnectionType(session.pc)
       .then((kind) => emit({ type: "connectionType", kind }))
       .catch(() => {});

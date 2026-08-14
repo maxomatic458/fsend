@@ -38,7 +38,11 @@ export function createTransferRun() {
       }
       return abortController.signal;
     },
-    abort: () => abortController.abort(),
+    /** Cancels the attempt and stops the clock it left running. */
+    abort: () => {
+      abortController.abort();
+      tracker.cleanup();
+    },
   };
 }
 

@@ -8,7 +8,7 @@ fsend is a peer-to-peer file transfer webapp and CLI tool.
 - **P2P File Transfer**: Directly send files between devices. The relay server only introduces the two peers — file data never passes through it.
 - **Web and CLI Interface**: fsend is available as a web application and a command-line tool, and the two interoperate.
 - **Resumable Transfers**: If the connection is lost, the transfer can be resumed from where it left off (see the browser support table below).
-- **Transfer files & Folders**
+- **Files and Folders**: Send individual files or whole folders — the directory structure is preserved on the receiving side.
 
 ## Browser support
 

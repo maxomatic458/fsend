@@ -11,7 +11,7 @@ export interface TransferSummary {
   averageBytesPerSec: number;
 }
 
-// headline numbers for completet transfer
+// headline numbers for a completed transfer
 export function summarize(transfer: FinishedTransfer): TransferSummary {
   const elapsedSecs = Math.max(
     0,
