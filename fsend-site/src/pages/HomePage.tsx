@@ -40,7 +40,7 @@ const STEPS = [
     title: "Share the code",
     body: (
       <>
-        You get a one-time code and a QR link. Share either with the receiver.
+        Share the one-time code with the receiver
       </>
     ),
   },
@@ -51,7 +51,7 @@ const STEPS = [
     body: (
       <>
         Both browsers connect over <Ext href={MDN_WEBRTC}>WebRTC</Ext> and the
-        files stream directly between them.
+        files stream directly between them
       </>
     ),
   },
@@ -63,7 +63,7 @@ const FAQ_ITEMS = [
     a: (
       <>
         No — files stream straight from one device to the other, so you're
-        limited only by your connection and the receiver's free disk space.
+        limited only by your connection and the receiver's free disk space
       </>
     ),
   },
@@ -71,8 +71,8 @@ const FAQ_ITEMS = [
     q: "Do both sides need to be online?",
     a: (
       <>
-        Yes — nothing is stored in between, so both tabs have to stay open until
-        the transfer finishes.
+        Yes — both tabs have to stay open until
+        the transfer finishes
       </>
     ),
   },
@@ -81,7 +81,7 @@ const FAQ_ITEMS = [
     a: (
       <>
         No — fsend uses end to end encrypted <Ext href={MDN_WEBRTC}>WebRTC</Ext>{" "}
-        data channels. File data never touches our servers.
+        data channels. File data never touches our servers
       </>
     ),
   },
@@ -179,8 +179,6 @@ export function HomePage() {
           <span>End-to-end encrypted</span>
           <span class="text-ink-faint">·</span>
           <span>Free</span>
-          <span class="text-ink-faint">·</span>
-          <span>No account</span>
         </div>
 
         <div class="w-full max-w-[560px] mt-10 flex flex-col gap-3.5">
@@ -188,8 +186,10 @@ export function HomePage() {
             <div class="flex gap-3 items-start text-left bg-warn-bg border border-warn-line text-warn-ink rounded-lg px-4 py-3.5 text-sm leading-relaxed">
               <div>
                 Your browser has limited support. Folders will be downloaded as
-                zip files and transfer resumption won't be available when
-                receiving.
+                zip files and you won't be able to resume interrupted transfers.
+                For the best experience, use a Chromium-based browser like Chrome, Edge or Opera.
+              </div>
+              <div class="flex-shrink-0">
               </div>
             </div>
           </Show>

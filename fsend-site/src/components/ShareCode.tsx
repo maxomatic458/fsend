@@ -66,7 +66,20 @@ export function ShareCode(props: ShareCodeProps) {
             ) : (
               <FiCopy class="w-4 h-4" />
             )}
-            {copied() ? "Copied!" : "Copy link"}
+            {/* Both labels share one grid cell, so the button stays as wide as
+                the longer of the two and does not resize when it flips. */}
+            <span class="grid justify-items-center">
+              <span
+                class={`col-start-1 row-start-1 ${copied() ? "invisible" : ""}`}
+              >
+                Copy link
+              </span>
+              <span
+                class={`col-start-1 row-start-1 ${copied() ? "" : "invisible"}`}
+              >
+                Copied!
+              </span>
+            </span>
           </span>
         </Button>
       </div>

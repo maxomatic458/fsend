@@ -182,7 +182,7 @@ export function ReceivePage() {
                 {formatBytes(receive.progress.totalTransferredBytes)}{" "}
                 {toDisk()
                   ? `saved to ${receive.folder()?.name}`
-                  : "handed to your browser"}
+                  : "Should now be downloading in your browser"}
               </p>
 
               <Show when={!toDisk()}>

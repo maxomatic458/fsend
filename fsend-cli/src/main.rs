@@ -15,6 +15,7 @@ use relay::{ConnectionInfo, Protocol, RelayClient};
 use transfer::{FilesAvailable, ReceiveArgs, SendArgs, Transfer};
 
 const DEFAULT_RELAY_URL: &str = "wss://relay.fsend.sh/ws";
+const DEFAULT_DOWNLOAD_URL: &str = "https://fsend.sh";
 
 #[derive(Parser)]
 struct Args {
@@ -23,6 +24,10 @@ struct Args {
 
     #[clap(long, default_value = DEFAULT_RELAY_URL)]
     relay_url: String,
+
+    /// Site the receiver opens. `/receive/<code>` is appended to it.
+    #[clap(long, default_value = DEFAULT_DOWNLOAD_URL)]
+    download_url: String,
 
     #[clap(subcommand)]
     mode: Mode,
@@ -43,6 +48,7 @@ enum Mode {
         #[clap(long, short, default_value = ".")]
         output_dir: PathBuf,
 
+        /// Share code, or a link such as https://fsend.sh/receive/AB12CD34
         code: String,
 
         #[clap(long, short = 'y')]
@@ -61,7 +67,7 @@ async fn main() -> color_eyre::Result<()> {
         .init();
 
     match args.mode {
-        Mode::Send { files } => run_send(&args.relay_url, files).await?,
+        Mode::Send { files } => run_send(&args.relay_url, &args.download_url, files).await?,
         Mode::Receive {
             overwrite,
             output_dir,
@@ -87,6 +93,21 @@ fn print_version() {
     for (label, value) in rows {
         println!("{:<10} {}", label, value.bright_white());
     }
+}
+
+/// Accepts a bare code or a share link like `https://fsend.sh/receive/AB12CD34`.
+/// Codes are uppercase, so a hand-typed lowercase one is normalised too.
+fn parse_code(input: &str) -> String {
+    let cleaned = input.trim();
+    let cleaned = cleaned.split(['?', '#']).next().unwrap_or(cleaned);
+    let cleaned = cleaned.trim_end_matches('/');
+    cleaned.rsplit('/').next().unwrap_or(cleaned).to_uppercase()
+}
+
+/// The link a receiver can open in a browser, e.g.
+/// `https://fsend.sh` + `AB12CD34` -> `https://fsend.sh/receive/AB12CD34`.
+fn download_link(base: &str, code: &str) -> String {
+    format!("{}/receive/{}", base.trim_end_matches('/'), code)
 }
 
 async fn create_sender_transfer(
@@ -176,7 +197,11 @@ async fn create_receiver_transfer(
     }
 }
 
-async fn run_send(relay_url: &str, files: Vec<PathBuf>) -> color_eyre::Result<()> {
+async fn run_send(
+    relay_url: &str,
+    download_url: &str,
+    files: Vec<PathBuf>,
+) -> color_eyre::Result<()> {
     for f in &files {
         if !f.exists() {
             return Err(transfer::TransferError::FileNotFound(f.clone()).into());
@@ -191,6 +216,9 @@ async fn run_send(relay_url: &str, files: Vec<PathBuf>) -> color_eyre::Result<()
     println!("Session code: {}\n", code.bright_white());
     println!("On the other peer, run:\n");
     println!("  {} {}\n", "fsend-cli receive".yellow(), code.yellow());
+
+    println!("or open in a browser:\n");
+    println!("  {}\n", download_link(download_url, &code).blue());
 
     let protocol = relay.wait_for_peer().await?;
     tracing::info!("peer joined, negotiated protocol: {:?}", protocol);
@@ -232,6 +260,8 @@ async fn run_receive(
     resume: bool,
     auto_accept: bool,
 ) -> color_eyre::Result<()> {
+    let code = parse_code(&code);
+
     let mut relay = RelayClient::connect(relay_url).await?;
     let protocol = relay
         .join_session(code, vec![Protocol::Iroh, Protocol::WebRtc])
@@ -385,5 +415,52 @@ fn colorize_conn_type(conn_type: &str) -> String {
         "Relay" => conn_type.red().to_string(),
         "Mixed" => conn_type.yellow().to_string(),
         _ => conn_type.red().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_codes_and_share_links() {
+        assert_eq!(parse_code("AB12CD34"), "AB12CD34");
+        assert_eq!(parse_code("ab12cd34"), "AB12CD34");
+        assert_eq!(parse_code("  AB12CD34\n"), "AB12CD34");
+        assert_eq!(parse_code("https://fsend.sh/receive/AB12CD34"), "AB12CD34");
+        assert_eq!(
+            parse_code("http://localhost:3000/receive/YJ6HM1DC"),
+            "YJ6HM1DC"
+        );
+        // Trailing slash, query and fragment must not end up in the code.
+        assert_eq!(parse_code("https://fsend.sh/receive/AB12CD34/"), "AB12CD34");
+        assert_eq!(
+            parse_code("https://fsend.sh/receive/AB12CD34?ref=x"),
+            "AB12CD34"
+        );
+        assert_eq!(
+            parse_code("https://fsend.sh/receive/AB12CD34#top"),
+            "AB12CD34"
+        );
+    }
+
+    #[test]
+    fn builds_the_download_link() {
+        assert_eq!(
+            download_link("https://fsend.sh", "AB12CD34"),
+            "https://fsend.sh/receive/AB12CD34"
+        );
+        // A trailing slash must not double up.
+        assert_eq!(
+            download_link("http://localhost:3000/", "AB12CD34"),
+            "http://localhost:3000/receive/AB12CD34"
+        );
+    }
+
+    #[test]
+    fn a_printed_link_is_accepted_back_as_a_code() {
+        let code = "AB12CD34";
+        let link = download_link(DEFAULT_DOWNLOAD_URL, code);
+        assert_eq!(parse_code(&link), code);
     }
 }

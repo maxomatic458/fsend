@@ -97,7 +97,7 @@ export function SendPage() {
                   : "Drop files anywhere on this page"}
               </h2>
               <p class="text-[14.5px] text-ink-dim text-center">
-                Any size · nothing is uploaded to a server
+                No size limits
               </p>
             </Show>
 
