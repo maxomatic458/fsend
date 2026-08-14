@@ -48,6 +48,8 @@ enum Mode {
         #[clap(long, short = 'y')]
         auto_accept: bool,
     },
+    #[clap(name = "version", aliases = &["v"])]
+    Version,
 }
 
 #[tokio::main]
@@ -66,9 +68,25 @@ async fn main() -> color_eyre::Result<()> {
             code,
             auto_accept,
         } => run_receive(&args.relay_url, code, output_dir, !overwrite, auto_accept).await?,
+        Mode::Version => print_version(),
     }
 
     Ok(())
+}
+
+fn print_version() {
+    let rows = [
+        ("fsend-cli", env!("CARGO_PKG_VERSION").to_owned()),
+        ("protocol", transfer::PROTO_VERSION.to_owned()),
+        (
+            "alpn",
+            String::from_utf8_lossy(transfer::FSEND_ALPN).into_owned(),
+        ),
+    ];
+
+    for (label, value) in rows {
+        println!("{:<10} {}", label, value.bright_white());
+    }
 }
 
 async fn create_sender_transfer(
