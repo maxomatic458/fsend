@@ -1,4 +1,8 @@
-import { STUN_SERVERS } from "../../config";
+import {
+  STUN_SERVERS,
+  ICE_GATHERING_TIMEOUT_MS,
+  CONNECT_TIMEOUT_MS,
+} from "../../config";
 
 export interface WebRtcConnection {
   pc: RTCPeerConnection;
@@ -15,9 +19,16 @@ function createPeerConnection(): RTCPeerConnection {
 function waitIceGathering(pc: RTCPeerConnection): Promise<void> {
   if (pc.iceGatheringState === "complete") return Promise.resolve();
   return new Promise((resolve) => {
-    pc.onicegatheringstatechange = () => {
-      if (pc.iceGatheringState === "complete") resolve();
+    const done = () => {
+      clearTimeout(timer);
+      pc.removeEventListener("icegatheringstatechange", onChange);
+      resolve();
     };
+    const onChange = () => {
+      if (pc.iceGatheringState === "complete") done();
+    };
+    pc.addEventListener("icegatheringstatechange", onChange);
+    const timer = setTimeout(done, ICE_GATHERING_TIMEOUT_MS);
   });
 }
 
@@ -82,8 +93,12 @@ export async function createAnswerer(offerSdp: string): Promise<{
   };
 }
 
-export function applyAnswer(pc: RTCPeerConnection, answerSdp: string): void {
-  pc.setRemoteDescription(
+/** Rejects if the answer is unusable, rather than failing silently. */
+export function applyAnswer(
+  pc: RTCPeerConnection,
+  answerSdp: string,
+): Promise<void> {
+  return pc.setRemoteDescription(
     new RTCSessionDescription({ type: "answer", sdp: answerSdp }),
   );
 }
@@ -91,33 +106,50 @@ export function applyAnswer(pc: RTCPeerConnection, answerSdp: string): void {
 export function waitConnected(
   pc: RTCPeerConnection,
   channels: RTCDataChannel[],
+  timeoutMs = CONNECT_TIMEOUT_MS,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
-    const check = () => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      pc.removeEventListener("connectionstatechange", onState);
+      for (const ch of channels) ch.removeEventListener("open", check);
+    };
+    const settle = (err?: Error) => {
+      cleanup();
+      if (err) reject(err);
+      else resolve();
+    };
+
+    function check() {
       if (
         (pc.connectionState === "connected" ||
           pc.connectionState === ("completed" as string)) &&
         channels.every((ch) => ch.readyState === "open")
       ) {
-        resolve();
+        settle();
       }
-    };
+    }
+
+    function onState() {
+      if (pc.connectionState === "failed") {
+        settle(new Error("WebRTC connection failed"));
+        return;
+      }
+      check();
+    }
+
+    const timer = setTimeout(
+      () => settle(new Error("Timed out establishing the connection")),
+      timeoutMs,
+    );
 
     if (pc.connectionState === "failed") {
-      reject(new Error("WebRTC connection failed"));
+      settle(new Error("WebRTC connection failed"));
       return;
     }
 
-    pc.onconnectionstatechange = () => {
-      if (pc.connectionState === "failed") {
-        reject(new Error("WebRTC connection failed"));
-      }
-      check();
-    };
-
-    for (const ch of channels) {
-      ch.onopen = check;
-    }
+    pc.addEventListener("connectionstatechange", onState);
+    for (const ch of channels) ch.addEventListener("open", check);
 
     check();
   });

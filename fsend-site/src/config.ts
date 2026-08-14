@@ -6,6 +6,12 @@ export const STUN_SERVERS = [
   "stun:stun1.l.google.com:19302",
 ];
 
+/// How long ICE gathering may block the handshake
+export const ICE_GATHERING_TIMEOUT_MS = 5_000;
+
+/// How long to wait for the peer connection and both channels to come up.
+export const CONNECT_TIMEOUT_MS = 30_000;
+
 export const PROTO_VERSION = "0.1.0";
 
 export const CHUNK_SIZE = 16384;

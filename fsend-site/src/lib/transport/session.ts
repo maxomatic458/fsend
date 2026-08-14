@@ -90,7 +90,7 @@ export async function openSenderSession(
 
   relay.sendExchange(exchange(offerSdp));
   const peerInfo = await relay.recvExchange();
-  applyAnswer(pc, peerInfo.sdp);
+  await applyAnswer(pc, peerInfo.sdp);
   await waitConnected(pc, [controlChannel, dataChannel]);
   if (abort.aborted) {
     relay.close();

@@ -10,10 +10,13 @@
     "serve": "vite preview",
     "test": "node test/run.mjs",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "test:e2e": "playwright test",
+    "test:all": "node test/run.mjs && playwright test"
   },
   "license": "MIT",
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "@tailwindcss/vite": "^4.1.13",
     "@types/node": "^25.6.0",
     "solid-devtools": "^0.34.3",
