@@ -26,3 +26,14 @@ gitignore
 # System Files
 .DS_Store
 Thumbs.db
+test/.build/
+
+# Playwright
+test-results/
+playwright-report/
+blob-report/
+.playwright/
+
+# End-to-end tests
+e2e/
+playwright.config.mjs

@@ -1,4 +1,4 @@
-import type { ClientMessage, ServerMessage, ConnectionInfo } from "./types";
+import type { ClientMessage, ServerMessage, ConnectionInfo } from "../types";
 
 export class RelayClient {
   private ws: WebSocket;

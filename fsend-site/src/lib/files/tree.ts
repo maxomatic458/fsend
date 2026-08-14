@@ -3,7 +3,7 @@ import type {
   FilesToSkip,
   FileSendRecvTree,
   SelectedEntry,
-} from "./types";
+} from "../types";
 
 export async function buildFileTree(
   entries: SelectedEntry[],
@@ -58,7 +58,6 @@ function dirTreeFromFileList(
   name: string,
   files: { relativePath: string; file: File }[],
 ): FilesAvailable {
-  const root: Map<string, FilesAvailable> = new Map();
   const dirs: Map<string, FilesAvailable[]> = new Map();
 
   for (const { relativePath, file } of files) {
@@ -89,29 +88,30 @@ function dirTreeFromFileList(
   return { type: "Dir", name, files: dirs.get("") ?? [] };
 }
 
-export function totalSize(files: FilesAvailable[]): number {
+export function totalSizeBytes(files: FilesAvailable[]): number {
   let total = 0;
   for (const f of files) {
     if (f.type === "File") total += f.size;
-    else total += totalSize(f.files);
+    else total += totalSizeBytes(f.files);
   }
   return total;
 }
 
-export function entrySize(entry: FilesAvailable): number {
+export function entrySizeBytes(entry: FilesAvailable): number {
   if (entry.type === "File") return entry.size;
-  return totalSize(entry.files);
+  return totalSizeBytes(entry.files);
 }
 
 export function flattenTree(
   trees: FileSendRecvTree[],
   prefix = "",
-): Array<{ path: string; skip: number; size: number }> {
-  const result: Array<{ path: string; skip: number; size: number }> = [];
+): Array<{ path: string; skipBytes: number; sizeBytes: number }> {
+  const result: Array<{ path: string; skipBytes: number; sizeBytes: number }> =
+    [];
   for (const tree of trees) {
     const path = prefix ? `${prefix}/${tree.name}` : tree.name;
     if (tree.type === "File") {
-      result.push({ path, skip: tree.skip, size: tree.size });
+      result.push({ path, skipBytes: tree.skip, sizeBytes: tree.size });
     } else {
       result.push(...flattenTree(tree.files, path));
     }
@@ -149,14 +149,14 @@ export function applySkip(
   return toSendRecvTree(available);
 }
 
-export function treeSize(tree: FileSendRecvTree): number {
+export function treeSizeBytes(tree: FileSendRecvTree): number {
   if (tree.type === "File") return tree.size;
-  return tree.files.reduce((sum, f) => sum + treeSize(f), 0);
+  return tree.files.reduce((sum, f) => sum + treeSizeBytes(f), 0);
 }
 
-export function treeSkip(tree: FileSendRecvTree): number {
+export function treeSkipBytes(tree: FileSendRecvTree): number {
   if (tree.type === "File") return tree.skip;
-  return tree.files.reduce((sum, f) => sum + treeSkip(f), 0);
+  return tree.files.reduce((sum, f) => sum + treeSkipBytes(f), 0);
 }
 
 export function toSendRecvTree(available: FilesAvailable): FileSendRecvTree {

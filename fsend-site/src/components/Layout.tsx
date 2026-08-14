@@ -1,45 +1,54 @@
 import type { JSX } from "solid-js";
 import { A } from "@solidjs/router";
 import { ThemeToggle } from "./ThemeToggle";
-import { FiGithub, FiMail } from "solid-icons/fi";
+import { Logo } from "./Logo";
+import { FiGithub } from "solid-icons/fi";
+import { GITHUB_URL } from "../lib/links";
 
 export function Layout(props: { children: JSX.Element }) {
   return (
-    <div class="min-h-screen flex flex-col bg-indigo-100 dark:bg-neutral-900 transition-colors">
-      <header class="flex items-center justify-between px-4 py-3">
+    <div class="min-h-svh flex flex-col bg-canvas text-ink">
+      <header class="h-[var(--app-header-h)] shrink-0 flex items-center justify-between gap-4 px-5 sm:px-8">
         <A
           href="/"
-          class="text-xl font-bold text-gray-800 dark:text-gray-100 hover:text-indigo-600 dark:hover:text-indigo-400 transition-colors"
+          class="flex items-center gap-2.5 shrink-0"
+          aria-label="fsend home"
         >
-          fsend
+          <Logo class="w-[26px]" />
+          <span class="text-[19px] font-bold tracking-tight">fsend</span>
         </A>
-        <ThemeToggle />
+
+        <nav class="flex items-center gap-1 text-ink-dim">
+          <a
+            href={GITHUB_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            class="p-2 rounded-lg hover:text-ink hover:bg-surface-2 transition-colors"
+            aria-label="fsend on GitHub"
+          >
+            <FiGithub class="w-5 h-5" />
+          </a>
+          <ThemeToggle />
+        </nav>
       </header>
 
       <main class="flex-1 flex flex-col">{props.children}</main>
 
-      <footer class="bg-indigo-200 dark:bg-neutral-800 border-t border-indigo-300 dark:border-neutral-700 py-6 px-4 transition-colors">
-        <div class="max-w-4xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-4">
-          <p class="text-sm text-gray-600 dark:text-gray-400">
-            fsend — Peer-to-peer file sharing
-          </p>
-          <div class="flex items-center gap-6">
-            <A
-              href="/about"
-              class="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100 transition text-sm"
-            >
-              About
-            </A>
-            <a
-              href="https://github.com/maxomatic458/fsend"
-              target="_blank"
-              rel="noopener noreferrer"
-              class="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100 transition text-sm flex items-center gap-2"
-            >
-              <FiGithub class="w-4 h-4" />
-              GitHub
-            </a>
+      <footer class="border-t border-line-soft px-5 sm:px-8 py-7">
+        <div class="flex flex-col sm:flex-row items-center justify-between gap-4 text-sm text-ink-faint">
+          <div class="flex items-center gap-2.5">
+            <Logo class="w-5" />
+            <span>fsend — peer-to-peer file transfer in the browser</span>
           </div>
+          <a
+            href={GITHUB_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            class="flex items-center gap-2 hover:text-ink-muted transition-colors"
+          >
+            <FiGithub class="w-4 h-4" />
+            GitHub
+          </a>
         </div>
       </footer>
     </div>

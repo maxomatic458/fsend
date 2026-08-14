@@ -1,46 +1,52 @@
 import { For, Show } from "solid-js";
 import { FiFolder, FiFile, FiX } from "solid-icons/fi";
 import { formatBytes } from "../lib/format";
-import type { SelectedEntry } from "../lib/types";
+import type { SelectedItem } from "../primitives/createSendSession";
 
 interface FileListProps {
-  entries: SelectedEntry[];
+  items: SelectedItem[];
   onRemove: (index: number) => void;
-  totalSize: number;
+  totalSizeBytes: number;
 }
 
+/**
+ * List of selected files and directories with size, types (dir/file), and remove button.
+ */
 export function FileList(props: FileListProps) {
   return (
-    <Show when={props.entries.length > 0}>
-      <div class="mb-6">
-        <div class="border border-gray-200 dark:border-neutral-700 rounded-lg divide-y divide-gray-200 dark:divide-neutral-700 max-h-60 overflow-y-auto">
-          <For each={props.entries}>
-            {(entry, i) => (
-              <div class="flex items-center justify-between py-3 px-4 hover:bg-gray-50 dark:hover:bg-neutral-700/50 transition-colors">
-                <div class="flex items-center gap-3">
-                  {entry.kind === "directory" ? (
-                    <FiFolder class="w-6 h-6 text-gray-500 dark:text-gray-400" />
-                  ) : (
-                    <FiFile class="w-6 h-6 text-gray-500 dark:text-gray-400" />
-                  )}
-                  <div>
-                    <div class="font-medium text-gray-800 dark:text-gray-100">
-                      {entry.name}
-                    </div>
-                  </div>
-                </div>
+    <Show when={props.items.length > 0}>
+      <div class="flex flex-col border-t border-line max-h-72 overflow-y-auto">
+        <For each={props.items}>
+          {(item, i) => (
+            <div class="flex items-center justify-between gap-3 py-3.5 px-1 border-b border-line">
+              <div class="flex items-center gap-3 min-w-0">
+                {item.entry.kind === "directory" ? (
+                  <FiFolder class="w-4 h-4 text-ink-faint shrink-0" />
+                ) : (
+                  <FiFile class="w-4 h-4 text-ink-faint shrink-0" />
+                )}
+                <span class="text-[15.5px] truncate">{item.entry.name}</span>
+              </div>
+              <div class="flex items-center gap-2 shrink-0">
+                <span class="font-mono text-[13px] text-ink-dim">
+                  {item.sizeBytes === null ? "…" : formatBytes(item.sizeBytes)}
+                </span>
                 <button
                   onClick={() => props.onRemove(i())}
-                  class="text-red-500 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300 p-2 transition-colors"
+                  class="text-ink-faint hover:text-danger transition-colors p-1 cursor-pointer"
+                  aria-label={`Remove ${item.entry.name}`}
                 >
-                  <FiX class="w-5 h-5" />
+                  <FiX class="w-4 h-4" />
                 </button>
               </div>
-            )}
-          </For>
-        </div>
-        <div class="text-right text-gray-600 dark:text-gray-400 mt-2">
-          Total: {formatBytes(props.totalSize)}
+            </div>
+          )}
+        </For>
+        <div class="flex items-center justify-between py-3 px-1 font-mono text-xs text-ink-faint">
+          <span>
+            {props.items.length} item{props.items.length === 1 ? "" : "s"}
+          </span>
+          <span>total {formatBytes(props.totalSizeBytes)}</span>
         </div>
       </div>
     </Show>

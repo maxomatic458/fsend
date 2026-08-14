@@ -1,96 +1,114 @@
 import { createStore, produce } from "solid-js/store";
 import { TransferStats } from "../lib/stats";
+import type { TransferEntry } from "../lib/transfer/events";
 
 export interface ProgressEntry {
   name: string;
-  size: number;
-  transferred: number;
+  sizeBytes: number;
+  transferredBytes: number;
   isDir: boolean;
 }
 
 export interface ProgressStore {
   entries: ProgressEntry[];
-  totalSize: number;
-  totalTransferred: number;
-  speed: number;
-  eta: number;
-  startTime: number;
+  totalSizeBytes: number;
+  totalTransferredBytes: number;
+  speedBytesPerSec: number;
+  etaSecs: number;
+  startTimeMs: number;
+  endTimeMs: number;
+  skippedBytes: number;
 }
 
 export function createProgressTracker() {
   const [progress, setProgress] = createStore<ProgressStore>({
     entries: [],
-    totalSize: 0,
-    totalTransferred: 0,
-    speed: 0,
-    eta: 0,
-    startTime: 0,
+    totalSizeBytes: 0,
+    totalTransferredBytes: 0,
+    speedBytesPerSec: 0,
+    etaSecs: 0,
+    startTimeMs: 0,
+    endTimeMs: 0,
+    skippedBytes: 0,
   });
 
   const stats = new TransferStats();
   let currentEntryIdx = 0;
   let statsInterval: ReturnType<typeof setInterval> | undefined;
 
-  function initialize(
-    items: Array<{ name: string; size: number; skip: number; isDir: boolean }>,
-  ) {
+  /** Stops the sampling interval. Safe to call when none is running. */
+  function stopClock() {
+    if (statsInterval) clearInterval(statsInterval);
+    statsInterval = undefined;
+  }
+
+  function initialize(items: TransferEntry[]) {
+    // A cancelled or failed attempt never reaches complete(), so its interval
+    // is still running when a retry starts. Without this the old one is
+    // orphaned: it keeps sampling into the shared stats and never stops.
+    stopClock();
+
     const entries = items.map((item) => ({
       name: item.name,
-      size: item.size,
-      transferred: item.skip,
+      sizeBytes: item.sizeBytes,
+      transferredBytes: item.skipBytes,
       isDir: item.isDir,
     }));
-    const totalSize = items.reduce((sum, item) => sum + item.size, 0);
-    const totalSkipped = items.reduce((sum, item) => sum + item.skip, 0);
+    const totalSizeBytes = items.reduce((sum, item) => sum + item.sizeBytes, 0);
+    const skippedBytes = items.reduce((sum, item) => sum + item.skipBytes, 0);
 
     setProgress({
       entries,
-      totalSize,
-      totalTransferred: totalSkipped,
-      speed: 0,
-      eta: 0,
-      startTime: performance.now(),
+      totalSizeBytes,
+      totalTransferredBytes: skippedBytes,
+      speedBytesPerSec: 0,
+      etaSecs: 0,
+      startTimeMs: performance.now(),
+      endTimeMs: 0,
+      skippedBytes,
     });
 
     currentEntryIdx = 0;
     // Find the first non-complete entry
     while (
       currentEntryIdx < entries.length &&
-      entries[currentEntryIdx].transferred >= entries[currentEntryIdx].size
+      entries[currentEntryIdx].transferredBytes >=
+        entries[currentEntryIdx].sizeBytes
     ) {
       currentEntryIdx++;
     }
 
     stats.reset();
-    stats.record(totalSkipped);
+    stats.record(skippedBytes);
 
     // Update speed/eta periodically
     statsInterval = setInterval(() => {
-      stats.record(progress.totalTransferred);
-      const remaining = progress.totalSize - progress.totalTransferred;
+      stats.record(progress.totalTransferredBytes);
+      const remainingBytes =
+        progress.totalSizeBytes - progress.totalTransferredBytes;
       setProgress(
         produce((p) => {
-          p.speed = stats.speed;
-          p.eta = stats.eta(remaining);
+          p.speedBytesPerSec = stats.bytesPerSec;
+          p.etaSecs = stats.etaSecs(remainingBytes);
         }),
       );
     }, 500);
   }
 
-  function recordBytes(n: number) {
+  function recordBytes(bytes: number) {
     setProgress(
       produce((p) => {
-        p.totalTransferred += n;
+        p.totalTransferredBytes += bytes;
 
         // Distribute bytes to current entry
         if (currentEntryIdx < p.entries.length) {
-          p.entries[currentEntryIdx].transferred += n;
+          p.entries[currentEntryIdx].transferredBytes += bytes;
 
           // Advance to next entry if current is complete
           while (
             currentEntryIdx < p.entries.length &&
-            p.entries[currentEntryIdx].transferred >=
-              p.entries[currentEntryIdx].size
+            p.entries[currentEntryIdx].transferredBytes >=
+              p.entries[currentEntryIdx].sizeBytes
           ) {
             currentEntryIdx++;
           }
@@ -99,9 +117,15 @@ export function createProgressTracker() {
     );
   }
 
-  function cleanup() {
-    if (statsInterval) clearInterval(statsInterval);
+  /** Stops the clock, freezing the numbers the summary is computed from. */
+  function complete() {
+    stopClock();
+    setProgress("endTimeMs", performance.now());
   }
 
-  return { progress, initialize, recordBytes, cleanup };
+  function cleanup() {
+    stopClock();
+  }
+
+  return { progress, initialize, recordBytes, complete, cleanup };
 }

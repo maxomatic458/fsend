@@ -2,30 +2,28 @@ import { createSignal, onMount } from "solid-js";
 import { FiSun, FiMoon } from "solid-icons/fi";
 
 export function ThemeToggle() {
-  const [dark, setDark] = createSignal(false);
+  const [dark, setDark] = createSignal(true);
 
   onMount(() => {
-    const stored = localStorage.getItem("theme");
-    const prefersDark = window.matchMedia(
-      "(prefers-color-scheme: dark)",
-    ).matches;
-    const isDark = stored === "dark" || (!stored && prefersDark);
-    setDark(isDark);
-    document.documentElement.classList.toggle("dark", isDark);
+    // index.html already applied the class before paint.
+    setDark(document.documentElement.classList.contains("dark"));
   });
 
   const toggle = () => {
     const next = !dark();
     setDark(next);
     document.documentElement.classList.toggle("dark", next);
+    document
+      .querySelector('meta[name="theme-color"]')
+      ?.setAttribute("content", next ? "#151515" : "#f7f5f2");
     localStorage.setItem("theme", next ? "dark" : "light");
   };
 
   return (
     <button
       onClick={toggle}
-      class="p-2 rounded-lg transition-colors bg-white/50 dark:bg-neutral-800/50 hover:bg-white dark:hover:bg-neutral-700 text-gray-700 dark:text-gray-200"
-      aria-label="Toggle theme"
+      class="p-2 rounded-lg text-ink-dim hover:text-ink hover:bg-surface-2 transition-colors cursor-pointer"
+      aria-label={dark() ? "Switch to light theme" : "Switch to dark theme"}
     >
       {dark() ? <FiSun class="w-5 h-5" /> : <FiMoon class="w-5 h-5" />}
     </button>
