@@ -20,7 +20,7 @@ export function ReceivePage() {
   const navigate = useNavigate();
   const params = useParams<{ code?: string }>();
   const receive = createReceiveSession(params.code ?? "");
-  const toDisk = receive.storage.kind === "disk";
+  const toDisk = () => receive.mode() === "disk";
 
   createWindowDropTarget(() => {});
   const exitGuard = createExitGuard(receive.isTransferring);
@@ -65,8 +65,25 @@ export function ReceivePage() {
 
             <p class="text-sm text-ink-dim">Paste the sender's link instead</p>
 
-            <Show when={toDisk}>
-              <div class="w-full flex flex-col gap-3">
+            <div class="w-full flex flex-col gap-3">
+              {/* If the File System Access API is available the user can choose download type */}
+              <Show when={receive.canUseDisk}>
+                <label class="flex items-center gap-2 text-sm text-ink-dim cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={toDisk()}
+                    onChange={(e) =>
+                      receive.setMode(
+                        e.currentTarget.checked ? "disk" : "download",
+                      )
+                    }
+                    class="rounded"
+                  />
+                  Save straight to a folder
+                </label>
+              </Show>
+
+              <Show when={toDisk()}>
                 <div class="flex gap-2.5">
                   <div class="flex-1 min-w-0 flex items-center px-4 py-3 border border-line rounded-lg bg-surface-2 text-ink truncate">
                     {receive.folder()?.name ?? "No folder selected"}
@@ -90,8 +107,8 @@ export function ReceivePage() {
                   />
                   Resume an interrupted transfer
                 </label>
-              </div>
-            </Show>
+              </Show>
+            </div>
 
             <Button
               tone="accent"
@@ -104,9 +121,9 @@ export function ReceivePage() {
             </Button>
 
             <p class="text-[13px] text-ink-faint text-center leading-relaxed max-w-[460px]">
-              {toDisk
+              {toDisk()
                 ? "Files are written straight to the folder you choose, so size is limited by disk space and an interrupted transfer can be resumed."
-                : "Files land in your Downloads folder. This browser holds the transfer in memory, so very large files are limited by RAM and can't be resumed."}
+                : "Files land in your Downloads folder, zipped if there is more than one. The transfer is held in memory until it finishes, so size is limited by RAM and it can't be resumed."}
             </p>
           </div>
         </Show>
@@ -122,7 +139,7 @@ export function ReceivePage() {
         <Show when={receive.state() === "offered"}>
           <FileOffer
             files={receive.offered()}
-            inMemory={!toDisk}
+            inMemory={!toDisk()}
             onAccept={receive.acceptOffer}
             onReject={receive.rejectOffer}
           />
@@ -139,14 +156,16 @@ export function ReceivePage() {
             verb="received"
             connection={receive.connection()}
             hint={
-              receive.state() !== "transferring"
-                ? undefined
-                : toDisk
-                  ? "Cancelling keeps what has arrived, so you can resume later."
-                  : "Keep this tab open until the transfer finishes."
+              receive.packing() !== null
+                ? `Packing the zip… ${Math.round(receive.packing()!)}%`
+                : receive.state() !== "transferring"
+                  ? undefined
+                  : toDisk()
+                    ? "Cancelling keeps what has arrived, so you can resume later."
+                    : "Keep this tab open until the transfer finishes."
             }
             actions={
-              <Show when={receive.state() === "transferring" && toDisk}>
+              <Show when={receive.state() === "transferring" && toDisk()}>
                 <Button tone="ghost" size="sm" onClick={cancelTransfer}>
                   Cancel
                 </Button>
@@ -161,8 +180,17 @@ export function ReceivePage() {
               </p>
               <p class="text-ink-muted mb-4">
                 {formatBytes(receive.progress.totalTransferredBytes)}{" "}
-                {toDisk ? `saved to ${receive.folder()?.name}` : "downloaded"}
+                {toDisk()
+                  ? `saved to ${receive.folder()?.name}`
+                  : "handed to your browser"}
               </p>
+
+              <Show when={!toDisk()}>
+                <p class="text-[13px] text-ink-faint mb-4">
+                  Check your downloads — saving may still be in progress for a
+                  large file.
+                </p>
+              </Show>
               <Button tone="accent" onClick={goBack}>
                 Back to Home
               </Button>

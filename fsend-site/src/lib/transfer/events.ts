@@ -27,6 +27,8 @@ export type TransferEvent =
     }
   | { type: "transferring"; entries: TransferEntry[] }
   | { type: "progress"; bytes: number }
+  /// Receiver only: bytes are all in, but the sink is still packing them.
+  | { type: "packing"; percent: number }
   | { type: "connectionType"; kind: ConnectionKind }
   | { type: "complete" }
   | { type: "error"; message: string };

@@ -1,5 +1,8 @@
 import type { FilesAvailable, FilesToSkip } from "../types";
 
+/// Long enough for the browser to have started reading the blob.
+const REVOKE_DELAY_MS = 60_000;
+
 /// Bytes are written into this sink
 export interface TransferSink {
   /** Whether a partially received transfer can be continued later. */
@@ -11,8 +14,14 @@ export interface TransferSink {
   write(chunk: Uint8Array): Promise<void>;
   /** Finish the file opened by the last `open`. Safe to call with none open. */
   closeFile(): Promise<void>;
-  /** All files received — hand them over (a download, or nothing to do). */
-  finish(offered: FilesAvailable[]): Promise<void>;
+  /**
+   * All files received — hand them over (e.g. browser download).
+   * `onProgress` reports 0-100 e.g. for packing zips
+   */
+  finish(
+    offered: FilesAvailable[],
+    onProgress?: (percent: number) => void,
+  ): Promise<void>;
   /** Transfer ended early; salvage whatever is worth keeping. */
   abandon(): Promise<void>;
 }
@@ -129,7 +138,7 @@ export function createDownloadSink(): TransferSink {
       current = null;
     },
 
-    async finish(offered) {
+    async finish(offered, onProgress) {
       const single =
         order.length === 1 &&
         offered.length === 1 &&
@@ -149,7 +158,9 @@ export function createDownloadSink(): TransferSink {
       for (const [path, chunks] of buffers) {
         zip.file(path, new Blob(chunks as BlobPart[]));
       }
-      const blob = await zip.generateAsync({ type: "blob" });
+      const blob = await zip.generateAsync({ type: "blob" }, (meta) =>
+        onProgress?.(meta.percent),
+      );
       const name =
         offered.length === 1 ? `${offered[0].name}.zip` : "fsend-files.zip";
       triggerDownload(blob, name);
@@ -172,5 +183,13 @@ function triggerDownload(blob: Blob, filename: string): void {
   document.body.appendChild(anchor);
   anchor.click();
   document.body.removeChild(anchor);
-  URL.revokeObjectURL(url);
+
+  // The click only *schedules* the download — the browser reads the blob after
+  // this task ends. Revoking straight away truncates or cancels it, which shows
+  // up on exactly the large zips this path exists for. The browser keeps the
+  // data alive while it is downloading, so holding the URL costs nothing.
+  const timer = setTimeout(() => URL.revokeObjectURL(url), REVOKE_DELAY_MS);
+  // Browsers return a number; Node returns a Timeout that would otherwise hold
+  // the test runner open for the full delay.
+  (timer as { unref?: () => void }).unref?.();
 }

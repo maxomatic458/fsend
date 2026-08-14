@@ -175,7 +175,7 @@ export async function runReceive(
     session.peer.stop();
     session.pc.close();
 
-    await sink.finish(offered);
+    await sink.finish(offered, (percent) => emit({ type: "packing", percent }));
     emit({ type: "complete" });
   } catch (err: any) {
     await sink.abandon();

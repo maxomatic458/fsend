@@ -1,6 +1,11 @@
 import { createSignal } from "solid-js";
 import { runReceive } from "../lib/transfer/receive";
-import { detectStorage, type Storage } from "../lib/files/storage";
+import {
+  hasFileSystemAccess,
+  chooseFolder as pickFolder,
+  type StorageMode,
+} from "../lib/files/storage";
+import { createDiskSink, createDownloadSink } from "../lib/transfer/sinks";
 import { createTransferRun, stepOf } from "./createTransferRun";
 import type { FilesAvailable } from "../lib/types";
 
@@ -16,7 +21,12 @@ export type ReceiveState =
 export function createReceiveSession(initialCode = "") {
   const [state, setState] = createSignal<ReceiveState>("input");
   const run = createTransferRun();
-  const storage: Storage = detectStorage();
+
+  // Writing to disk needs the API; without it "download" is the only option.
+  const canUseDisk = hasFileSystemAccess();
+  const [mode, setMode] = createSignal<StorageMode>(
+    canUseDisk ? "disk" : "download",
+  );
 
   const [code, setCodeRaw] = createSignal(normalizeCode(initialCode));
   const [offered, setOffered] = createSignal<FilesAvailable[]>([]);
@@ -24,22 +34,24 @@ export function createReceiveSession(initialCode = "") {
     null,
   );
   const [resume, setResume] = createSignal(false);
+  /// 0-100 while the sink packs a zip, null when there is nothing to pack.
+  const [packing, setPacking] = createSignal<number | null>(null);
 
   let accept: (() => void) | null = null;
   let reject: (() => void) | null = null;
 
   const chooseFolder = async () => {
-    if (storage.kind !== "disk") return;
+    if (mode() !== "disk") return;
     try {
-      setFolder(await storage.chooseFolder());
+      setFolder(await pickFolder());
     } catch {
       // The picker was dismissed; nothing to do.
     }
   };
 
-  /// Disk storage needs somewhere to write before it can start.
+  /// Writing to disk needs somewhere to write before it can start.
   const isReady = () =>
-    code().length === 8 && (storage.kind === "download" || folder() !== null);
+    code().length === 8 && (mode() === "download" || folder() !== null);
 
   const start = () => {
     if (!isReady()) return;
@@ -47,9 +59,7 @@ export function createReceiveSession(initialCode = "") {
     setState("connecting");
 
     const sink =
-      storage.kind === "disk"
-        ? storage.createSink(folder()!)
-        : storage.createSink();
+      mode() === "disk" ? createDiskSink(folder()!) : createDownloadSink();
 
     runReceive(
       code(),
@@ -76,11 +86,15 @@ export function createReceiveSession(initialCode = "") {
           case "progress":
             run.tracker.recordBytes(event.bytes);
             break;
+          case "packing":
+            setPacking(event.percent);
+            break;
           case "connectionType":
             run.setConnection(event.kind);
             break;
           case "complete":
             run.tracker.complete();
+            setPacking(null);
             setState("completed");
             break;
           case "error":
@@ -94,8 +108,8 @@ export function createReceiveSession(initialCode = "") {
   };
 
   const acceptOffer = async () => {
-    // Disk storage may still need a destination if the code was deep-linked
-    if (storage.kind === "disk" && !folder()) {
+    // Writing to disk may still need a destination if the code was deep-linked
+    if (mode() === "disk" && !folder()) {
       await chooseFolder();
       if (!folder()) return;
     }
@@ -103,7 +117,10 @@ export function createReceiveSession(initialCode = "") {
   };
 
   return {
-    storage,
+    /// False when the browser has no File System Access API, so there is no choice to offer.
+    canUseDisk,
+    mode,
+    setMode,
     state,
     error: run.error,
     connection: run.connection,
@@ -117,6 +134,7 @@ export function createReceiveSession(initialCode = "") {
     folder,
     resume,
     setResume,
+    packing,
     isReady,
     chooseFolder,
     start,
