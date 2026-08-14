@@ -10,10 +10,7 @@ interface FileListProps {
 }
 
 /**
- * The chosen files, on hairlines to match the offer and progress screens.
- *
- * Each item carries its own size, so a row can never be labelled with another
- * row's number.
+ * List of selected files and directories with size, types (dir/file), and remove button.
  */
 export function FileList(props: FileListProps) {
   return (

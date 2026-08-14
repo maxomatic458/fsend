@@ -5,24 +5,20 @@ const REVOKE_DELAY_MS = 60_000;
 
 /// Bytes are written into this sink
 export interface TransferSink {
-  /** Whether a partially received transfer can be continued later. */
+  /// can the transfer be resumed
   readonly canResume: boolean;
-  /** Bytes already present per offered entry, so the sender can skip them. */
+  // Which files to fully/partially skip, or null if none.
   existing(offered: FilesAvailable[]): Promise<(FilesToSkip | null)[]>;
-  /** Begin a file; `skipBytes` of it are already accounted for. */
+  // open a file with a optional offset.
   open(path: string, skipBytes: number): Promise<void>;
   write(chunk: Uint8Array): Promise<void>;
-  /** Finish the file opened by the last `open`. Safe to call with none open. */
   closeFile(): Promise<void>;
-  /**
-   * All files received — hand them over (e.g. browser download).
-   * `onProgress` reports 0-100 e.g. for packing zips
-   */
+  // Finish the transfer, by either flushing writes and closing files or by
+  // zipping and downloading the in-memory buffers.
   finish(
     offered: FilesAvailable[],
     onProgress?: (percent: number) => void,
   ): Promise<void>;
-  /** Transfer ended early; salvage whatever is worth keeping. */
   abandon(): Promise<void>;
 }
 

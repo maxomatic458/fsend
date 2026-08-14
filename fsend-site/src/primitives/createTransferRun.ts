@@ -3,11 +3,8 @@ import { createProgressTracker } from "./createProgressTracker";
 import type { ConnectionKind } from "../lib/transfer/events";
 
 /**
- * Everything a transfer attempt needs that is *not* the state machine: the
- * progress tracker, connection kind, error message and abort controller.
- *
- * Owns no state signal on purpose — the sides' states differ, so each keeps
- * its own and this stays a bag of plain signals to read.
+ * Shared parts of a transfer attempt: progress tracker, connection kind, error
+ * and abort controller. Holds no state signal — each side owns its own.
  */
 export function createTransferRun() {
   const tracker = createProgressTracker();

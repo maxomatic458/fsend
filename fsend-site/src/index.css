@@ -164,10 +164,6 @@
   --azure: #2a5ed6;
   --azure-hi: #1c46a6;
 
-  /* Tinted panel/button fills. `soft-hi` is the hover step, `deep` the shadow
-     slab behind the landing CTAs, `line`/`ink` the border and label.
-     Values are the Tailwind palette entries these replaced, verbatim, so the
-     rendered colour is unchanged: orange-100/200/700/900/950 etc. */
   --flame-soft: oklch(95.4% 0.038 75.164);
   --flame-soft-hi: oklch(90.1% 0.076 70.697);
   --flame-line: oklch(55.3% 0.195 38.402);
@@ -294,17 +290,6 @@
 }
 
 @layer components {
-  /*
-   * The two sides of the app are the same screens in different colours: send is
-   * flame, receive is azure. Putting the accent on the container rather than
-   * threading a prop down means buttons, the step rail and the progress bar all
-   * pick it up from the cascade and stay side-agnostic.
-   *
-   * Named `theme-*` rather than `accent-*`: Tailwind already generates an
-   * `accent-<color>` utility for the CSS accent-color property, and shadowing
-   * it would be a trap. Flame is the :root default so a component rendered
-   * outside a page container still resolves to something.
-   */
   :root,
   .theme-flame {
     --accent: var(--flame);
