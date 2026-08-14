@@ -1,4 +1,8 @@
-# Transfer test suite (this is completely ai generated)
+# WebRTC Transfer test suite
+
+> This test suite is pretty much completely ai generated atm.
+>
+> TODO: properly review and rewrite tests.
 
 Runs the real `runSend` / `runReceive` against an in-process fake browser. No headless browser, no network, no relay server —
 the whole suite finishes in about two seconds.

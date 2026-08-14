@@ -64,17 +64,3 @@ On the other peer, run:
 $ fsend-cli receive 123456
 ```
 
-## Development
-
-```bash
-cd fsend-site
-bun install
-bun run dev      # http://localhost:3000
-bun run build
-bun run test     # transfer + protocol suite, no browser needed
-```
-
-The webapp test suite runs the real transfer modules against an in-process
-fake browser (WebRTC, WebSocket, File System Access), and also checks the
-wire format still matches `fsend-cli` and `fsend-relay`. See
-[`fsend-site/test/README.md`](fsend-site/test/README.md).
