@@ -40,3 +40,6 @@ playwright.config.mjs
 
 # Prerender output
 .ssg/
+
+# Build stamp (scripts/buildinfo.mjs)
+.buildinfo.json
