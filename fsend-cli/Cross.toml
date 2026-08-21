@@ -1,0 +1,8 @@
+# The images tagged for cross 0.2.5 are built on a distro whose glibc is older
+# than what current rustc emits, so host build scripts fail to run with
+# "GLIBC_2.28 not found". The `:main` images are built on a newer base.
+[target.aarch64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:main"
+
+[target.x86_64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:main"

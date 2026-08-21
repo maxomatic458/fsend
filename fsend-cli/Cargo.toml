@@ -4,7 +4,7 @@ license = "MIT"
 description = "A CLI for fsend, a peer-to-peer file sharing tool"
 authors = ["Maxomatic458"]
 keywords = ["file-transfer", "peer-to-peer", "p2p", "cli"]
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 repository = "https://github.com/maxomatic458/fsend"
 homepage = "https://fsend.sh"
@@ -28,11 +28,47 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2.0.12"
 tokio = { version = "1.43.1", features = ["rt", "rt-multi-thread", "time", "macros", "net", "fs"] }
-tokio-tungstenite = { version = "0.26.2", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.26.2", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1.41"
 tracing-subscriber = "0.3.20"
 webrtc = "0.13"
 bytes = "1"
+
+[profile.release]
+strip = true
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+# Used by `cargo deb` in the release workflow
+[package.metadata.deb]
+name = "fsend"
+maintainer = "Maxomatic458"
+copyright = "Maxomatic458"
+license-file = ["LICENCE", "0"]
+section = "utils"
+priority = "optional"
+depends = ""
+extended-description = """\
+fsend is a peer-to-peer file transfer tool. Send files and directories, \
+no relay server involved. Transfers can be resumed if interrupted. \
+Compatible with the fsend.sh web-app. \
+"""
+
+assets = [
+    ["target/release/fsend", "usr/bin/", "755"],
+    ["../README.md", "usr/share/doc/fsend/README.md", "644"],
+    ["dist/man/fsend.1", "usr/share/man/man1/fsend.1", "644"],
+    ["dist/completions/fsend.bash", "usr/share/bash-completion/completions/fsend", "644"],
+    ["dist/completions/fsend.fish", "usr/share/fish/vendor_completions.d/fsend.fish", "644"],
+    ["dist/completions/_fsend", "usr/share/zsh/vendor-completions/_fsend", "644"],
+]
+
+[build-dependencies]
+clap = { version = "4.5.31", features = ["derive"] }
+clap_complete = "4.5"
+clap_mangen = "0.2"
+tracing = "0.1.41"
 
 [[bin]]
 name = "fsend"

@@ -1,3 +1,4 @@
+mod cli;
 mod iroh;
 mod relay;
 mod transfer;
@@ -11,52 +12,9 @@ use dialoguer::theme::ColorfulTheme;
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressStyle};
 
 use self::iroh::IrohTransfer;
+use cli::{Args, Mode};
 use relay::{ConnectionInfo, Protocol, RelayClient};
 use transfer::{FilesAvailable, ReceiveArgs, SendArgs, Transfer};
-
-const DEFAULT_RELAY_URL: &str = "wss://relay.fsend.sh/ws";
-const DEFAULT_DOWNLOAD_URL: &str = "https://fsend.sh";
-
-#[derive(Parser)]
-struct Args {
-    #[clap(long, short, default_value = "error")]
-    log_level: tracing::Level,
-
-    #[clap(long, default_value = DEFAULT_RELAY_URL)]
-    relay_url: String,
-
-    /// Site the receiver opens. `/receive/<code>` is appended to it.
-    #[clap(long, default_value = DEFAULT_DOWNLOAD_URL)]
-    download_url: String,
-
-    #[clap(subcommand)]
-    mode: Mode,
-}
-
-#[derive(clap::Subcommand)]
-enum Mode {
-    #[clap(name = "send", aliases = &["s"])]
-    Send {
-        #[clap(required = true)]
-        files: Vec<PathBuf>,
-    },
-    #[clap(name = "receive", aliases = &["r"])]
-    Receive {
-        #[clap(long, short = 'f')]
-        overwrite: bool,
-
-        #[clap(long, short, default_value = ".")]
-        output_dir: PathBuf,
-
-        /// Share code, or a link such as https://fsend.sh/receive/AB12CD34
-        code: String,
-
-        #[clap(long, short = 'y')]
-        auto_accept: bool,
-    },
-    #[clap(name = "version", aliases = &["v"])]
-    Version,
-}
 
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
@@ -421,6 +379,7 @@ fn colorize_conn_type(conn_type: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cli::DEFAULT_DOWNLOAD_URL;
 
     #[test]
     fn accepts_codes_and_share_links() {

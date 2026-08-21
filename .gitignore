@@ -1,2 +1,10 @@
 target/
 .claude/
+
+apt-key.b64
+*.asc
+!key.asc.example
+secring.*
+*.gpg
+
+publish-apt.sh

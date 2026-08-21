@@ -26,11 +26,39 @@ The difference is the [File System Access API](https://developer.mozilla.org/en-
 
 ## Installation
 
-The cli version can be installed via cargo.
+### Debian and Ubuntu (apt)
+
+```bash
+sudo apt update && sudo apt install -y ca-certificates curl
+
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://apt.fsend.sh/key.asc | sudo tee /etc/apt/keyrings/fsend.asc >/dev/null
+
+echo "deb [signed-by=/etc/apt/keyrings/fsend.asc] https://apt.fsend.sh stable main" \
+  | sudo tee /etc/apt/sources.list.d/fsend.list
+
+sudo apt update && sudo apt install fsend
+```
+
+### Prebuilt binaries
+
+You can download the prebuilt binaries for various platforms [here](https://github.com/maxomatic458/fsend/releases/latest).
+
+If you would rather not add the repository, the same `.deb` can be installed on its own:
+
+```bash
+sudo dpkg -i fsend_<version>_amd64.deb
+```
+
+> [!NOTE]
+> The macOS binaries are not signed or notarised. macOS will refuse to run them until you clear the quarantine flag: `xattr -d com.apple.quarantine fsend`.
+
+### From source via cargo
 
 ```bash
 cargo install fsend-cli
 ```
+
 ## Usage
 
 ### Webapp
