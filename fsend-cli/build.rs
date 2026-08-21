@@ -1,8 +1,8 @@
 //! Generates shell completions and a man page at build time.
 
-use std::{env, fs, io};
 use clap::CommandFactory;
 use clap_complete::{generate, Generator, Shell};
+use std::{env, fs, io};
 
 include!("src/cli.rs");
 
