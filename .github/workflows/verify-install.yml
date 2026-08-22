@@ -1,0 +1,127 @@
+name: Verify install instructions
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "Which install method to verify"
+        type: choice
+        default: all
+        options:
+          - all
+          - apt
+          - linux-x86_64
+          - linux-aarch64
+          - macos-aarch64
+          - macos-x86_64
+          - windows-x86_64
+          - source
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - id: pick
+        env:
+          SELECTED: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+          # Scenarios run on hardware matching the architecture they install.
+          # macos-13 (the old free Intel image) has been retired, so Intel
+          # macOS is only available as the -intel/-large SKU.
+          all='[
+            {"runner":"ubuntu-latest","ids":"apt linux-x86_64 source"},
+            {"runner":"ubuntu-24.04-arm","ids":"linux-aarch64"},
+            {"runner":"macos-latest","ids":"macos-aarch64"},
+            {"runner":"macos-15-intel","ids":"macos-x86_64"},
+            {"runner":"windows-latest","ids":"windows-x86_64"}
+          ]'
+          if [ "$SELECTED" = "all" ]; then
+            matrix=$(jq -c . <<<"$all")
+          else
+            # Keep only the runner that owns the chosen scenario, narrowed to
+            # that one scenario.
+            matrix=$(jq -c --arg id "$SELECTED" \
+              '[.[] | select(.ids | split(" ") | index($id)) | .ids = $id]' <<<"$all")
+          fi
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "verifying: $matrix"
+
+  verify:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    name: ${{ matrix.ids }}
+    defaults:
+      run:
+        working-directory: fsend-site/install
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # Only the `source` scenario needs a toolchain
+      - if: contains(matrix.ids, 'source')
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      # unix: check install, uninstalls
+      - name: Verify
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          IDS: ${{ matrix.ids }}
+        run: |
+          set -uo pipefail
+          failed=""
+          for id in $IDS; do
+            echo "::group::$id"
+            if bash -e "$id.install.sh" \
+              && bash -c 'set -e; command -v fsend; fsend version; fsend --help >/dev/null' \
+              && bash -e "$id.uninstall.sh" \
+              && bash -c 'if command -v fsend; then exit 1; fi'
+            then
+              echo "$id: ok"
+            else
+              echo "::error::$id: install/uninstall verification failed"
+              failed="$failed $id"
+            fi
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "failed:$failed"
+            exit 1
+          fi
+          echo "all scenarios passed:$IDS"
+
+      # windows
+      - name: Verify
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          ID: ${{ matrix.ids }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & "./$env:ID.install.ps1"
+
+          $exe = "$env:LOCALAPPDATA\fsend\fsend-x86_64-pc-windows-msvc\fsend.exe"
+          if (-not (Test-Path $exe)) { throw "fsend.exe not found at $exe" }
+          & $exe version
+          & $exe --help | Out-Null
+
+          $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+          if ($userPath -notlike "*fsend*") { throw "install did not add fsend to the user PATH" }
+
+          & "./$env:ID.uninstall.ps1"
+
+          $root = "$env:LOCALAPPDATA\fsend"
+          if (Test-Path $root) { throw "$root still exists after uninstall" }
+          $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+          if ($userPath -like "*fsend*") { throw "uninstall left fsend on the user PATH" }
+          Write-Host "$env:ID : ok"

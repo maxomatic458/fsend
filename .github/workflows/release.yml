@@ -91,7 +91,7 @@ jobs:
           target: ${{ matrix.target }}
           build-tool: ${{ matrix.build-tool }}
           manifest-path: fsend-cli/Cargo.toml
-          archive: fsend-$tag-$target
+          archive: fsend-$target
           leading-dir: true
           locked: true
           ref: refs/tags/${{ env.TAG }}
@@ -146,47 +146,3 @@ jobs:
           cd target/debian
           deb=$(ls -- *_"$ARCH".deb)
           gh release upload "$TAG" "$deb" --clobber
-
-  # Runs once every asset is on the release, and appends their SHA-256 sums to
-  # the release notes. The block is delimited by an HTML comment so that
-  # re-running the workflow replaces it rather than appending a second copy.
-  checksums:
-    needs: [build, deb]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Append checksums to the release notes
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          LC_ALL: C
-        run: |
-          # pipefail matters here: without it a failed download or sha256sum
-          # would still produce an empty table and publish blank checksums.
-          set -euo pipefail
-          mkdir -p assets
-          gh release download "$TAG" --dir assets --clobber
-
-          # Pad the names to the longest one so the columns line up.
-          table=$(cd assets && sha256sum -- * | awk '
-            { hash[NR] = $1; sub(/^[^ ]+ [ *]/, ""); name[NR] = $0
-              if (length($0) > width) width = length($0) }
-            END { for (i = 1; i <= NR; i++) printf "%-*s  %s\n", width, name[i], hash[i] }
-          ')
-
-          body=$(gh release view "$TAG" --json body --jq .body)
-          # Drop a previously appended block, if this is a re-run.
-          body=$(printf '%s\n' "$body" | sed '/<!-- checksums -->/,$d')
-
-          {
-            printf '%s\n\n' "$body"
-            echo '<!-- checksums -->'
-            echo '### SHA-256'
-            echo
-            echo '```'
-            printf '%s\n' "$table"
-            echo '```'
-          } > notes.md
-
-          gh release edit "$TAG" --notes-file notes.md

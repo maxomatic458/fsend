@@ -12,7 +12,7 @@ import { pathToFileURL } from "node:url";
 
 const DIST = "dist";
 const SSR_OUT = ".ssg";
-const ROUTES = ["/", "/send", "/receive"];
+const ROUTES = ["/", "/send", "/receive", "/download"];
 
 const { renderRoute } = await import(
   pathToFileURL(join(process.cwd(), SSR_OUT, "entry-server.js")).href

@@ -32,6 +32,12 @@ export function Layout(props: { children: JSX.Element }) {
         </A>
 
         <nav class="flex items-center gap-1 text-ink-dim">
+          <A
+            href="/download"
+            class="px-2.5 py-1.5 rounded-lg text-sm font-medium hover:text-ink hover:bg-surface-2 transition-colors"
+          >
+            Download
+          </A>
           <a
             href={GITHUB_URL}
             target="_blank"

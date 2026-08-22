@@ -38,11 +38,7 @@ const STEPS = [
     n: "02",
     accent: "text-flame",
     title: "Share the code",
-    body: (
-      <>
-        Share the one-time code with the receiver
-      </>
-    ),
+    body: <>Share the one-time code with the receiver</>,
   },
   {
     n: "03",
@@ -69,12 +65,7 @@ const FAQ_ITEMS = [
   },
   {
     q: "Do both sides need to be online?",
-    a: (
-      <>
-        Yes — both tabs have to stay open until
-        the transfer finishes
-      </>
-    ),
+    a: <>Yes — both tabs have to stay open until the transfer finishes</>,
   },
   {
     q: "Can fsend see my files?",
@@ -187,10 +178,10 @@ export function HomePage() {
               <div>
                 Your browser has limited support. Folders will be downloaded as
                 zip files and you won't be able to resume interrupted transfers.
-                For the best experience, use a Chromium-based browser like Chrome, Edge or Opera.
+                For the best experience, use a Chromium-based browser like
+                Chrome, Edge or Opera.
               </div>
-              <div class="flex-shrink-0">
-              </div>
+              <div class="flex-shrink-0"></div>
             </div>
           </Show>
 

@@ -1,0 +1,1 @@
+cargo uninstall fsend-cli

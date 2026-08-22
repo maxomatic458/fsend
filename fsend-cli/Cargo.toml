@@ -4,7 +4,7 @@ license = "MIT"
 description = "A CLI for fsend, a peer-to-peer file sharing tool"
 authors = ["Maxomatic458"]
 keywords = ["file-transfer", "peer-to-peer", "p2p", "cli"]
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 repository = "https://github.com/maxomatic458/fsend"
 homepage = "https://fsend.sh"
@@ -43,6 +43,8 @@ panic = "abort"
 # Used by `cargo deb` in the release workflow
 [package.metadata.deb]
 name = "fsend"
+# dont track deb revision
+revision = ""
 maintainer = "Maxomatic458"
 copyright = "Maxomatic458"
 license-file = ["LICENCE", "0"]
