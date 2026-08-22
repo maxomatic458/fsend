@@ -1,0 +1,48 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Origin: fsend
+Label: fsend
+Suite: stable
+Codename: stable
+Date: Sat, 22 Aug 2026 03:08:45 UTC
+Architectures: amd64 arm64
+Components: main
+Description: fsend apt repository
+MD5Sum:
+ cf4728b4f0d5650b5adfff9d7e900f36 638 main/binary-amd64/Packages
+ 5873e45468ce717e392e3a4977348abc 449 main/binary-amd64/Packages.gz
+ aaaab3af0d2e3ce72ba29ffa9ae0fc26 113 main/binary-amd64/Release
+ b64caaa1330465bb60e6849cb3466b0a 638 main/binary-arm64/Packages
+ bfabfcca67b374b7e4dc51dd90e2e33a 445 main/binary-arm64/Packages.gz
+ 4a0bb92f338569bd5937736820f9be73 113 main/binary-arm64/Release
+SHA1:
+ a0667966c200501a536ffc1b404a1355bdaa3e48 638 main/binary-amd64/Packages
+ 8f626152ebe98086c17ae916e13d0175b8250eb4 449 main/binary-amd64/Packages.gz
+ 290289f6335255423882fc181ac69f29e3336ad6 113 main/binary-amd64/Release
+ d27575d31b5638035d3dca633cda309f0274d7dd 638 main/binary-arm64/Packages
+ b71e29f90cbf8fbc01729b11fd38d4ffa7515be6 445 main/binary-arm64/Packages.gz
+ 177c1b8f9852fba60a648d67cba5520a1c437114 113 main/binary-arm64/Release
+SHA256:
+ a6cbf06e8a203c7fb29e426d5d80a4b864d8dbc146bb6135c8136a6cce44dab4 638 main/binary-amd64/Packages
+ f14b3eea4ca848e4828f4d0a4d89d07d991aeed9fbc9f2f500462388c727eb5f 449 main/binary-amd64/Packages.gz
+ 206ce6e3d5ce45013e08ce0f43c3159b62b2a9dd8942c1a2575cba005ca409dd 113 main/binary-amd64/Release
+ 6d24520fa13bfb3c3497cf59b9582e604b0f26bfa2e9fe94c5baa7baf139f30e 638 main/binary-arm64/Packages
+ 3cf506f8c8199132b9fe13c6f456fddad80107e80f7d17b0cd4918856753c7d5 445 main/binary-arm64/Packages.gz
+ df6d3344c6fbf2f801a3a9b655b2bd84bc60853dcb7eaa6bfe160198b8d97b07 113 main/binary-arm64/Release
+-----BEGIN PGP SIGNATURE-----
+
+iQIzBAEBCgAdFiEEb/batlIHs+uubtMZgG4UtircoaIFAmqJEr0ACgkQgG4Utirc
+oaJweQ//QlP3aga4z3EYFWO8X3FdljWJVpwO/MZ7f0gv0O8xtxcZN6RJGq0iybER
+G/4Eaq3owG5ikia1gUOO1Wie5STLCEVgJBAxOntZyeEMtbPMMpwPmKXH2oBSaFpH
+98BuZzCHg7qaxrJzPshEgDn+ByVvYRw51r3gBMfFHMBMHKIQvHDfa5nGv/Dcd5pQ
+h5H6Sp+5935Qb4tE8mjI/ocPhhzNAPx9k+ZIsDbpEpi0FFcPRs69nfGpBoozeBW+
+LJYpUO763FCx4FdoGiX0ZECWv/AswTslZbFPrVHki1C1uhsTEBVJDdklQ0SXLCsE
+tmftJjgcMDJzOrIfauI8PVvnqQ39J9BxAp7oV0ZBndyDljANvh0oBhvdbml082WS
+U42OqJjBAarm7y7Wf0zw2/StJ4+vExcX4/rl+WRz+hawDqpa1rG3Arat5Pnb5TNJ
+h4R0HCgw5cSmXTo4dRJnCQho+ZIswnqRljq8kOhY2NhYLEHb26iWzO6QFCEYwROo
++o0NCeXKxcXMlDADDBPBgyi3CmzajN6KhC0sAP1pn3mtY81YTBz3A5VbPmf0A37C
+U49nsNq63F5DOUpOnw6Sc2SfH7UBl0Ast7fOwjFHhFOZs0daopNhSF/anNhWrCDb
+qxAI7bCs/vvGC0HMGq/EYkmRoRCvHqcNOj0jmjXceeBQTK3hFlU=
+=muxI
+-----END PGP SIGNATURE-----
