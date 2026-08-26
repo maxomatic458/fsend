@@ -302,7 +302,7 @@ impl Transfer for IrohTransfer {
 
         let to_skip = match receive_packet::<ReceiverToSender>(&self.conn).await? {
             ReceiverToSender::AcceptFilesSkip { files } => files,
-            ReceiverToSender::RejectFiles => return Err(TransferError::FilesRejected),
+            ReceiverToSender::RejectFiles => return Err(TransferError::PeerDeclined),
             _ => return Err(TransferError::UnexpectedPacket),
         };
 
@@ -385,7 +385,7 @@ impl Transfer for IrohTransfer {
             None => {
                 send_packet(ReceiverToSender::RejectFiles, &self.conn).await?;
                 self.conn.closed().await;
-                return Err(TransferError::FilesRejected);
+                return Err(TransferError::Declined);
             }
         };
 

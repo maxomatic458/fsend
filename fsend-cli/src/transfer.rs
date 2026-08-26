@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use async_compression::tokio::write::GzipEncoder;
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
+use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
@@ -264,8 +265,12 @@ pub enum TransferError {
     Packet(#[from] PacketRecvError),
     #[error("wrong version: expected {0}, got {1}")]
     WrongVersion(String, String),
-    #[error("files rejected")]
-    FilesRejected,
+    #[error("transfer declined")]
+    Declined,
+    #[error("the peer declined the files")]
+    PeerDeclined,
+    #[error("{} of the given paths do not exist", .0.len())]
+    PathsNotFound(Vec<PathBuf>),
     #[error("unexpected packet")]
     UnexpectedPacket,
     #[error("file does not exist: {0}")]
@@ -274,6 +279,44 @@ pub enum TransferError {
     Iroh(String),
     #[error("webrtc: {0}")]
     WebRtc(String),
+}
+
+impl TransferError {
+    /// Generate a user-facing error messsages for user-facing errors
+    pub fn user_error(&self) -> Option<String> {
+        match self {
+            Self::Declined => Some("Transfer declined.".to_owned()),
+            Self::PeerDeclined => Some(format!("{} the peer declined the files", "error:".red())),
+            Self::PathsNotFound(paths) => {
+                let noun = if paths.len() == 1 {
+                    "path does"
+                } else {
+                    "paths do"
+                };
+                let list: String = paths
+                    .iter()
+                    .map(|p| format!("\n - {}", p.display().to_string().blue()))
+                    .collect();
+
+                Some(format!(
+                    "{} {} {} not exist:{}",
+                    "error:".red(),
+                    paths.len(),
+                    noun,
+                    list
+                ))
+            }
+            Self::Io(_)
+            | Self::Connection(_)
+            | Self::Read(_)
+            | Self::Packet(_)
+            | Self::WrongVersion(..)
+            | Self::UnexpectedPacket
+            | Self::FileNotFound(_)
+            | Self::Iroh(_)
+            | Self::WebRtc(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
