@@ -44,14 +44,6 @@ sudo apt update && sudo apt install fsend
 
 You can download the prebuilt binaries for various platforms [here](https://github.com/maxomatic458/fsend/releases/latest).
 
-If you would rather not add the repository, the same `.deb` can be installed on its own:
-
-```bash
-sudo dpkg -i fsend_<version>_amd64.deb
-```
-
-> [!NOTE]
-> The macOS binaries are not signed or notarised. macOS will refuse to run them until you clear the quarantine flag: `xattr -d com.apple.quarantine fsend`.
 
 ### From source via cargo
 

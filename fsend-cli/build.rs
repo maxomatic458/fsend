@@ -2,19 +2,26 @@
 
 use clap::CommandFactory;
 use clap_complete::{generate_to, Shell};
-use std::{env, fs, io, path::Path};
+use std::{env, ffi::OsStr, fs, io, path::Path};
 
 include!("src/cli.rs");
 
-/// Cargo builds from a copy it owns during `cargo package`/`publish`
-/// (`target/package/`) and `cargo install` (`registry/src/`). Writing there
-/// fails the packaging check, and breaks installs when the registry is
-/// read-only.
+/// Cargo builds from a copy it owns during `cargo package`/`publish` and
+/// `cargo install`.
 fn is_managed_checkout(dir: &Path) -> bool {
-    let parts: Vec<_> = dir.iter().collect();
-    parts
+    // `cargo install` unpacks to `<registry>/src/<index>/<pkg>-<ver>`
+    let from_registry = dir
+        .iter()
+        .collect::<Vec<_>>()
         .windows(2)
-        .any(|w| (w[0] == "target" && w[1] == "package") || (w[0] == "registry" && w[1] == "src"))
+        .any(|w| w[0] == "registry" && w[1] == "src");
+
+    // Verify builds run from `<target-dir>/package/<pkg>-<ver>`. `<target-dir>`
+    // is whatever `--target-dir` says, so match the parent name alone — keying
+    // on a literal `target/package` misses `--target-dir target/publish`.
+    let from_package = dir.parent().and_then(Path::file_name) == Some(OsStr::new("package"));
+
+    from_registry || from_package
 }
 
 fn main() -> io::Result<()> {
