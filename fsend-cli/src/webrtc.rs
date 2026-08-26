@@ -471,7 +471,7 @@ impl Transfer for WebRtcTransfer {
 
         let to_skip = match recv_packet::<ReceiverToSender>(&self.control_rx).await? {
             ReceiverToSender::AcceptFilesSkip { files } => files,
-            ReceiverToSender::RejectFiles => return Err(TransferError::FilesRejected),
+            ReceiverToSender::RejectFiles => return Err(TransferError::PeerDeclined),
             _ => return Err(TransferError::UnexpectedPacket),
         };
 
@@ -556,7 +556,7 @@ impl Transfer for WebRtcTransfer {
             Some(p) => p,
             None => {
                 send_packet(self.control_dc(), &ReceiverToSender::RejectFiles).await?;
-                return Err(TransferError::FilesRejected);
+                return Err(TransferError::Declined);
             }
         };
 

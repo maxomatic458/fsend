@@ -5,6 +5,7 @@ mod transfer;
 mod webrtc;
 
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use clap::Parser;
 use colored::Colorize;
@@ -14,10 +15,26 @@ use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressStyle};
 use self::iroh::IrohTransfer;
 use cli::{Args, Mode};
 use relay::{ConnectionInfo, Protocol, RelayClient};
-use transfer::{FilesAvailable, ReceiveArgs, SendArgs, Transfer};
+use transfer::{FilesAvailable, ReceiveArgs, SendArgs, Transfer, TransferError};
 
 #[tokio::main]
-async fn main() -> color_eyre::Result<()> {
+async fn main() -> ExitCode {
+    let Err(report) = run().await else {
+        return ExitCode::SUCCESS;
+    };
+
+    match report
+        .downcast_ref::<TransferError>()
+        .and_then(TransferError::user_error)
+    {
+        Some(msg) => eprintln!("{msg}"),
+        None => eprintln!("{report:?}"),
+    }
+
+    ExitCode::FAILURE
+}
+
+async fn run() -> color_eyre::Result<()> {
     let args = Args::parse();
     color_eyre::install()?;
     tracing_subscriber::fmt()
@@ -160,10 +177,10 @@ async fn run_send(
     download_url: &str,
     files: Vec<PathBuf>,
 ) -> color_eyre::Result<()> {
-    for f in &files {
-        if !f.exists() {
-            return Err(transfer::TransferError::FileNotFound(f.clone()).into());
-        }
+    let missing: Vec<_> = files.iter().filter(|f| !f.exists()).cloned().collect();
+
+    if !missing.is_empty() {
+        return Err(TransferError::PathsNotFound(missing).into());
     }
 
     let mut relay = RelayClient::connect(relay_url).await?;
@@ -173,7 +190,7 @@ async fn run_send(
 
     println!("Session code: {}\n", code.bright_white());
     println!("On the other peer, run:\n");
-    println!("  {} {}\n", "fsend-cli receive".yellow(), code.yellow());
+    println!("  {} {}\n", "fsend receive".yellow(), code.yellow());
 
     println!("or open in a browser:\n");
     println!("  {}\n", download_link(download_url, &code).blue());
@@ -196,8 +213,7 @@ async fn run_send(
                 *progress_bars.lock().unwrap() = Some(CliProgressBars::new(initial));
             },
             &mut || {
-                print!("Waiting for peer to accept files...");
-                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                println!("Waiting for peer to accept files...");
             },
             &mut |n| {
                 if let Some(pb) = &mut *progress_bars.lock().unwrap() {

@@ -79,17 +79,17 @@ The transfer speed should be within 80-90% of `min(sender_up, receiver_down)`.
 
 #### Sending files
 ```bash
-$ fsend-cli send <file_path>
+$ fsend send <file_path>
 Session code: 123456
 
 On the other peer, run:
 
-  fsend-cli receive 123456
+  fsend receive 123456
 ```
 
 #### Receiving files
 ```bash
-$ fsend-cli receive 123456
+$ fsend receive 123456
 ```
 
 ## Licenses
