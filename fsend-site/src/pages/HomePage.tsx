@@ -226,6 +226,29 @@ export function HomePage() {
         </div>
 
         <a
+          class="mt-8 inline-block"
+          href="https://www.producthunt.com/products/fsend-sh/reviews/new?utm_source=badge-product_review&utm_medium=badge&utm_source=badge-fsend&#0045;sh"
+          target="_blank"
+        >
+          <img
+            class="dark:hidden"
+            src="https://api.producthunt.com/widgets/embed-image/v1/product_review.svg?product_id=1293275&theme=light"
+            alt="fsend&#0046;sh - peer&#0032;to&#0032;peer&#0032;filesharing&#0032;in&#0032;your&#0032;browser | Product Hunt"
+            style="width: 250px; height: 54px;"
+            width="250"
+            height="54"
+          />
+          <img
+            class="hidden dark:block"
+            src="https://api.producthunt.com/widgets/embed-image/v1/product_review.svg?product_id=1293275&theme=dark"
+            alt="fsend&#0046;sh - peer&#0032;to&#0032;peer&#0032;filesharing&#0032;in&#0032;your&#0032;browser | Product Hunt"
+            style="width: 250px; height: 54px;"
+            width="250"
+            height="54"
+          />
+        </a>
+
+        <a
           href="#how"
           aria-label="Scroll to how it works"
           class="absolute bottom-4 left-1/2 -translate-x-1/2 p-2 text-ink-dim hover:text-ink transition-colors"
