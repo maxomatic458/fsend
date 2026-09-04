@@ -52,9 +52,7 @@ fn main() -> io::Result<()> {
         generate_to(shell, &mut cmd, "fsend", &completions)?;
     }
 
-    let mut man = Vec::new();
-    clap_mangen::Man::new(cmd).render(&mut man)?;
-    fs::write(man_dir.join("fsend.1"), man)?;
+    clap_mangen::generate_to(Args::command(), &man_dir)?;
 
     Ok(())
 }

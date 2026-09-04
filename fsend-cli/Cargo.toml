@@ -4,7 +4,7 @@ license = "MIT"
 description = "A CLI for fsend, a peer-to-peer file sharing tool"
 authors = ["Maxomatic458"]
 keywords = ["file-transfer", "peer-to-peer", "p2p", "cli"]
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 repository = "https://github.com/maxomatic458/fsend"
 homepage = "https://fsend.sh"
@@ -60,7 +60,7 @@ Compatible with the fsend.sh web-app. \
 assets = [
     ["target/release/fsend", "usr/bin/", "755"],
     ["../README.md", "usr/share/doc/fsend/README.md", "644"],
-    ["dist/man/fsend.1", "usr/share/man/man1/fsend.1", "644"],
+    ["dist/man/*.1", "usr/share/man/man1/", "644"],
     ["dist/completions/fsend.bash", "usr/share/bash-completion/completions/fsend", "644"],
     ["dist/completions/fsend.fish", "usr/share/fish/vendor_completions.d/fsend.fish", "644"],
     ["dist/completions/_fsend", "usr/share/zsh/vendor-completions/_fsend", "644"],
