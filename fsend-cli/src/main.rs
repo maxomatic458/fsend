@@ -7,6 +7,9 @@ use clap::Parser;
 use colored::Colorize;
 use dialoguer::theme::ColorfulTheme;
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use tracing_subscriber::filter::{LevelFilter, Targets};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use self::iroh::IrohTransfer;
 use cli::{Args, Mode};
@@ -33,8 +36,9 @@ async fn main() -> ExitCode {
 async fn run() -> color_eyre::Result<()> {
     let args = Args::parse();
     color_eyre::install()?;
-    tracing_subscriber::fmt()
-        .with_max_level(args.log_level)
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(log_filter(args.log_level))
         .init();
 
     match args.mode {
@@ -49,6 +53,20 @@ async fn run() -> color_eyre::Result<()> {
     }
 
     Ok(())
+}
+
+/// Only show errors for fsend and fsend_cli (webrtc throws some error logs that,
+/// are not actually errors) to avoid spam.
+fn log_filter(level: tracing::Level) -> Targets {
+    let own = LevelFilter::from_level(level);
+    let libraries = if level == tracing::Level::ERROR {
+        LevelFilter::OFF
+    } else {
+        own
+    };
+    Targets::new()
+        .with_default(libraries)
+        .with_targets([("fsend", own), ("fsend_cli", own)])
 }
 
 fn print_version() {
