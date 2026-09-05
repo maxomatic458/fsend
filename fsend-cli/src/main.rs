@@ -1,8 +1,4 @@
-mod cli;
-mod iroh;
-mod relay;
-mod transfer;
-mod webrtc;
+use fsend_cli::{cli, iroh, relay, transfer, webrtc};
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -10,7 +6,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use colored::Colorize;
 use dialoguer::theme::ColorfulTheme;
-use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 use self::iroh::IrohTransfer;
 use cli::{Args, Mode};
@@ -92,11 +88,7 @@ async fn create_sender_transfer(
     match protocol {
         Protocol::Iroh => {
             let endpoint = IrohTransfer::create_endpoint().await?;
-            let node_addr = endpoint
-                .node_addr()
-                .await
-                .map_err(|e| transfer::TransferError::Iroh(e.to_string()))?;
-            let my_info = IrohTransfer::connection_info_from_node_addr(&node_addr);
+            let my_info = IrohTransfer::local_connection_info(&endpoint).await;
 
             relay.send_exchange(my_info).await?;
             let _peer_info = relay.recv_exchange().await?;
@@ -116,11 +108,7 @@ async fn create_sender_transfer(
 
             let answer_sdp = match &peer_info {
                 ConnectionInfo::WebRtc { sdp, .. } => sdp.clone(),
-                _ => {
-                    return Err(
-                        transfer::TransferError::WebRtc("expected WebRTC answer".into()).into(),
-                    )
-                }
+                _ => return Err(transfer::TransferError::UnexpectedConnectionInfo.into()),
             };
             wrt.set_answer(&answer_sdp).await?;
             wrt.wait_connected().await?;
@@ -136,11 +124,7 @@ async fn create_receiver_transfer(
     match protocol {
         Protocol::Iroh => {
             let endpoint = IrohTransfer::create_endpoint().await?;
-            let node_addr = endpoint
-                .node_addr()
-                .await
-                .map_err(|e| transfer::TransferError::Iroh(e.to_string()))?;
-            let my_info = IrohTransfer::connection_info_from_node_addr(&node_addr);
+            let my_info = IrohTransfer::local_connection_info(&endpoint).await;
 
             let peer_info = relay.recv_exchange().await?;
             relay.send_exchange(my_info).await?;
@@ -152,11 +136,7 @@ async fn create_receiver_transfer(
             let peer_info = relay.recv_exchange().await?;
             let offer_sdp = match &peer_info {
                 ConnectionInfo::WebRtc { sdp, .. } => sdp.clone(),
-                _ => {
-                    return Err(
-                        transfer::TransferError::WebRtc("expected WebRTC offer".into()).into(),
-                    )
-                }
+                _ => return Err(transfer::TransferError::UnexpectedConnectionInfo.into()),
             };
 
             let (mut wrt, answer_sdp) = webrtc::WebRtcTransfer::create_answerer(&offer_sdp).await?;
@@ -339,7 +319,11 @@ impl CliProgressBars {
             });
         longest = longest.max("Total".len());
 
-        let mp = MultiProgress::new();
+        let mp = if cfg!(test) {
+            MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
+        } else {
+            MultiProgress::new()
+        };
         let mut bars = Vec::new();
         for (name, progress, size) in data {
             let pb = mp.add(ProgressBar::new(*size));
@@ -386,8 +370,8 @@ impl CliProgressBars {
 fn colorize_conn_type(conn_type: &str) -> String {
     match conn_type {
         "Direct" => conn_type.green().to_string(),
-        "Relay" => conn_type.red().to_string(),
-        "Mixed" => conn_type.yellow().to_string(),
+        "Relay" => conn_type.yellow().to_string(),
+        "WebRTC" => conn_type.green().to_string(),
         _ => conn_type.red().to_string(),
     }
 }
@@ -437,5 +421,54 @@ mod tests {
         let code = "AB12CD34";
         let link = download_link(DEFAULT_DOWNLOAD_URL, code);
         assert_eq!(parse_code(&link), code);
+    }
+
+    #[test]
+    fn progress_bars_fill_files_in_order() {
+        let mut bars = CliProgressBars::new(&[
+            ("a".into(), 0, 100),
+            ("b".into(), 50, 100),
+            ("c".into(), 100, 100),
+        ]);
+        let positions = |bars: &CliProgressBars| -> Vec<u64> {
+            bars.bars.iter().map(|b| b.position()).collect()
+        };
+        assert_eq!(positions(&bars), [0, 50, 100]);
+        let total = bars.total.as_ref().expect("several files get a total bar");
+        assert_eq!(total.position(), 150);
+        assert_eq!(total.length(), Some(300));
+
+        // Bytes land in the first file that still has room.
+        bars.update(30);
+        assert_eq!(positions(&bars), [30, 50, 100]);
+        // then they move to the next bar
+        bars.update(100);
+        assert_eq!(positions(&bars), [100, 80, 100]);
+        bars.update(20);
+        assert_eq!(positions(&bars), [100, 100, 100]);
+        assert_eq!(bars.total.as_ref().unwrap().position(), 300);
+    }
+
+    #[test]
+    fn a_single_file_has_no_total_bar() {
+        let mut bars = CliProgressBars::new(&[("only".into(), 10, 40)]);
+        assert!(bars.total.is_none());
+        bars.update(30);
+        assert_eq!(bars.bars[0].position(), 40);
+    }
+
+    #[test]
+    fn progress_bars_survive_no_files() {
+        let mut bars = CliProgressBars::new(&[]);
+        assert!(bars.bars.is_empty() && bars.total.is_none());
+        bars.update(5);
+    }
+
+    #[test]
+    fn connection_types_keep_their_names() {
+        colored::control::set_override(false);
+        for kind in ["Direct", "Relay", "WebRTC", "None", "Unknown"] {
+            assert_eq!(colorize_conn_type(kind), kind);
+        }
     }
 }

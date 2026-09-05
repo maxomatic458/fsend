@@ -1,44 +1,60 @@
-use std::path::Path;
+use std::net::SocketAddr;
+use std::time::Duration;
 
-use async_compression::tokio::bufread::GzipDecoder;
-use async_compression::tokio::write::GzipEncoder;
 use async_trait::async_trait;
-use bincode::{Decode, Encode};
-use iroh::{Endpoint, NodeAddr, RelayMode, SecretKey};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use iroh::endpoint::{presets, Connection, ConnectionError, StoppedError, VarInt};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr, Watcher};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::relay::ConnectionInfo;
 use crate::transfer::*;
 
-async fn send_packet<P: Encode + std::fmt::Debug>(
-    packet: P,
-    conn: &iroh::endpoint::Connection,
-) -> std::io::Result<()> {
+const MAX_PACKET_SIZE: usize = 512 * 1024 * 1024; // 512 MiB is probably enough
+
+/// Resolving Home relay and direct address timeout.
+const ADDR_TIMEOUT: Duration = Duration::from_secs(15);
+
+// Initial peer connection timeout.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+
+const CLOSE_OK: u32 = 0;
+const CLOSE_ERR: u32 = 1;
+
+/// Sends one control packet on its own unidirectional stream (they are very cheap to use).
+/// The packet is gzip compressed.
+async fn send_packet<P: WirePacket>(packet: &P, conn: &Connection) -> Result<(), TransferError> {
     tracing::debug!("sending packet: {:?}", packet);
-    let mut send = conn.open_uni().await?;
-    let data = bincode::encode_to_vec(&packet, bincode::config::standard()).unwrap();
+    let data = packet.to_wire().map_err(PacketError::Encode)?;
     let compressed = compress_gzip(&data).await?;
-    send.write_all(&compressed).await?;
-    send.flush().await?;
-    send.finish()?;
-    Ok(())
+    let mut send = conn.open_uni().await?;
+    send.write_all(&compressed)
+        .await
+        .map_err(PacketError::Write)?;
+    send.finish().map_err(|_| PacketError::Stopped)?;
+    match send.stopped().await {
+        Ok(_) => Ok(()),
+        Err(StoppedError::ConnectionLost(e)) => Err(TransferError::Connection(e)),
+        Err(_) => Err(PacketError::Stopped.into()),
+    }
 }
 
-async fn receive_packet<P: Decode<()> + std::fmt::Debug>(
-    conn: &iroh::endpoint::Connection,
-) -> Result<P, PacketRecvError> {
+/// Receives one control packet on its own unidirectional stream (they are very cheap to use).
+/// The packet is gzip compressed.
+async fn receive_packet<P: WirePacket>(conn: &Connection) -> Result<P, TransferError> {
     let mut recv = conn.accept_uni().await?;
-    let mut buf = Vec::new();
-    let mut tmp = vec![0u8; 4096];
-    while let Some(n) = recv.read(&mut tmp).await? {
-        buf.extend_from_slice(&tmp[..n]);
-    }
-    let decompressed = decompress_gzip(&buf).await?;
-    let (packet, _) = bincode::decode_from_slice(&decompressed, bincode::config::standard())?;
+    let compressed = recv
+        .read_to_end(MAX_PACKET_SIZE)
+        .await
+        .map_err(PacketError::Read)?;
+    let data = decompress_gzip(&compressed)
+        .await
+        .map_err(PacketError::Io)?;
+    let packet = P::from_wire(&data).map_err(PacketError::Decode)?;
     tracing::debug!("received packet: {:?}", packet);
     Ok(packet)
 }
 
+/// Copies `skip..size` of `file` into `send`.
 async fn send_file_data<S, R>(
     send: &mut S,
     file: &mut R,
@@ -55,7 +71,7 @@ where
     let mut read = skip;
     while read < size {
         let to_read = std::cmp::min(BUF_SIZE as u64, size - read) as usize;
-        let n = file.read_exact(&mut buf[..to_read]).await?;
+        let n = file.read(&mut buf[..to_read]).await?;
         if n == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -69,34 +85,7 @@ where
     Ok(())
 }
 
-fn send_directory<S>(
-    send: &mut S,
-    root: &Path,
-    files: &[FileSendRecvTree],
-    cb: &mut (dyn FnMut(u64) + Send),
-) -> std::io::Result<()>
-where
-    S: AsyncWriteExt + Unpin + Send,
-{
-    for file in files {
-        match file {
-            FileSendRecvTree::File { name, skip, size } => {
-                let path = root.join(name);
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        let mut f = tokio::fs::File::open(&path).await?;
-                        send_file_data(send, &mut f, *skip, *size, cb).await
-                    })
-                })?;
-            }
-            FileSendRecvTree::Dir { name, files } => {
-                send_directory(send, &root.join(name), files, cb)?;
-            }
-        }
-    }
-    Ok(())
-}
-
+/// Reads `skip..size` from `recv` into `file`.
 async fn receive_file_data<R, W>(
     recv: &mut R,
     file: &mut W,
@@ -106,18 +95,17 @@ async fn receive_file_data<R, W>(
 ) -> std::io::Result<()>
 where
     R: AsyncReadExt + Unpin,
-    W: AsyncWriteExt + AsyncSeekExt + Unpin,
+    W: AsyncWriteExt + Unpin,
 {
-    file.seek(std::io::SeekFrom::Start(skip)).await?;
     let mut buf = vec![0u8; BUF_SIZE];
     let mut written = skip;
     while written < size {
         let to_read = std::cmp::min(BUF_SIZE as u64, size - written) as usize;
-        let n = recv.read_exact(&mut buf[..to_read]).await?;
+        let n = recv.read(&mut buf[..to_read]).await?;
         if n == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
-                "unexpected eof",
+                "the stream ended before the file was complete",
             ));
         }
         file.write_all(&buf[..n]).await?;
@@ -127,39 +115,40 @@ where
     Ok(())
 }
 
-fn receive_directory<R>(
-    recv: &mut R,
-    root: &Path,
-    files: &[FileSendRecvTree],
-    cb: &mut (dyn FnMut(u64) + Send),
+use tokio::io::AsyncSeekExt;
+
+async fn send_entries<S>(
+    send: &mut S,
+    entries: &[TransferEntry],
+    write_cb: &mut (dyn FnMut(u64) + Send),
 ) -> std::io::Result<()>
 where
-    R: AsyncReadExt + Unpin + Send,
+    S: AsyncWriteExt + Unpin,
 {
-    for file in files {
-        match file {
-            FileSendRecvTree::File { name, skip, size } => {
-                let path = root.join(name);
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        let mut f = tokio::fs::OpenOptions::new()
-                            .write(true)
-                            .create(true)
-                            .open(&path)
-                            .await?;
-                        receive_file_data(recv, &mut f, *skip, *size, cb).await?;
-                        f.sync_all().await?;
-                        f.shutdown().await?;
-                        Ok::<(), std::io::Error>(())
-                    })
-                })?;
-            }
-            FileSendRecvTree::Dir { name, files } => {
-                let dir = root.join(name);
-                if !dir.exists() {
-                    std::fs::create_dir(&dir)?;
-                }
-                receive_directory(recv, &dir, files, cb)?;
+    for entry in entries {
+        if let TransferEntry::File { path, skip, size } = entry {
+            let mut file = tokio::fs::File::open(path).await?;
+            send_file_data(send, &mut file, *skip, *size, write_cb).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn receive_entries<R>(
+    recv: &mut R,
+    entries: &[TransferEntry],
+    read_cb: &mut (dyn FnMut(u64) + Send),
+) -> std::io::Result<()>
+where
+    R: AsyncReadExt + Unpin,
+{
+    for entry in entries {
+        match entry {
+            TransferEntry::Dir { path } => tokio::fs::create_dir_all(path).await?,
+            TransferEntry::File { path, skip, size } => {
+                let mut file = open_for_receive(path, *skip).await?;
+                receive_file_data(recv, &mut file, *skip, *size, read_cb).await?;
+                finish_received_file(&mut file, *size).await?;
             }
         }
     }
@@ -167,99 +156,112 @@ where
 }
 
 pub struct IrohTransfer {
-    conn: iroh::endpoint::Connection,
+    conn: Connection,
     endpoint: Endpoint,
 }
 
 impl IrohTransfer {
-    pub fn connection_info_from_node_addr(addr: &NodeAddr) -> ConnectionInfo {
-        let addrs: Vec<String> = addr
-            .direct_addresses
+    /// An iroh endpoint with the n0 defaults
+    pub async fn create_endpoint() -> Result<Endpoint, TransferError> {
+        Self::bind(presets::N0).await
+    }
+
+    pub async fn bind(preset: impl presets::Preset) -> Result<Endpoint, TransferError> {
+        Ok(Endpoint::builder(preset)
+            .alpns(vec![FSEND_ALPN.to_vec()])
+            .bind()
+            .await?)
+    }
+
+    /// The address to hand to the relay for the other peer.
+    pub async fn local_connection_info(endpoint: &Endpoint) -> ConnectionInfo {
+        let mut watcher = endpoint.watch_addr();
+        let ready = async {
+            loop {
+                let addr = watcher.get();
+                if addr.relay_urls().next().is_some() && addr.ip_addrs().next().is_some() {
+                    return;
+                }
+                if watcher.updated().await.is_err() {
+                    return;
+                }
+            }
+        };
+
+        if tokio::time::timeout(ADDR_TIMEOUT, ready).await.is_err() {
+            tracing::warn!("sharing the address before the relay was reached");
+        }
+
+        Self::connection_info_from_addr(&endpoint.addr())
+    }
+
+    /// Convert the [`EndpointAddr`] into a [`ConnectionInfo`]
+    pub fn connection_info_from_addr(addr: &EndpointAddr) -> ConnectionInfo {
+        let addrs = addr
+            .addrs
             .iter()
-            .map(|a| a.to_string())
+            .filter_map(|a| match a {
+                TransportAddr::Ip(addr) => Some(addr.to_string()),
+                TransportAddr::Relay(url) => Some(url.to_string()),
+                _ => None,
+            })
             .collect();
         ConnectionInfo::Iroh {
-            node_id: addr.node_id.to_string(),
+            node_id: addr.id.to_string(),
             addrs,
         }
     }
 
-    pub fn node_addr_from_connection_info(
-        info: &ConnectionInfo,
-    ) -> Result<NodeAddr, TransferError> {
-        match info {
-            ConnectionInfo::Iroh { node_id, addrs } => {
-                let node_id = node_id
-                    .parse::<iroh::NodeId>()
-                    .map_err(|e| TransferError::Iroh(format!("invalid node_id: {e}")))?;
-                let direct_addresses: std::collections::BTreeSet<std::net::SocketAddr> =
-                    addrs.iter().filter_map(|a| a.parse().ok()).collect();
-                Ok(NodeAddr {
-                    node_id,
-                    relay_url: None,
-                    direct_addresses,
-                })
+    pub fn addr_from_connection_info(info: &ConnectionInfo) -> Result<EndpointAddr, TransferError> {
+        let ConnectionInfo::Iroh { node_id, addrs } = info else {
+            return Err(TransferError::UnexpectedConnectionInfo);
+        };
+        let id = node_id.parse::<EndpointId>()?;
+        let addrs = addrs.iter().filter_map(|a| {
+            if let Ok(addr) = a.parse::<SocketAddr>() {
+                Some(TransportAddr::Ip(addr))
+            } else if let Ok(url) = a.parse::<RelayUrl>() {
+                Some(TransportAddr::Relay(url))
+            } else {
+                tracing::warn!("ignoring unparsable peer address {a:?}");
+                None
             }
-            _ => Err(TransferError::Iroh("expected iroh connection info".into())),
-        }
+        });
+        Ok(EndpointAddr::from_parts(id, addrs))
     }
 
-    pub async fn create_endpoint() -> Result<Endpoint, TransferError> {
-        let secret_key = SecretKey::generate(rand::rngs::OsRng);
-        Endpoint::builder()
-            .secret_key(secret_key)
-            .alpns(vec![FSEND_ALPN.to_vec()])
-            .relay_mode(RelayMode::Default)
-            .bind()
-            .await
-            .map_err(|e| TransferError::Iroh(e.to_string()))
-    }
-
+    /// Waits for the receiver to connect.
     pub async fn accept(endpoint: Endpoint) -> Result<Self, TransferError> {
-        let incoming = endpoint.accept().await.ok_or_else(|| {
-            TransferError::Iroh("endpoint closed while waiting for connection".into())
-        })?;
-        let connecting = incoming.accept()?;
-        let conn = connecting.await?;
-        tracing::info!("receiver connected to sender");
+        let accept = async {
+            let incoming = endpoint
+                .accept()
+                .await
+                .ok_or(TransferError::EndpointClosed)?;
+            Ok::<_, TransferError>(incoming.accept()?.await?)
+        };
+        let conn = tokio::time::timeout(CONNECT_TIMEOUT, accept)
+            .await
+            .map_err(|_| TransferError::PeerTimeout)??;
+        tracing::info!("receiver connected");
         Ok(Self { conn, endpoint })
     }
 
-    pub async fn connect(
-        endpoint: Endpoint,
-        peer_info: ConnectionInfo,
-    ) -> Result<Self, TransferError> {
-        let node_addr = Self::node_addr_from_connection_info(&peer_info)?;
-        let conn = endpoint
-            .connect(node_addr, FSEND_ALPN)
+    /// Connects to the sender.
+    pub async fn connect(endpoint: Endpoint, peer: ConnectionInfo) -> Result<Self, TransferError> {
+        let addr = Self::addr_from_connection_info(&peer)?;
+        let conn = tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(addr, FSEND_ALPN))
             .await
-            .map_err(|e| TransferError::Iroh(e.to_string()))?;
+            .map_err(|_| TransferError::PeerTimeout)??;
         tracing::info!("connected to sender");
         Ok(Self { conn, endpoint })
     }
-}
 
-#[async_trait]
-impl Transfer for IrohTransfer {
-    async fn connection_type_name(&self) -> String {
-        let conn_type = match self.conn.remote_node_id() {
-            Ok(node_id) => self
-                .endpoint
-                .conn_type(node_id)
-                .ok()
-                .and_then(|c| c.get().ok()),
-            Err(_) => None,
-        };
-        match conn_type {
-            Some(iroh::endpoint::ConnectionType::Direct(_)) => "Direct".into(),
-            Some(iroh::endpoint::ConnectionType::Relay(_)) => "Relay".into(),
-            Some(iroh::endpoint::ConnectionType::Mixed(_, _)) => "Mixed".into(),
-            Some(iroh::endpoint::ConnectionType::None) => "None".into(),
-            None => "Unknown".into(),
-        }
+    async fn close_with(&self, code: u32, reason: &[u8]) {
+        self.conn.close(VarInt::from(code), reason);
+        self.endpoint.close().await;
     }
 
-    async fn send_files(
+    async fn run_send(
         &mut self,
         args: SendArgs,
         initial_progress_cb: ProgressCb<'_>,
@@ -267,7 +269,7 @@ impl Transfer for IrohTransfer {
         write_cb: DataCb<'_>,
     ) -> Result<(), TransferError> {
         send_packet(
-            SenderToReceiver::ConnRequest {
+            &SenderToReceiver::ConnRequest {
                 version: PROTO_VERSION.to_string(),
             },
             &self.conn,
@@ -291,7 +293,7 @@ impl Transfer for IrohTransfer {
         }
 
         send_packet(
-            SenderToReceiver::FileInfo {
+            &SenderToReceiver::FileInfo {
                 files: files_available.clone(),
             },
             &self.conn,
@@ -305,53 +307,36 @@ impl Transfer for IrohTransfer {
             ReceiverToSender::RejectFiles => return Err(TransferError::PeerDeclined),
             _ => return Err(TransferError::UnexpectedPacket),
         };
+        if to_skip.len() != files_available.len() {
+            return Err(TransferError::UnexpectedPacket);
+        }
 
-        let to_send: Vec<Option<FileSendRecvTree>> = files_available
-            .iter()
-            .zip(&to_skip)
-            .map(|(file, skip)| match skip {
-                Some(s) => file.remove_skipped(s),
-                None => Some(file.to_send_recv_tree()),
-            })
-            .collect();
+        let plan = plan_transfer(&files_available, &to_skip);
+        initial_progress_cb(&plan.progress);
 
-        let progress: Vec<(String, u64, u64)> = files_available
-            .iter()
-            .zip(&to_skip)
-            .map(|(file, skip)| {
-                (
-                    file.name().to_string(),
-                    skip.as_ref().map(|s| s.skip()).unwrap_or(0),
-                    file.size(),
-                )
-            })
-            .collect();
+        let mut send = self.conn.open_uni().await?;
 
-        initial_progress_cb(&progress);
-
-        let uni = self.conn.open_uni().await?;
-        let mut send = GzipEncoder::new(uni);
-
-        for (path, file) in args.files.iter().zip(to_send) {
-            if let Some(file) = file {
-                match file {
-                    FileSendRecvTree::File { skip, size, .. } => {
-                        let mut f = tokio::fs::File::open(path).await?;
-                        send_file_data(&mut send, &mut f, skip, size, write_cb).await?;
-                    }
-                    FileSendRecvTree::Dir { files, .. } => {
-                        send_directory(&mut send, path, &files, write_cb)?;
-                    }
-                }
-            }
+        for (path, tree) in args.files.iter().zip(plan.to_transfer) {
+            let Some(tree) = tree else { continue };
+            let entries = flatten_trees(std::slice::from_ref(&tree), path);
+            send_entries(&mut send, &entries, write_cb).await?;
         }
 
         send.shutdown().await?;
-        self.conn.closed().await;
-        Ok(())
+
+        // The receiver closes once everything is on disk. CLOSE_OK indicates
+        // success.
+        match self.conn.closed().await {
+            ConnectionError::ApplicationClosed(close)
+                if close.error_code == VarInt::from(CLOSE_OK) =>
+            {
+                Ok(())
+            }
+            reason => Err(TransferError::Disconnected(reason.to_string())),
+        }
     }
 
-    async fn receive_files(
+    async fn run_receive(
         &mut self,
         args: ReceiveArgs,
         initial_progress_cb: ProgressCb<'_>,
@@ -362,7 +347,7 @@ impl Transfer for IrohTransfer {
             SenderToReceiver::ConnRequest { version } => {
                 if version != PROTO_VERSION {
                     send_packet(
-                        ReceiverToSender::WrongVersion {
+                        &ReceiverToSender::WrongVersion {
                             expected: PROTO_VERSION.into(),
                         },
                         &self.conn,
@@ -370,7 +355,7 @@ impl Transfer for IrohTransfer {
                     .await?;
                     return Err(TransferError::WrongVersion(PROTO_VERSION.into(), version));
                 }
-                send_packet(ReceiverToSender::Ok, &self.conn).await?;
+                send_packet(&ReceiverToSender::Ok, &self.conn).await?;
             }
             _ => return Err(TransferError::UnexpectedPacket),
         }
@@ -383,89 +368,85 @@ impl Transfer for IrohTransfer {
         let output_path = match accept_files_cb(&files_offered) {
             Some(p) => p,
             None => {
-                send_packet(ReceiverToSender::RejectFiles, &self.conn).await?;
-                self.conn.closed().await;
+                send_packet(&ReceiverToSender::RejectFiles, &self.conn).await?;
                 return Err(TransferError::Declined);
             }
         };
 
-        let files_to_skip: Vec<Option<FilesToSkip>> = if args.resume {
-            files_offered
-                .iter()
-                .map(|offered| {
-                    let local_path = output_path.join(offered.name());
-                    get_files_available(&local_path)
-                        .ok()
-                        .and_then(|local| offered.get_skippable(&local))
-                })
-                .collect()
-        } else {
-            vec![None; files_offered.len()]
-        };
-
-        let to_receive: Vec<Option<FileSendRecvTree>> = files_offered
-            .iter()
-            .zip(&files_to_skip)
-            .map(|(offered, skip)| match skip {
-                Some(s) => offered.remove_skipped(s),
-                None => Some(offered.to_send_recv_tree()),
-            })
-            .collect();
-
-        let progress: Vec<(String, u64, u64)> = files_offered
-            .iter()
-            .zip(&files_to_skip)
-            .map(|(offered, skip)| {
-                (
-                    offered.name().to_string(),
-                    skip.as_ref().map(|s| s.skip()).unwrap_or(0),
-                    offered.size(),
-                )
-            })
-            .collect();
-
-        initial_progress_cb(&progress);
+        let files_to_skip = skip_list(&files_offered, &output_path, args.resume);
+        let plan = plan_transfer(&files_offered, &files_to_skip);
+        initial_progress_cb(&plan.progress);
 
         send_packet(
-            ReceiverToSender::AcceptFilesSkip {
+            &ReceiverToSender::AcceptFilesSkip {
                 files: files_to_skip,
             },
             &self.conn,
         )
         .await?;
 
-        let recv_stream = self.conn.accept_uni().await?;
-        let mut recv = GzipDecoder::new(tokio::io::BufReader::with_capacity(BUF_SIZE, recv_stream));
+        let mut recv = self.conn.accept_uni().await?;
 
-        for file in to_receive.into_iter().flatten() {
-            match file {
-                FileSendRecvTree::File { name, skip, size } => {
-                    let path = output_path.join(&name);
-                    let mut f = tokio::fs::OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .open(&path)
-                        .await?;
-                    receive_file_data(&mut recv, &mut f, skip, size, read_cb).await?;
-                    f.sync_all().await?;
-                    f.shutdown().await?;
-                }
-                FileSendRecvTree::Dir { name, files } => {
-                    let dir = output_path.join(&name);
-                    if !dir.exists() {
-                        std::fs::create_dir(&dir)?;
-                    }
-                    receive_directory(&mut recv, &dir, &files, read_cb)?;
-                }
-            }
+        tokio::fs::create_dir_all(&output_path).await?;
+        for tree in plan.to_transfer.into_iter().flatten() {
+            let entries =
+                flatten_trees(std::slice::from_ref(&tree), &output_path.join(tree.name()));
+            receive_entries(&mut recv, &entries, read_cb).await?;
         }
 
-        self.close().await;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl Transfer for IrohTransfer {
+    async fn connection_type_name(&self) -> String {
+        let paths = self.conn.paths();
+        match paths.iter().find(|p| p.is_selected()) {
+            Some(p) if p.is_ip() => "Direct",
+            Some(p) if p.is_relay() => "Relay",
+            Some(_) => "Unknown",
+            None => "None",
+        }
+        .into()
+    }
+
+    async fn send_files(
+        &mut self,
+        args: SendArgs,
+        initial_progress_cb: ProgressCb<'_>,
+        waiting_cb: WaitingCb<'_>,
+        write_cb: DataCb<'_>,
+    ) -> Result<(), TransferError> {
+        let result = self
+            .run_send(args, initial_progress_cb, waiting_cb, write_cb)
+            .await;
+        // On success the receiver already closed the connection.
+        let code = if result.is_ok() { CLOSE_OK } else { CLOSE_ERR };
+        self.close_with(code, b"sender done").await;
+        result
+    }
+
+    async fn receive_files(
+        &mut self,
+        args: ReceiveArgs,
+        initial_progress_cb: ProgressCb<'_>,
+        accept_files_cb: AcceptFilesCb<'_>,
+        read_cb: DataCb<'_>,
+    ) -> Result<(), TransferError> {
+        let result = self
+            .run_receive(args, initial_progress_cb, accept_files_cb, read_cb)
+            .await;
+        let code = if result.is_ok() { CLOSE_OK } else { CLOSE_ERR };
+        self.close_with(code, b"receiver done").await;
+        result
     }
 
     async fn close(&mut self) {
-        self.conn.close(0u32.into(), &[0]);
-        self.endpoint.close().await;
+        self.close_with(CLOSE_OK, b"closed").await;
     }
 }
+
+#[cfg(test)]
+#[path = "tests/iroh.rs"]
+mod tests;

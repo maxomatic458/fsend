@@ -10,7 +10,7 @@ pub enum Protocol {
     Iroh,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum ConnectionInfo {
     WebRtc {
@@ -184,5 +184,143 @@ impl RelayClient {
             ServerMessage::Error(e) => Err(RelayError::Relay(e.message)),
             _ => Err(RelayError::UnexpectedMessage),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_async;
+
+    fn iroh_info(id: &str) -> ConnectionInfo {
+        ConnectionInfo::Iroh {
+            node_id: id.into(),
+            addrs: vec!["10.0.0.1:1234".into()],
+        }
+    }
+
+    /// What the relay does with each client message.
+    type Script = Box<dyn Fn(ClientMessage) -> Vec<Message> + Send + Sync>;
+
+    fn reply(msg: &ServerMessage) -> Message {
+        Message::Text(serde_json::to_string(msg).unwrap().into())
+    }
+
+    /// A relay that runs `script` for one client.
+    async fn mock_relay(script: Script) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            while let Some(Ok(msg)) = ws.next().await {
+                let Message::Text(text) = msg else { continue };
+                let client: ClientMessage = serde_json::from_str(&text).unwrap();
+                for frame in script(client) {
+                    if ws.send(frame).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn sender_flow_creates_a_session_and_exchanges_info() {
+        let url = mock_relay(Box::new(|msg| match msg {
+            ClientMessage::CreateSession(req) => {
+                assert_eq!(req.capabilities, [Protocol::Iroh, Protocol::WebRtc]);
+                // The relay answers with the code, then with the peer.
+                vec![
+                    reply(&ServerMessage::CreateSession(CreateSessionAnswer {
+                        code: "AB12CD34".into(),
+                    })),
+                    reply(&ServerMessage::PeerJoined(PeerJoinedAnswer {
+                        protocol: Protocol::Iroh,
+                    })),
+                ]
+            }
+            ClientMessage::Exchange(req) => {
+                assert_eq!(req.connection_info, iroh_info("sender"));
+                vec![reply(&ServerMessage::Exchange(ExchangeAnswer {
+                    connection_info: iroh_info("receiver"),
+                }))]
+            }
+            other => panic!("unexpected {other:?}"),
+        }))
+        .await;
+
+        let mut relay = RelayClient::connect(&url).await.unwrap();
+        let code = relay
+            .create_session(vec![Protocol::Iroh, Protocol::WebRtc])
+            .await
+            .unwrap();
+        assert_eq!(code, "AB12CD34");
+        assert_eq!(relay.wait_for_peer().await.unwrap(), Protocol::Iroh);
+        relay.send_exchange(iroh_info("sender")).await.unwrap();
+        assert_eq!(relay.recv_exchange().await.unwrap(), iroh_info("receiver"));
+    }
+
+    #[tokio::test]
+    async fn receiver_flow_joins_and_exchanges_info() {
+        let url = mock_relay(Box::new(|msg| match msg {
+            ClientMessage::JoinSession(req) => {
+                assert_eq!(req.code, "AB12CD34");
+                assert_eq!(req.capabilities, [Protocol::WebRtc]);
+                vec![
+                    reply(&ServerMessage::JoinSession(JoinSessionAnswer {
+                        protocol: Protocol::WebRtc,
+                    })),
+                    reply(&ServerMessage::Exchange(ExchangeAnswer {
+                        connection_info: ConnectionInfo::WebRtc {
+                            sdp: "v=0 offer".into(),
+                            ice_candidates: vec![],
+                        },
+                    })),
+                ]
+            }
+            ClientMessage::Exchange(req) => {
+                assert!(matches!(req.connection_info, ConnectionInfo::WebRtc { ref sdp, .. } if sdp == "v=0 answer"));
+                vec![]
+            }
+            other => panic!("unexpected {other:?}"),
+        }))
+        .await;
+
+        let mut relay = RelayClient::connect(&url).await.unwrap();
+        let protocol = relay
+            .join_session("AB12CD34".into(), vec![Protocol::WebRtc])
+            .await
+            .unwrap();
+        assert_eq!(protocol, Protocol::WebRtc);
+        let offer = relay.recv_exchange().await.unwrap();
+        assert!(matches!(offer, ConnectionInfo::WebRtc { ref sdp, .. } if sdp == "v=0 offer"));
+        relay
+            .send_exchange(ConnectionInfo::WebRtc {
+                sdp: "v=0 answer".into(),
+                ice_candidates: vec![],
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_relay_that_hangs_up_is_a_closed_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            let _ = ws.close(None).await;
+        });
+
+        let mut relay = RelayClient::connect(&url).await.unwrap();
+        let err = relay.wait_for_peer().await.unwrap_err();
+        assert!(
+            matches!(err, RelayError::ConnectionClosed | RelayError::WebSocket(_)),
+            "{err}"
+        );
     }
 }
