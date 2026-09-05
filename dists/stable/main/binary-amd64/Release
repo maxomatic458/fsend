@@ -1,0 +1,6 @@
+Archive: stable
+Component: main
+Origin: fsend
+Label: fsend
+Architecture: amd64
+Description: fsend apt repository

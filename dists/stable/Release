@@ -1,0 +1,29 @@
+Origin: fsend
+Label: fsend
+Suite: stable
+Codename: stable
+Date: Sat, 05 Sep 2026 14:43:28 UTC
+Architectures: amd64 arm64
+Components: main
+Description: fsend apt repository
+MD5Sum:
+ 0efd03742196395db67378cf20057767 638 main/binary-amd64/Packages
+ b3370763c5b398f5b37144dc55891464 446 main/binary-amd64/Packages.gz
+ aaaab3af0d2e3ce72ba29ffa9ae0fc26 113 main/binary-amd64/Release
+ 1a28fff89169ff0bc4a2f522b1067e41 638 main/binary-arm64/Packages
+ d778c4cc3b5a13f1e4034b45071b9a2f 447 main/binary-arm64/Packages.gz
+ 4a0bb92f338569bd5937736820f9be73 113 main/binary-arm64/Release
+SHA1:
+ 62b354c324a6163b08bdaf505deb97a8c233ea35 638 main/binary-amd64/Packages
+ 57e02ff717eee61f1084f7fa414b4d7703c88748 446 main/binary-amd64/Packages.gz
+ 290289f6335255423882fc181ac69f29e3336ad6 113 main/binary-amd64/Release
+ 84919a994273f41c45c93e3a37989468885efd27 638 main/binary-arm64/Packages
+ 47869cafdeb828403fe7f33dd7a9ad3b13040c70 447 main/binary-arm64/Packages.gz
+ 177c1b8f9852fba60a648d67cba5520a1c437114 113 main/binary-arm64/Release
+SHA256:
+ 25783623cb51eff0db365d1b12a09dbb99bac93710722a7e5acd598e25f8b526 638 main/binary-amd64/Packages
+ 43de8425402b734a98cc300a2837e48c350354a1fa512382e5200813f5c5218a 446 main/binary-amd64/Packages.gz
+ 206ce6e3d5ce45013e08ce0f43c3159b62b2a9dd8942c1a2575cba005ca409dd 113 main/binary-amd64/Release
+ b5107a711817d5a2846159c163e36d021f9ee05c539123ef5efe8fe0b6cb4a89 638 main/binary-arm64/Packages
+ 4bb313a6fa34510ce72ae0f1fc1ab066776f81ada4f7221ba1d8bed96d17de6b 447 main/binary-arm64/Packages.gz
+ df6d3344c6fbf2f801a3a9b655b2bd84bc60853dcb7eaa6bfe160198b8d97b07 113 main/binary-arm64/Release
