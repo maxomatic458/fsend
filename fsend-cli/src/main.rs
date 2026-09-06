@@ -1,7 +1,7 @@
-use fsend_cli::{cli, iroh, relay, transfer, webrtc};
-
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Mutex;
+use std::time::Duration;
 
 use clap::Parser;
 use colored::Colorize;
@@ -11,10 +11,11 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use self::iroh::IrohTransfer;
-use cli::{Args, Mode};
-use relay::{ConnectionInfo, Protocol, RelayClient};
-use transfer::{FilesAvailable, ReceiveArgs, SendArgs, Transfer, TransferError};
+use fsend_cli::cli::{Args, Mode};
+use fsend_cli::iroh::IrohTransfer;
+use fsend_cli::relay::{ConnectionInfo, Protocol, RelayClient};
+use fsend_cli::transfer::{self, FilesAvailable, ReceiveArgs, SendArgs, TransferError, Transport};
+use fsend_cli::webrtc::WebRtcTransfer;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -73,10 +74,6 @@ fn print_version() {
     let rows = [
         ("fsend-cli", env!("CARGO_PKG_VERSION").to_owned()),
         ("protocol", transfer::PROTO_VERSION.to_owned()),
-        (
-            "alpn",
-            String::from_utf8_lossy(transfer::FSEND_ALPN).into_owned(),
-        ),
     ];
 
     for (label, value) in rows {
@@ -99,10 +96,10 @@ fn download_link(base: &str, code: &str) -> String {
     format!("{}/receive/{}", base.trim_end_matches('/'), code)
 }
 
-async fn create_sender_transfer(
+async fn connect_as_sender(
     protocol: Protocol,
     relay: &mut RelayClient,
-) -> color_eyre::Result<Box<dyn Transfer>> {
+) -> color_eyre::Result<Box<dyn Transport>> {
     match protocol {
         Protocol::Iroh => {
             let endpoint = IrohTransfer::create_endpoint().await?;
@@ -111,11 +108,10 @@ async fn create_sender_transfer(
             relay.send_exchange(my_info).await?;
             let _peer_info = relay.recv_exchange().await?;
 
-            let transfer = IrohTransfer::accept(endpoint).await?;
-            Ok(Box::new(transfer))
+            Ok(Box::new(IrohTransfer::accept(endpoint).await?))
         }
         Protocol::WebRtc => {
-            let (mut wrt, offer_sdp) = webrtc::WebRtcTransfer::create_offerer().await?;
+            let (mut wrt, offer_sdp) = WebRtcTransfer::create_offerer().await?;
             let my_info = ConnectionInfo::WebRtc {
                 sdp: offer_sdp,
                 ice_candidates: vec![],
@@ -126,7 +122,7 @@ async fn create_sender_transfer(
 
             let answer_sdp = match &peer_info {
                 ConnectionInfo::WebRtc { sdp, .. } => sdp.clone(),
-                _ => return Err(transfer::TransferError::UnexpectedConnectionInfo.into()),
+                _ => return Err(TransferError::UnexpectedConnectionInfo.into()),
             };
             wrt.set_answer(&answer_sdp).await?;
             wrt.wait_connected().await?;
@@ -135,10 +131,10 @@ async fn create_sender_transfer(
     }
 }
 
-async fn create_receiver_transfer(
+async fn connect_as_receiver(
     protocol: Protocol,
     relay: &mut RelayClient,
-) -> color_eyre::Result<Box<dyn Transfer>> {
+) -> color_eyre::Result<Box<dyn Transport>> {
     match protocol {
         Protocol::Iroh => {
             let endpoint = IrohTransfer::create_endpoint().await?;
@@ -147,17 +143,16 @@ async fn create_receiver_transfer(
             let peer_info = relay.recv_exchange().await?;
             relay.send_exchange(my_info).await?;
 
-            let transfer = IrohTransfer::connect(endpoint, peer_info).await?;
-            Ok(Box::new(transfer))
+            Ok(Box::new(IrohTransfer::connect(endpoint, peer_info).await?))
         }
         Protocol::WebRtc => {
             let peer_info = relay.recv_exchange().await?;
             let offer_sdp = match &peer_info {
                 ConnectionInfo::WebRtc { sdp, .. } => sdp.clone(),
-                _ => return Err(transfer::TransferError::UnexpectedConnectionInfo.into()),
+                _ => return Err(TransferError::UnexpectedConnectionInfo.into()),
             };
 
-            let (mut wrt, answer_sdp) = webrtc::WebRtcTransfer::create_answerer(&offer_sdp).await?;
+            let (mut wrt, answer_sdp) = WebRtcTransfer::create_answerer(&offer_sdp).await?;
             let my_info = ConnectionInfo::WebRtc {
                 sdp: answer_sdp,
                 ice_candidates: vec![],
@@ -196,30 +191,18 @@ async fn run_send(
     let protocol = relay.wait_for_peer().await?;
     tracing::info!("peer joined, negotiated protocol: {:?}", protocol);
 
-    let mut transfer = create_sender_transfer(protocol, &mut relay).await?;
+    let mut transport = connect_as_sender(protocol, &mut relay).await?;
+    announce_connection(transport.as_ref()).await;
 
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    let conn_type = transfer.connection_type_name().await;
-    println!("Connection type: {}", colorize_conn_type(&conn_type));
-
-    let progress_bars = std::sync::Mutex::new(None::<CliProgressBars>);
-
-    transfer
-        .send_files(
-            SendArgs { files },
-            &mut |initial| {
-                *progress_bars.lock().unwrap() = Some(CliProgressBars::new(initial));
-            },
-            &mut || {
-                println!("Waiting for peer to accept files...");
-            },
-            &mut |n| {
-                if let Some(pb) = &mut *progress_bars.lock().unwrap() {
-                    pb.update(n);
-                }
-            },
-        )
-        .await?;
+    let progress = Progress::default();
+    transfer::send_files(
+        transport.as_mut(),
+        SendArgs { files },
+        &mut |initial| progress.start(initial),
+        &mut || println!("Waiting for peer to accept files..."),
+        &mut |n| progress.update(n),
+    )
+    .await?;
 
     println!("\nTransfer complete.");
     Ok(())
@@ -240,40 +223,51 @@ async fn run_receive(
         .await?;
     tracing::info!("joined session, negotiated protocol: {:?}", protocol);
 
-    let mut transfer = create_receiver_transfer(protocol, &mut relay).await?;
+    let mut transport = connect_as_receiver(protocol, &mut relay).await?;
+    announce_connection(transport.as_ref()).await;
 
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    let conn_type = transfer.connection_type_name().await;
-    println!("Connection type: {}", colorize_conn_type(&conn_type));
-
-    let progress_bars = std::sync::Mutex::new(None::<CliProgressBars>);
-
-    transfer
-        .receive_files(
-            ReceiveArgs { resume },
-            &mut |initial| {
-                *progress_bars.lock().unwrap() = Some(CliProgressBars::new(initial));
-            },
-            &mut |files_offered| {
-                if auto_accept {
-                    println!("Auto-accepting files.");
-                    Some(output_dir.clone())
-                } else if accept_files(files_offered) {
-                    Some(output_dir.clone())
-                } else {
-                    None
-                }
-            },
-            &mut |n| {
-                if let Some(pb) = &mut *progress_bars.lock().unwrap() {
-                    pb.update(n);
-                }
-            },
-        )
-        .await?;
+    let progress = Progress::default();
+    transfer::receive_files(
+        transport.as_mut(),
+        ReceiveArgs { resume },
+        &mut |initial| progress.start(initial),
+        &mut |files_offered| {
+            if auto_accept {
+                println!("Auto-accepting files.");
+                Some(output_dir.clone())
+            } else if accept_files(files_offered) {
+                Some(output_dir.clone())
+            } else {
+                None
+            }
+        },
+        &mut |n| progress.update(n),
+    )
+    .await?;
 
     println!("\nTransfer complete.");
     Ok(())
+}
+
+async fn announce_connection(transport: &dyn Transport) {
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let conn_type = transport.connection_type_name();
+    println!("Connection type: {}", colorize_conn_type(&conn_type));
+}
+
+#[derive(Default)]
+struct Progress(Mutex<Option<CliProgressBars>>);
+
+impl Progress {
+    fn start(&self, initial: &[(String, u64, u64)]) {
+        *self.0.lock().unwrap() = Some(CliProgressBars::new(initial));
+    }
+
+    fn update(&self, bytes: u64) {
+        if let Some(bars) = &mut *self.0.lock().unwrap() {
+            bars.update(bytes);
+        }
+    }
 }
 
 fn accept_files(files: &[FilesAvailable]) -> bool {
@@ -397,7 +391,7 @@ fn colorize_conn_type(conn_type: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cli::DEFAULT_DOWNLOAD_URL;
+    use fsend_cli::cli::DEFAULT_DOWNLOAD_URL;
 
     #[test]
     fn accepts_codes_and_share_links() {

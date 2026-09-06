@@ -1359,7 +1359,7 @@ dependencies = [
 
 [[package]]
 name = "fsend-cli"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-compression",
  "async-trait",
@@ -1373,13 +1373,14 @@ dependencies = [
  "futures-util",
  "indicatif",
  "iroh",
- "rkyv",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-stream",
  "tokio-tungstenite",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "webrtc",

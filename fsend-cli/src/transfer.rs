@@ -1,26 +1,28 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use async_compression::tokio::write::GzipEncoder;
 use async_trait::async_trait;
+use bytes::Bytes;
 use colored::Colorize;
-use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
+use futures_util::{SinkExt, StreamExt};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
+use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
-pub const BUF_SIZE: usize = 8192;
-pub const PROTO_VERSION: &str = "0.1.0";
-pub const FSEND_ALPN: &[u8] = b"fsend/0.2.0";
+/// Read/write chunk on the data stream.
+pub const BUF_SIZE: usize = 64 * 1024;
+pub const PROTO_VERSION: &str = "3";
+pub const FSEND_ALPN: &[u8] = b"fsend";
+pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+/// How long a incompatible peer gets to read our last packet.
+const GOODBYE_TIMEOUT: Duration = Duration::from_secs(5);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(
-    Debug, PartialEq, Clone, Hash, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize,
-)]
+#[derive(Debug, PartialEq, Clone, Hash, Serialize, Deserialize)]
 #[serde(tag = "type")]
-#[rkyv(
-    serialize_bounds(__S: rkyv::ser::Writer + rkyv::ser::Allocator, __S::Error: rkyv::rancor::Source),
-    deserialize_bounds(__D::Error: rkyv::rancor::Source),
-    bytecheck(bounds(__C: rkyv::validation::ArchiveContext, __C::Error: rkyv::rancor::Source)),
-)]
 pub enum FileSendRecvTree {
     File {
         name: String,
@@ -29,7 +31,6 @@ pub enum FileSendRecvTree {
     },
     Dir {
         name: String,
-        #[rkyv(omit_bounds)]
         files: Vec<FileSendRecvTree>,
     },
 }
@@ -56,15 +57,8 @@ impl FileSendRecvTree {
     }
 }
 
-#[derive(
-    Debug, PartialEq, Clone, Hash, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize,
-)]
+#[derive(Debug, PartialEq, Clone, Hash, Serialize, Deserialize)]
 #[serde(tag = "type")]
-#[rkyv(
-    serialize_bounds(__S: rkyv::ser::Writer + rkyv::ser::Allocator, __S::Error: rkyv::rancor::Source),
-    deserialize_bounds(__D::Error: rkyv::rancor::Source),
-    bytecheck(bounds(__C: rkyv::validation::ArchiveContext, __C::Error: rkyv::rancor::Source)),
-)]
 pub enum FilesAvailable {
     File {
         name: String,
@@ -72,7 +66,6 @@ pub enum FilesAvailable {
     },
     Dir {
         name: String,
-        #[rkyv(omit_bounds)]
         files: Vec<FilesAvailable>,
     },
 }
@@ -177,10 +170,10 @@ impl FilesAvailable {
                 }
                 let mut skippable = Vec::new();
                 for file in files {
-                    if let Some(lm) = lf.iter().find(|l| l.name() == file.name()) {
-                        if let Some(s) = file.get_skippable(lm) {
-                            skippable.push(s);
-                        }
+                    if let Some(lm) = lf.iter().find(|l| l.name() == file.name())
+                        && let Some(s) = file.get_skippable(lm)
+                    {
+                        skippable.push(s);
                     }
                 }
                 if skippable.is_empty() {
@@ -332,8 +325,6 @@ pub fn skip_list(
 
 /// Opens a file for receiving.
 pub async fn open_for_receive(path: &Path, skip: u64) -> std::io::Result<tokio::fs::File> {
-    use tokio::io::AsyncSeekExt;
-
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -351,15 +342,8 @@ pub async fn finish_received_file(file: &mut tokio::fs::File, size: u64) -> std:
     file.shutdown().await
 }
 
-#[derive(
-    Debug, PartialEq, Clone, Hash, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize,
-)]
+#[derive(Debug, PartialEq, Clone, Hash, Serialize, Deserialize)]
 #[serde(tag = "type")]
-#[rkyv(
-    serialize_bounds(__S: rkyv::ser::Writer + rkyv::ser::Allocator, __S::Error: rkyv::rancor::Source),
-    deserialize_bounds(__D::Error: rkyv::rancor::Source),
-    bytecheck(bounds(__C: rkyv::validation::ArchiveContext, __C::Error: rkyv::rancor::Source)),
-)]
 pub enum FilesToSkip {
     File {
         name: String,
@@ -367,7 +351,6 @@ pub enum FilesToSkip {
     },
     Dir {
         name: String,
-        #[rkyv(omit_bounds)]
         files: Vec<FilesToSkip>,
     },
 }
@@ -387,18 +370,14 @@ impl FilesToSkip {
     }
 }
 
-#[derive(
-    Debug, Clone, PartialEq, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum SenderToReceiver {
     ConnRequest { version: String },
     FileInfo { files: Vec<FilesAvailable> },
 }
 
-#[derive(
-    Debug, Clone, PartialEq, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ReceiverToSender {
     WrongVersion { expected: String },
@@ -406,30 +385,6 @@ pub enum ReceiverToSender {
     RejectFiles,
     AcceptFilesSkip { files: Vec<Option<FilesToSkip>> },
 }
-
-/// Binary encoding of the control packets on the iroh transport (rkyv).
-pub trait WirePacket: Sized + std::fmt::Debug {
-    fn to_wire(&self) -> Result<Vec<u8>, rkyv::rancor::Error>;
-    fn from_wire(bytes: &[u8]) -> Result<Self, rkyv::rancor::Error>;
-}
-
-macro_rules! impl_wire_packet {
-    ($($t:ty),* $(,)?) => {$(
-        impl WirePacket for $t {
-            fn to_wire(&self) -> Result<Vec<u8>, rkyv::rancor::Error> {
-                rkyv::to_bytes::<rkyv::rancor::Error>(self).map(|b| b.to_vec())
-            }
-
-            fn from_wire(bytes: &[u8]) -> Result<Self, rkyv::rancor::Error> {
-                let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
-                aligned.extend_from_slice(bytes);
-                rkyv::from_bytes::<Self, rkyv::rancor::Error>(&aligned)
-            }
-        }
-    )*};
-}
-
-impl_wire_packet!(SenderToReceiver, ReceiverToSender);
 
 pub async fn compress_gzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut out = Vec::new();
@@ -450,11 +405,9 @@ pub async fn decompress_gzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
 #[derive(Debug, Error)]
 pub enum TransferError {
     #[error("io: {0}")]
-    Io(#[from] std::io::Error),
+    Io(std::io::Error),
     #[error("connection: {0}")]
     Connection(#[from] iroh::endpoint::ConnectionError),
-    #[error("packet: {0}")]
-    Packet(#[from] PacketError),
     #[error("wrong version: expected {0}, got {1}")]
     WrongVersion(String, String),
     #[error("transfer declined")]
@@ -479,6 +432,8 @@ pub enum TransferError {
     NodeId(#[from] iroh::KeyParsingError),
     #[error("the peer did not connect in time")]
     PeerTimeout,
+    #[error("the peer did not complete the handshake in time")]
+    HandshakeTimeout,
     #[error("the endpoint closed while waiting for the peer")]
     EndpointClosed,
     #[error("the relay handed over connection info for another transport")]
@@ -529,13 +484,16 @@ impl TransferError {
                     list
                 ))
             }
+            Self::HandshakeTimeout => Some(format!(
+                "{} the peer did not answer the handshake. It may run an incompatible version of fsend; update both sides.",
+                "error:".red()
+            )),
             Self::PeerTimeout => Some(format!(
                 "{} the peer did not connect in time. Check that both sides are online and try again.",
                 "error:".red()
             )),
             Self::Io(_)
             | Self::Connection(_)
-            | Self::Packet(_)
             | Self::UnexpectedPacket
             | Self::FileNotFound(_)
             | Self::Bind(_)
@@ -552,22 +510,16 @@ impl TransferError {
     }
 }
 
-#[derive(Debug, Error)]
-pub enum PacketError {
-    #[error("io: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("encode: {0}")]
-    Encode(rkyv::rancor::Error),
-    #[error("decode: {0}")]
-    Decode(rkyv::rancor::Error),
-    #[error("connection: {0}")]
-    Connection(#[from] iroh::endpoint::ConnectionError),
-    #[error("read: {0}")]
-    Read(#[from] iroh::endpoint::ReadToEndError),
-    #[error("write: {0}")]
-    Write(#[from] iroh::endpoint::WriteError),
-    #[error("stream closed before the packet was delivered")]
-    Stopped,
+/// A stream that reports the peer as gone is a lost connection, not an I/O
+/// fault; the transports mark those with `ConnectionAborted`/`NotConnected`.
+impl From<std::io::Error> for TransferError {
+    fn from(e: std::io::Error) -> Self {
+        use std::io::ErrorKind::*;
+        match e.kind() {
+            ConnectionAborted | ConnectionReset | NotConnected => Self::Disconnected(e.to_string()),
+            _ => Self::Io(e),
+        }
+    }
 }
 
 pub struct SendArgs {
@@ -583,27 +535,309 @@ pub type WaitingCb<'a> = &'a mut (dyn FnMut() + Send);
 pub type DataCb<'a> = &'a mut (dyn FnMut(u64) + Send);
 pub type AcceptFilesCb<'a> = &'a mut (dyn FnMut(&[FilesAvailable]) -> Option<PathBuf> + Send);
 
+/// A bidirectional bytestream.
+pub trait ByteStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + ?Sized> ByteStream for T {}
+
 #[async_trait]
-pub trait Transfer: Send {
-    async fn connection_type_name(&self) -> String;
+pub trait Transport: Send {
+    fn connection_type_name(&self) -> String;
+    /// The control stream. Packets are length-prefixed frames of gzipped JSON.
+    async fn control(&mut self) -> Result<Box<dyn ByteStream>, TransferError>;
+    /// The data stream, opened once the offer has been accepted.
+    async fn data(&mut self) -> Result<Box<dyn ByteStream>, TransferError>;
+    /// Resolves once the peer has hung up. `Ok` if it did so on purpose.
+    async fn closed(&mut self) -> Result<(), TransferError>;
+    async fn close(&mut self, ok: bool);
+}
 
-    async fn send_files(
-        &mut self,
-        args: SendArgs,
-        initial_progress_cb: ProgressCb<'_>,
-        waiting_cb: WaitingCb<'_>,
-        write_cb: DataCb<'_>,
-    ) -> Result<(), TransferError>;
+pub(crate) type Control = Framed<Box<dyn ByteStream>, LengthDelimitedCodec>;
 
-    async fn receive_files(
-        &mut self,
-        args: ReceiveArgs,
-        initial_progress_cb: ProgressCb<'_>,
-        accept_files_cb: AcceptFilesCb<'_>,
-        read_cb: DataCb<'_>,
-    ) -> Result<(), TransferError>;
+pub(crate) fn frame(stream: Box<dyn ByteStream>) -> Control {
+    Framed::new(
+        stream,
+        LengthDelimitedCodec::builder()
+            .max_frame_length(MAX_FRAME_BYTES)
+            .new_codec(),
+    )
+}
 
-    async fn close(&mut self);
+pub(crate) async fn send_packet<P: Serialize + std::fmt::Debug>(
+    control: &mut Control,
+    packet: &P,
+) -> Result<(), TransferError> {
+    tracing::debug!("sending packet: {packet:?}");
+    let json = serde_json::to_vec(packet)?;
+    let compressed = compress_gzip(&json).await?;
+    control.send(Bytes::from(compressed)).await?;
+    Ok(())
+}
+
+pub(crate) async fn recv_packet<P: DeserializeOwned + std::fmt::Debug>(
+    control: &mut Control,
+) -> Result<P, TransferError> {
+    let frame = control
+        .next()
+        .await
+        .ok_or_else(|| TransferError::Disconnected("the control stream ended".into()))??;
+    let json = decompress_gzip(&frame).await?;
+    let packet: P = serde_json::from_slice(&json)?;
+    tracing::debug!("received packet: {packet:?}");
+    Ok(packet)
+}
+
+/// Copies `skip..size` of `file` into `stream`.
+async fn send_file_data<S, R>(
+    stream: &mut S,
+    file: &mut R,
+    skip: u64,
+    size: u64,
+    write_cb: &mut (dyn FnMut(u64) + Send),
+) -> std::io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+    R: AsyncRead + AsyncSeek + Unpin,
+{
+    file.seek(std::io::SeekFrom::Start(skip)).await?;
+    let mut buf = vec![0u8; BUF_SIZE];
+    let mut read = skip;
+    while read < size {
+        let to_read = std::cmp::min(BUF_SIZE as u64, size - read) as usize;
+        let n = file.read(&mut buf[..to_read]).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "unexpected eof",
+            ));
+        }
+        stream.write_all(&buf[..n]).await?;
+        read += n as u64;
+        write_cb(n as u64);
+    }
+    Ok(())
+}
+
+/// Reads `skip..size` from `stream` into `file`.
+async fn receive_file_data<S, W>(
+    stream: &mut S,
+    file: &mut W,
+    skip: u64,
+    size: u64,
+    read_cb: &mut (dyn FnMut(u64) + Send),
+) -> std::io::Result<()>
+where
+    S: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; BUF_SIZE];
+    let mut written = skip;
+    while written < size {
+        let to_read = std::cmp::min(BUF_SIZE as u64, size - written) as usize;
+        let n = stream.read(&mut buf[..to_read]).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "the stream ended before the file was complete",
+            ));
+        }
+        file.write_all(&buf[..n]).await?;
+        written += n as u64;
+        read_cb(n as u64);
+    }
+    Ok(())
+}
+
+/// Gives the peer a moment to read our last packet before we close on it.
+async fn goodbye(transport: &mut dyn Transport) {
+    let _ = tokio::time::timeout(GOODBYE_TIMEOUT, transport.closed()).await;
+}
+
+pub async fn send_files(
+    transport: &mut dyn Transport,
+    args: SendArgs,
+    initial_progress_cb: ProgressCb<'_>,
+    waiting_cb: WaitingCb<'_>,
+    write_cb: DataCb<'_>,
+) -> Result<(), TransferError> {
+    let result = run_send(transport, args, initial_progress_cb, waiting_cb, write_cb).await;
+    transport.close(result.is_ok()).await;
+    result
+}
+
+async fn run_send(
+    transport: &mut dyn Transport,
+    args: SendArgs,
+    initial_progress_cb: ProgressCb<'_>,
+    waiting_cb: WaitingCb<'_>,
+    write_cb: DataCb<'_>,
+) -> Result<(), TransferError> {
+    let mut control = frame(transport.control().await?);
+
+    send_packet(
+        &mut control,
+        &SenderToReceiver::ConnRequest {
+            version: PROTO_VERSION.to_string(),
+        },
+    )
+    .await?;
+
+    let reply = tokio::time::timeout(HANDSHAKE_TIMEOUT, recv_packet(&mut control))
+        .await
+        .map_err(|_| TransferError::HandshakeTimeout)??;
+    match reply {
+        ReceiverToSender::Ok => {}
+        ReceiverToSender::WrongVersion { expected } => {
+            return Err(TransferError::WrongVersion(expected, PROTO_VERSION.into()));
+        }
+        _ => return Err(TransferError::UnexpectedPacket),
+    }
+
+    let mut files_available = Vec::new();
+    for path in &args.files {
+        if !path.exists() {
+            return Err(TransferError::FileNotFound(path.clone()));
+        }
+        files_available.push(get_files_available(path)?);
+    }
+
+    send_packet(
+        &mut control,
+        &SenderToReceiver::FileInfo {
+            files: files_available.clone(),
+        },
+    )
+    .await?;
+
+    waiting_cb();
+
+    let to_skip = match recv_packet::<ReceiverToSender>(&mut control).await? {
+        ReceiverToSender::AcceptFilesSkip { files } => files,
+        ReceiverToSender::RejectFiles => return Err(TransferError::PeerDeclined),
+        _ => return Err(TransferError::UnexpectedPacket),
+    };
+    if to_skip.len() != files_available.len() {
+        return Err(TransferError::UnexpectedPacket);
+    }
+
+    let plan = plan_transfer(&files_available, &to_skip);
+    initial_progress_cb(&plan.progress);
+
+    let mut data = transport.data().await?;
+    for (path, tree) in args.files.iter().zip(plan.to_transfer) {
+        let Some(tree) = tree else { continue };
+        for entry in flatten_trees(std::slice::from_ref(&tree), path) {
+            if let TransferEntry::File { path, skip, size } = entry {
+                let mut file = tokio::fs::File::open(&path).await?;
+                send_file_data(&mut data, &mut file, skip, size, write_cb).await?;
+            }
+        }
+    }
+    data.shutdown().await?;
+
+    // The receiver hangs up once everything is on disk.
+    transport.closed().await
+}
+
+pub async fn receive_files(
+    transport: &mut dyn Transport,
+    args: ReceiveArgs,
+    initial_progress_cb: ProgressCb<'_>,
+    accept_files_cb: AcceptFilesCb<'_>,
+    read_cb: DataCb<'_>,
+) -> Result<(), TransferError> {
+    let result = run_receive(
+        transport,
+        args,
+        initial_progress_cb,
+        accept_files_cb,
+        read_cb,
+    )
+    .await;
+    transport.close(result.is_ok()).await;
+    result
+}
+
+async fn run_receive(
+    transport: &mut dyn Transport,
+    args: ReceiveArgs,
+    initial_progress_cb: ProgressCb<'_>,
+    accept_files_cb: AcceptFilesCb<'_>,
+    read_cb: DataCb<'_>,
+) -> Result<(), TransferError> {
+    let handshake = async {
+        let mut control = frame(transport.control().await?);
+        let request: SenderToReceiver = recv_packet(&mut control).await?;
+        Ok::<_, TransferError>((control, request))
+    };
+    let (mut control, request) = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
+        .await
+        .map_err(|_| TransferError::HandshakeTimeout)??;
+
+    match request {
+        SenderToReceiver::ConnRequest { version } => {
+            if version != PROTO_VERSION {
+                send_packet(
+                    &mut control,
+                    &ReceiverToSender::WrongVersion {
+                        expected: PROTO_VERSION.into(),
+                    },
+                )
+                .await?;
+                goodbye(transport).await;
+                return Err(TransferError::WrongVersion(PROTO_VERSION.into(), version));
+            }
+            send_packet(&mut control, &ReceiverToSender::Ok).await?;
+        }
+        _ => return Err(TransferError::UnexpectedPacket),
+    }
+
+    let files_offered = match recv_packet::<SenderToReceiver>(&mut control).await? {
+        SenderToReceiver::FileInfo { files } => files,
+        _ => return Err(TransferError::UnexpectedPacket),
+    };
+
+    let output_path = match accept_files_cb(&files_offered) {
+        Some(p) => p,
+        None => {
+            send_packet(&mut control, &ReceiverToSender::RejectFiles).await?;
+            goodbye(transport).await;
+            return Err(TransferError::Declined);
+        }
+    };
+
+    let files_to_skip = skip_list(&files_offered, &output_path, args.resume);
+    let plan = plan_transfer(&files_offered, &files_to_skip);
+    initial_progress_cb(&plan.progress);
+
+    send_packet(
+        &mut control,
+        &ReceiverToSender::AcceptFilesSkip {
+            files: files_to_skip,
+        },
+    )
+    .await?;
+
+    let mut data = transport.data().await?;
+    tokio::fs::create_dir_all(&output_path).await?;
+    for tree in plan.to_transfer.into_iter().flatten() {
+        let entries = flatten_trees(std::slice::from_ref(&tree), &output_path.join(tree.name()));
+        for entry in entries {
+            match entry {
+                TransferEntry::Dir { path } => tokio::fs::create_dir_all(path).await?,
+                TransferEntry::File { path, skip, size } => {
+                    let mut file = open_for_receive(&path, skip).await?;
+                    let received =
+                        receive_file_data(&mut data, &mut file, skip, size, read_cb).await;
+                    // Even a partial file must be on disk before the next session resumes it.
+                    file.flush().await?;
+                    received?;
+                    finish_received_file(&mut file, size).await?;
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

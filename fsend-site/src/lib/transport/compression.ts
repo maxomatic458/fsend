@@ -1,4 +1,4 @@
-import { MAX_DC_PAYLOAD, FRAG_MORE, FRAG_LAST } from "../../config";
+import { MAX_MESSAGE_BYTES, FRAME_HEADER_BYTES } from "../../config";
 
 export async function compressGzip(data: Uint8Array): Promise<Uint8Array> {
   const cs = new CompressionStream("gzip");
@@ -32,38 +32,44 @@ export async function decompressGzip(data: Uint8Array): Promise<Uint8Array> {
   return concat(chunks);
 }
 
-export function fragment(data: Uint8Array): Uint8Array[] {
-  const fragments: Uint8Array[] = [];
-  let offset = 0;
-  while (offset < data.length) {
-    const end = Math.min(offset + MAX_DC_PAYLOAD, data.length);
-    const isLast = end >= data.length;
-    const frag = new Uint8Array(1 + (end - offset));
-    frag[0] = isLast ? FRAG_LAST : FRAG_MORE;
-    frag.set(data.subarray(offset, end), 1);
-    fragments.push(frag);
-    offset = end;
-  }
-  if (fragments.length === 0) {
-    fragments.push(new Uint8Array([FRAG_LAST]));
-  }
-  return fragments;
+/// One control frame: a big-endian u32 length, then the payload.
+export function frame(payload: Uint8Array): Uint8Array {
+  const out = new Uint8Array(FRAME_HEADER_BYTES + payload.length);
+  new DataView(out.buffer).setUint32(0, payload.length);
+  out.set(payload, FRAME_HEADER_BYTES);
+  return out;
 }
 
-export class Defragmenter {
-  private chunks: Uint8Array[] = [];
+/// Slices a byte stream into data channel messages.
+export function messages(bytes: Uint8Array): Uint8Array[] {
+  const out: Uint8Array[] = [];
+  for (let offset = 0; offset < bytes.length; offset += MAX_MESSAGE_BYTES) {
+    out.push(bytes.subarray(offset, offset + MAX_MESSAGE_BYTES));
+  }
+  return out;
+}
 
-  push(chunk: Uint8Array): Uint8Array | null {
-    if (chunk.length === 0) return null;
-    const header = chunk[0];
-    const payload = chunk.subarray(1);
-    this.chunks.push(payload);
-    if (header === FRAG_LAST) {
-      const result = concat(this.chunks);
-      this.chunks = [];
-      return result;
+/// Reassembles frames from the messages of the control channel. A message
+/// may end mid-frame or carry the start of the next one.
+export class FrameDecoder {
+  private buffered: Uint8Array = new Uint8Array(0);
+
+  push(chunk: Uint8Array): Uint8Array[] {
+    this.buffered = concat([this.buffered, chunk]);
+    const frames: Uint8Array[] = [];
+    while (this.buffered.length >= FRAME_HEADER_BYTES) {
+      const view = new DataView(
+        this.buffered.buffer,
+        this.buffered.byteOffset,
+        this.buffered.byteLength,
+      );
+      const length = view.getUint32(0);
+      const end = FRAME_HEADER_BYTES + length;
+      if (this.buffered.length < end) break;
+      frames.push(this.buffered.slice(FRAME_HEADER_BYTES, end));
+      this.buffered = this.buffered.slice(end);
     }
-    return null;
+    return frames;
   }
 }
 

@@ -3,6 +3,7 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::time::Duration;
 
 use super::*;
 
@@ -75,8 +76,8 @@ pub fn no_offer(_: &[FilesAvailable]) -> Option<PathBuf> {
 pub type AbortFn = Box<dyn Fn() + Send + Sync>;
 
 pub struct Peers {
-    pub sender: Box<dyn Transfer>,
-    pub receiver: Box<dyn Transfer>,
+    pub sender: Box<dyn Transport>,
+    pub receiver: Box<dyn Transport>,
     pub abort_sender: AbortFn,
     pub abort_receiver: AbortFn,
 }
@@ -139,11 +140,12 @@ pub async fn run(peers: Peers, files: Vec<PathBuf>, out: &Path, opts: RunOptions
     let mut on_waiting = || waited = true;
     let mut on_write = |n: u64| {
         sent += n;
-        if let Some(limit) = opts.abort_sender_after {
-            if sent >= limit && !sender_aborted {
-                sender_aborted = true;
-                abort_sender();
-            }
+        if let Some(limit) = opts.abort_sender_after
+            && sent >= limit
+            && !sender_aborted
+        {
+            sender_aborted = true;
+            abort_sender();
         }
     };
     let mut on_receiver_initial = |p: &[(String, u64, u64)]| receiver_initial = Some(p.to_vec());
@@ -153,21 +155,24 @@ pub async fn run(peers: Peers, files: Vec<PathBuf>, out: &Path, opts: RunOptions
     };
     let mut on_read = |n: u64| {
         received += n;
-        if let Some(limit) = opts.abort_receiver_after {
-            if received >= limit && !receiver_aborted {
-                receiver_aborted = true;
-                abort_receiver();
-            }
+        if let Some(limit) = opts.abort_receiver_after
+            && received >= limit
+            && !receiver_aborted
+        {
+            receiver_aborted = true;
+            abort_receiver();
         }
     };
 
-    let send = sender.send_files(
+    let send = send_files(
+        sender.as_mut(),
         SendArgs { files },
         &mut on_sender_initial,
         &mut on_waiting,
         &mut on_write,
     );
-    let recv = receiver.receive_files(
+    let recv = receive_files(
+        receiver.as_mut(),
         ReceiveArgs {
             resume: opts.resume,
         },
@@ -603,14 +608,17 @@ pub mod suite {
             o.recv.is_err(),
             "the receiver must notice the sender is gone"
         );
-        let partial = std::fs::metadata(f.out.join("movie.bin")).unwrap().len();
+        // A sender that dies early enough leaves nothing behind at all.
+        let partial = std::fs::metadata(f.out.join("movie.bin"))
+            .map(|m| m.len())
+            .unwrap_or(0);
         assert!(
             partial < data.len() as u64,
             "partial file of {partial} bytes"
         );
         assert_eq!(partial, o.received);
         assert_eq!(
-            std::fs::read(f.out.join("movie.bin")).unwrap(),
+            std::fs::read(f.out.join("movie.bin")).unwrap_or_default(),
             &data[..partial as usize]
         );
 
@@ -652,5 +660,260 @@ pub mod suite {
         );
         assert!(o.recv.is_err(), "the receiver must not wait forever");
         assert!(o.offered.is_none());
+    }
+
+    pub async fn receiver_rejects_another_protocol_version(pair: PairFn) {
+        let Peers {
+            mut sender,
+            mut receiver,
+            ..
+        } = pair().await;
+
+        let peer = async {
+            let mut control = frame(sender.control().await.unwrap());
+            send_packet(
+                &mut control,
+                &SenderToReceiver::ConnRequest {
+                    version: "9.9.9".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let reply: ReceiverToSender = recv_packet(&mut control).await.unwrap();
+            drop(control);
+            sender.close(false).await;
+            reply
+        };
+        let (mut progress, mut offer, mut data) = (no_progress, no_offer, no_data);
+        let receive = receive_files(
+            receiver.as_mut(),
+            ReceiveArgs { resume: false },
+            &mut progress,
+            &mut offer,
+            &mut data,
+        );
+
+        let (reply, result) = tokio::join!(peer, receive);
+        assert_eq!(
+            reply,
+            ReceiverToSender::WrongVersion {
+                expected: PROTO_VERSION.into()
+            }
+        );
+        assert!(
+            matches!(&result, Err(TransferError::WrongVersion(expected, got)) if expected == PROTO_VERSION && got == "9.9.9"),
+            "{result:?}"
+        );
+    }
+
+    pub async fn sender_stops_when_the_receiver_wants_another_version(pair: PairFn) {
+        let Peers {
+            mut sender,
+            mut receiver,
+            ..
+        } = pair().await;
+
+        let peer = async {
+            let mut control = frame(receiver.control().await.unwrap());
+            let request: SenderToReceiver = recv_packet(&mut control).await.unwrap();
+            assert_eq!(
+                request,
+                SenderToReceiver::ConnRequest {
+                    version: PROTO_VERSION.into()
+                }
+            );
+            send_packet(
+                &mut control,
+                &ReceiverToSender::WrongVersion {
+                    expected: "9.9.9".into(),
+                },
+            )
+            .await
+            .unwrap();
+            // Give the packet time to arrive before hanging up.
+            let _ = tokio::time::timeout(Duration::from_secs(5), receiver.closed()).await;
+            drop(control);
+            receiver.close(false).await;
+        };
+        let (mut progress, mut waiting, mut data) = (no_progress, no_wait, no_data);
+        let send = send_files(
+            sender.as_mut(),
+            SendArgs {
+                files: vec!["unused".into()],
+            },
+            &mut progress,
+            &mut waiting,
+            &mut data,
+        );
+
+        let ((), result) = tokio::join!(peer, send);
+        assert!(
+            matches!(&result, Err(TransferError::WrongVersion(expected, got)) if expected == "9.9.9" && got == PROTO_VERSION),
+            "{result:?}"
+        );
+    }
+
+    pub async fn unexpected_packets_are_errors(pair: PairFn) {
+        // A sender that skips the handshake.
+        let Peers {
+            mut sender,
+            mut receiver,
+            ..
+        } = pair().await;
+        let peer = async {
+            let mut control = frame(sender.control().await.unwrap());
+            send_packet(&mut control, &SenderToReceiver::FileInfo { files: vec![] })
+                .await
+                .unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), sender.closed()).await;
+            drop(control);
+            sender.close(false).await;
+        };
+        let (mut progress, mut offer, mut data) = (no_progress, decline, no_data);
+        let receive = receive_files(
+            receiver.as_mut(),
+            ReceiveArgs { resume: false },
+            &mut progress,
+            &mut offer,
+            &mut data,
+        );
+        let ((), result) = tokio::join!(peer, receive);
+        assert!(
+            matches!(result, Err(TransferError::UnexpectedPacket)),
+            "{result:?}"
+        );
+
+        // A receiver that answers the handshake with a decline.
+        let Peers {
+            mut sender,
+            mut receiver,
+            ..
+        } = pair().await;
+        let peer = async {
+            let mut control = frame(receiver.control().await.unwrap());
+            let _: SenderToReceiver = recv_packet(&mut control).await.unwrap();
+            send_packet(&mut control, &ReceiverToSender::RejectFiles)
+                .await
+                .unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), receiver.closed()).await;
+            drop(control);
+            receiver.close(false).await;
+        };
+        let (mut progress, mut waiting, mut data) = (no_progress, no_wait, no_data);
+        let send = send_files(
+            sender.as_mut(),
+            SendArgs { files: vec![] },
+            &mut progress,
+            &mut waiting,
+            &mut data,
+        );
+        let ((), result) = tokio::join!(peer, send);
+        assert!(
+            matches!(result, Err(TransferError::UnexpectedPacket)),
+            "{result:?}"
+        );
+    }
+
+    pub async fn a_skip_list_of_the_wrong_length_is_rejected(pair: PairFn) {
+        let f = fixture();
+        write(&f.src.join("a.txt"), b"hello");
+
+        let Peers {
+            mut sender,
+            mut receiver,
+            ..
+        } = pair().await;
+        let peer = async {
+            let mut control = frame(receiver.control().await.unwrap());
+            let _: SenderToReceiver = recv_packet(&mut control).await.unwrap();
+            send_packet(&mut control, &ReceiverToSender::Ok)
+                .await
+                .unwrap();
+            let _: SenderToReceiver = recv_packet(&mut control).await.unwrap();
+            send_packet(
+                &mut control,
+                &ReceiverToSender::AcceptFilesSkip {
+                    files: vec![None, None],
+                },
+            )
+            .await
+            .unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), receiver.closed()).await;
+            drop(control);
+            receiver.close(false).await;
+        };
+        let (mut progress, mut waiting, mut data) = (no_progress, no_wait, no_data);
+        let send = send_files(
+            sender.as_mut(),
+            SendArgs {
+                files: vec![f.src.join("a.txt")],
+            },
+            &mut progress,
+            &mut waiting,
+            &mut data,
+        );
+        let ((), result) = tokio::join!(peer, send);
+        assert!(
+            matches!(result, Err(TransferError::UnexpectedPacket)),
+            "{result:?}"
+        );
+    }
+
+    pub async fn packets_survive_the_wire(pair: PairFn) {
+        let Peers {
+            mut sender,
+            mut receiver,
+            ..
+        } = pair().await;
+        let big = SenderToReceiver::FileInfo {
+            files: (0..5000)
+                .map(|i| FilesAvailable::File {
+                    name: format!("file-{i}.bin"),
+                    size: i,
+                })
+                .collect(),
+        };
+
+        // The receiver's stream only exists once the sender has written.
+        let mut a = frame(sender.control().await.unwrap());
+        let (sent, (mut b, received)) = tokio::join!(send_packet(&mut a, &big), async {
+            let mut b = frame(receiver.control().await.unwrap());
+            let received = recv_packet::<SenderToReceiver>(&mut b).await;
+            (b, received)
+        });
+        sent.unwrap();
+        assert_eq!(received.unwrap(), big);
+
+        // The other direction on the same stream.
+        send_packet(&mut b, &ReceiverToSender::Ok).await.unwrap();
+        let got: ReceiverToSender = recv_packet(&mut a).await.unwrap();
+        assert_eq!(got, ReceiverToSender::Ok);
+
+        // The wrong packet type does not decode.
+        send_packet(&mut b, &ReceiverToSender::RejectFiles)
+            .await
+            .unwrap();
+        let got = recv_packet::<SenderToReceiver>(&mut a).await;
+        assert!(matches!(got, Err(TransferError::Json(_))), "{got:?}");
+
+        drop((a, b));
+        sender.close(true).await;
+        receiver.close(true).await;
+    }
+
+    pub async fn a_closed_peer_fails_the_control_stream(pair: PairFn) {
+        let Peers {
+            mut sender,
+            mut receiver,
+            ..
+        } = pair().await;
+        sender.close(false).await;
+
+        let result = match receiver.control().await {
+            Err(e) => Err(e),
+            Ok(stream) => recv_packet::<SenderToReceiver>(&mut frame(stream)).await,
+        };
+        assert!(result.is_err(), "{result:?}");
+        receiver.close(false).await;
     }
 }

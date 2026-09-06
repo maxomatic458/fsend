@@ -21,8 +21,7 @@ export function createControlChannel<In, Out>(
   channel.onmessage = async (ev) => {
     const data =
       ev.data instanceof ArrayBuffer ? ev.data : await ev.data.arrayBuffer();
-    const message = await decoder.onMessage(data);
-    if (message) {
+    for (const message of await decoder.onMessage(data)) {
       queued.push(message as In);
       notify?.();
     }

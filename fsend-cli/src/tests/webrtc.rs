@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use super::*;
-use crate::transfer::test_support::{no_data, no_offer, no_progress, suite, Peers};
+use crate::transfer::test_support::{Peers, suite};
 
 fn local_config() -> WebRtcConfig {
     WebRtcConfig {
@@ -33,11 +33,13 @@ async fn connected_pair() -> (WebRtcTransfer, WebRtcTransfer) {
 fn pair() -> Pin<Box<dyn Future<Output = Peers> + Send>> {
     Box::pin(async {
         let (sender, receiver) = connected_pair().await;
+        // Pulling the plug: the peer connection goes away and, since
+        // a local close produces no events, the link is marked as gone.
         let abort = |pc: Arc<dyn PeerConnection>,
                      link_tx: Arc<watch::Sender<LinkState>>|
          -> Box<dyn Fn() + Send + Sync> {
             Box::new(move || {
-                mark_closed(&link_tx, false, "test: plug pulled");
+                mark_closed(&link_tx, "test: plug pulled");
                 let pc = pc.clone();
                 tokio::spawn(async move {
                     let _ = pc.close().await;
@@ -118,59 +120,32 @@ async fn interrupted_by_the_sender_then_resumed() {
 async fn a_missing_file_fails_the_transfer() {
     suite::a_missing_file_fails_the_transfer(pair).await
 }
+#[tokio::test]
+async fn receiver_rejects_another_protocol_version() {
+    suite::receiver_rejects_another_protocol_version(pair).await
+}
+#[tokio::test]
+async fn sender_stops_when_the_receiver_wants_another_version() {
+    suite::sender_stops_when_the_receiver_wants_another_version(pair).await
+}
+#[tokio::test]
+async fn unexpected_packets_are_errors() {
+    suite::unexpected_packets_are_errors(pair).await
+}
+#[tokio::test]
+async fn a_skip_list_of_the_wrong_length_is_rejected() {
+    suite::a_skip_list_of_the_wrong_length_is_rejected(pair).await
+}
+#[tokio::test]
+async fn packets_survive_the_wire() {
+    suite::packets_survive_the_wire(pair).await
+}
+#[tokio::test]
+async fn a_closed_peer_fails_the_control_stream() {
+    suite::a_closed_peer_fails_the_control_stream(pair).await
+}
 
 // WebRTC specifics.
-
-#[test]
-fn fragments_carry_a_header_and_reassemble() {
-    for size in [
-        0,
-        1,
-        MAX_DC_PAYLOAD - 1,
-        MAX_DC_PAYLOAD,
-        MAX_DC_PAYLOAD + 1,
-        3 * MAX_DC_PAYLOAD + 5,
-    ] {
-        let data: Vec<u8> = (0..size).map(|i| i as u8).collect();
-        let frags = fragment(&data);
-
-        let expected = if size == 0 {
-            1
-        } else {
-            size.div_ceil(MAX_DC_PAYLOAD)
-        };
-        assert_eq!(frags.len(), expected, "size {size}");
-        for (i, frag) in frags.iter().enumerate() {
-            assert!(frag.len() <= CHUNK_SIZE);
-            let last = i + 1 == frags.len();
-            assert_eq!(frag[0], if last { FRAG_LAST } else { FRAG_MORE });
-        }
-
-        let mut assembler = Assembler::default();
-        let mut whole = None;
-        for frag in &frags {
-            assert!(whole.is_none(), "message complete before the last fragment");
-            whole = assembler.push(frag).unwrap();
-        }
-        assert_eq!(whole.unwrap(), data, "size {size}");
-    }
-}
-
-#[test]
-fn assembler_rejects_malformed_fragments() {
-    let mut assembler = Assembler::default();
-    assert!(matches!(
-        assembler.push(&[]),
-        Err(TransferError::Protocol(msg)) if msg.contains("empty")
-    ));
-    assert!(matches!(
-        assembler.push(&[0x07, 1, 2]),
-        Err(TransferError::Protocol(msg)) if msg.contains("header")
-    ));
-    // A correct message afterwards still works.
-    assert_eq!(assembler.push(&[FRAG_MORE, 1]).unwrap(), None);
-    assert_eq!(assembler.push(&[FRAG_LAST, 2]).unwrap(), Some(vec![1, 2]));
-}
 
 #[test]
 fn default_config_uses_the_public_stun_servers() {
@@ -182,112 +157,63 @@ fn default_config_uses_the_public_stun_servers() {
 }
 
 #[tokio::test]
-async fn link_state_tracks_the_peer_connection() {
+async fn a_lost_link_fails_the_streams_instead_of_hanging() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     let (mut sender, mut receiver) = connected_pair().await;
     assert_eq!(*sender.link.borrow(), LinkState::Connected);
-    assert_eq!(*receiver.link.borrow(), LinkState::Connected);
-    assert_eq!(sender.connection_type_name().await, "WebRTC");
+    assert_eq!(sender.connection_type_name(), "WebRTC");
+    let mut data = sender.data().await.unwrap();
 
-    // The receiver hanging reaches the sender as connection lost
-    receiver.close().await;
-    assert!(
-        if_closed(&receiver.link).is_err(),
-        "a local close marks the link"
-    );
-    let (_, reason) = tokio::time::timeout(Duration::from_secs(10), closed(&mut sender.link))
+    // The receiver hanging up reaches the sender as a lost connection.
+    receiver.close(false).await;
+    assert!(matches!(&*receiver.link.borrow(), LinkState::Closed(_)));
+    tokio::time::timeout(Duration::from_secs(10), sender.closed())
         .await
-        .expect("the sender must notice the close");
-    assert!(reason.contains("disconnected"), "{reason}");
-    assert!(if_closed(&sender.link).is_err());
+        .expect("the sender must notice the close")
+        .unwrap();
 
-    // Which makes any further send an error rather than a hang.
-    let ch = sender.channels.as_mut().unwrap();
-    let result = send_packet(&ch.control, &mut sender.link, &ReceiverToSender::Ok).await;
+    // Which makes any further write or read an error rather than a hang.
+    let result = async {
+        data.write_all(b"more").await?;
+        data.flush().await
+    }
+    .await;
     assert!(
-        matches!(result, Err(TransferError::Disconnected(_))),
+        matches!(&result, Err(e) if e.kind() == std::io::ErrorKind::ConnectionAborted),
         "{result:?}"
     );
-    let result = recv_msg(&mut ch.control, &mut sender.link).await;
+    let mut buf = [0u8; 8];
+    let result = data.read(&mut buf).await;
     assert!(
-        matches!(result, Err(TransferError::Disconnected(_))),
+        matches!(&result, Err(e) if e.kind() == std::io::ErrorKind::ConnectionAborted),
         "{result:?}"
     );
-    sender.close().await;
+    sender.close(false).await;
 }
 
 #[tokio::test]
-async fn control_packets_round_trip_between_peers() {
-    let (mut a, mut b) = connected_pair().await;
-    let big = SenderToReceiver::FileInfo {
-        files: (0..3000)
-            .map(|i| FilesAvailable::File {
-                name: format!("file-{i}.bin"),
-                size: i,
-            })
-            .collect(),
+async fn writes_are_split_into_channel_sized_messages() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (mut sender, mut receiver) = connected_pair().await;
+    let mut out = sender.data().await.unwrap();
+    let mut inp = receiver.data().await.unwrap();
+
+    // More than one message
+    let payload: Vec<u8> = (0..5 * MAX_MESSAGE_BYTES + 17).map(|i| i as u8).collect();
+    let write = async {
+        out.write_all(&payload).await.unwrap();
+        out.flush().await.unwrap();
     };
-    let a_ch = a.channels.as_mut().unwrap();
-    let b_ch = b.channels.as_mut().unwrap();
-
-    send_packet(&a_ch.control, &mut a.link, &big).await.unwrap();
-    let got: SenderToReceiver = recv_packet(&mut b_ch.control, &mut b.link).await.unwrap();
-    assert_eq!(got, big);
-
-    send_packet(&b_ch.control, &mut b.link, &ReceiverToSender::Ok)
-        .await
-        .unwrap();
-    let got: ReceiverToSender = recv_packet(&mut a_ch.control, &mut a.link).await.unwrap();
-    assert_eq!(got, ReceiverToSender::Ok);
-
-    // Wrong packet type fails to decode.
-    send_packet(&b_ch.control, &mut b.link, &ReceiverToSender::RejectFiles)
-        .await
-        .unwrap();
-    let got = recv_packet::<SenderToReceiver>(&mut a_ch.control, &mut a.link).await;
-    assert!(matches!(got, Err(TransferError::Json(_))), "{got:?}");
-
-    a.close().await;
-    b.close().await;
-}
-
-#[tokio::test]
-async fn receiver_rejects_another_protocol_version() {
-    let (mut raw_sender, mut receiver) = connected_pair().await;
-
-    let peer = async {
-        let ch = raw_sender.channels.as_mut().unwrap();
-        send_packet(
-            &ch.control,
-            &mut raw_sender.link,
-            &SenderToReceiver::ConnRequest {
-                version: "9.9.9".into(),
-            },
-        )
-        .await
-        .unwrap();
-        let reply: ReceiverToSender = recv_packet(&mut ch.control, &mut raw_sender.link)
-            .await
-            .unwrap();
-        raw_sender.close().await;
-        reply
+    let read = async {
+        let mut got = vec![0u8; payload.len()];
+        inp.read_exact(&mut got).await.unwrap();
+        got
     };
-    let (mut progress, mut offer, mut data) = (no_progress, no_offer, no_data);
-    let receive = receiver.receive_files(
-        ReceiveArgs { resume: false },
-        &mut progress,
-        &mut offer,
-        &mut data,
-    );
+    let ((), got) = tokio::join!(write, read);
+    assert_eq!(got, payload);
 
-    let (reply, result) = tokio::join!(peer, receive);
-    assert_eq!(
-        reply,
-        ReceiverToSender::WrongVersion {
-            expected: PROTO_VERSION.into()
-        }
-    );
-    assert!(
-        matches!(&result, Err(TransferError::WrongVersion(expected, got)) if expected == PROTO_VERSION && got == "9.9.9"),
-        "{result:?}"
-    );
+    sender.close(true).await;
+    receiver.close(true).await;
 }

@@ -4,8 +4,8 @@ license = "MIT"
 description = "A CLI for fsend, a peer-to-peer file sharing tool"
 authors = ["Maxomatic458"]
 keywords = ["file-transfer", "peer-to-peer", "p2p", "cli"]
-version = "0.2.1"
-edition = "2021"
+version = "0.3.0"
+edition = "2024"
 rust-version = "1.91"
 repository = "https://github.com/maxomatic458/fsend"
 homepage = "https://fsend.sh"
@@ -22,12 +22,13 @@ dialoguer = "0.12"
 futures-util = "0.3.34"
 indicatif = "0.18"
 iroh = "1.1"
-rkyv = "0.8.18"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2.0.20"
 tokio = { version = "1.52", features = ["rt", "rt-multi-thread", "time", "macros", "net", "fs", "sync", "io-util"] }
+tokio-stream = "0.1"
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 webrtc = "0.20"

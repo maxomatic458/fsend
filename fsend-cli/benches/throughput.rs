@@ -14,10 +14,10 @@ use std::time::Instant;
 
 use fsend_cli::iroh::IrohTransfer;
 use fsend_cli::relay::ConnectionInfo;
-use fsend_cli::transfer::{ReceiveArgs, SendArgs, Transfer};
+use fsend_cli::transfer::{ReceiveArgs, SendArgs, Transport, receive_files, send_files};
 use fsend_cli::webrtc::{WebRtcConfig, WebRtcTransfer};
-use iroh::endpoint::presets;
 use iroh::Endpoint;
+use iroh::endpoint::presets;
 
 fn env_or(name: &str, default: u64) -> u64 {
     std::env::var(name)
@@ -52,41 +52,41 @@ fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().unwrap()
 }
 
-fn send_harness(payload: PathBuf, transfer: impl Future<Output = Box<dyn Transfer>>) {
+fn send_harness(payload: PathBuf, transfer: impl Future<Output = Box<dyn Transport>>) {
     runtime().block_on(async {
         let mut transfer = transfer.await;
-        transfer
-            .send_files(
-                SendArgs {
-                    files: vec![payload],
-                },
-                &mut |_| {},
-                &mut || {},
-                &mut |_| {},
-            )
-            .await
-            .expect("send");
+        send_files(
+            transfer.as_mut(),
+            SendArgs {
+                files: vec![payload],
+            },
+            &mut |_| {},
+            &mut || {},
+            &mut |_| {},
+        )
+        .await
+        .expect("send");
     });
 }
 
 fn receive_harness(
     out: PathBuf,
     bytes: u64,
-    transfer: impl Future<Output = Box<dyn Transfer>>,
+    transfer: impl Future<Output = Box<dyn Transport>>,
 ) -> f64 {
     runtime().block_on(async {
         let mut transfer = transfer.await;
         let mut started = None;
         let out_dir = out.clone();
-        transfer
-            .receive_files(
-                ReceiveArgs { resume: false },
-                &mut |_| started = Some(Instant::now()),
-                &mut |_| Some(out_dir.clone()),
-                &mut |_| {},
-            )
-            .await
-            .expect("receive");
+        receive_files(
+            transfer.as_mut(),
+            ReceiveArgs { resume: false },
+            &mut |_| started = Some(Instant::now()),
+            &mut |_| Some(out_dir.clone()),
+            &mut |_| {},
+        )
+        .await
+        .expect("receive");
         let secs = started.expect("offer accepted").elapsed().as_secs_f64();
         bytes as f64 / secs / (1024.0 * 1024.0)
     })
@@ -120,7 +120,7 @@ fn bench_iroh(payload: &Path, out: &Path, bytes: u64) -> f64 {
             send_harness(payload, async {
                 let endpoint = IrohTransfer::bind(presets::Minimal).await.unwrap();
                 addr_tx.send(loopback_info(&endpoint)).unwrap();
-                Box::new(IrohTransfer::accept(endpoint).await.unwrap()) as Box<dyn Transfer>
+                Box::new(IrohTransfer::accept(endpoint).await.unwrap()) as Box<dyn Transport>
             })
         }
     });
@@ -130,7 +130,7 @@ fn bench_iroh(payload: &Path, out: &Path, bytes: u64) -> f64 {
             receive_harness(out, bytes, async {
                 let endpoint = IrohTransfer::bind(presets::Minimal).await.unwrap();
                 let peer = addr_rx.recv().unwrap();
-                Box::new(IrohTransfer::connect(endpoint, peer).await.unwrap()) as Box<dyn Transfer>
+                Box::new(IrohTransfer::connect(endpoint, peer).await.unwrap()) as Box<dyn Transport>
             })
         }
     });
@@ -162,7 +162,7 @@ fn bench_webrtc(payload: &Path, out: &Path, bytes: u64) -> f64 {
                     .await
                     .unwrap();
                 offerer.wait_connected().await.unwrap();
-                Box::new(offerer) as Box<dyn Transfer>
+                Box::new(offerer) as Box<dyn Transport>
             })
         }
     });
@@ -176,7 +176,7 @@ fn bench_webrtc(payload: &Path, out: &Path, bytes: u64) -> f64 {
                     .unwrap();
                 answer_tx.send(answer).unwrap();
                 answerer.wait_connected().await.unwrap();
-                Box::new(answerer) as Box<dyn Transfer>
+                Box::new(answerer) as Box<dyn Transport>
             })
         }
     });

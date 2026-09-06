@@ -1,8 +1,9 @@
 import {
   compressGzip,
   decompressGzip,
-  fragment,
-  Defragmenter,
+  frame,
+  messages,
+  FrameDecoder,
 } from "./compression";
 import type { SenderToReceiver, ReceiverToSender } from "../types";
 
@@ -15,22 +16,23 @@ export async function sendControlMessage(
 ): Promise<void> {
   const json = encoder.encode(JSON.stringify(msg));
   const compressed = await compressGzip(json);
-  const fragments = fragment(compressed);
-  for (const frag of fragments) {
-    channel.send(frag as any);
+  for (const message of messages(frame(compressed))) {
+    channel.send(message as any);
   }
 }
 
 export class ControlDecoder {
-  private defrag = new Defragmenter();
+  private frames = new FrameDecoder();
 
+  /// The control messages completed by this data channel message.
   async onMessage(
     data: ArrayBuffer,
-  ): Promise<(SenderToReceiver | ReceiverToSender) | null> {
-    const assembled = this.defrag.push(new Uint8Array(data));
-    if (!assembled) return null;
-    const decompressed = await decompressGzip(assembled);
-    const json = decoder.decode(decompressed);
-    return JSON.parse(json);
+  ): Promise<(SenderToReceiver | ReceiverToSender)[]> {
+    const out: (SenderToReceiver | ReceiverToSender)[] = [];
+    for (const payload of this.frames.push(new Uint8Array(data))) {
+      const decompressed = await decompressGzip(payload);
+      out.push(JSON.parse(decoder.decode(decompressed)));
+    }
+    return out;
   }
 }

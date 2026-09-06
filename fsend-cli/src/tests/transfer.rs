@@ -480,52 +480,62 @@ async fn gzip_round_trips() {
     assert!(decompress_gzip(b"definitely not gzip").await.is_err());
 }
 
-#[test]
-fn rkyv_packets_round_trip() {
+#[tokio::test]
+async fn control_frames_round_trip_over_a_byte_stream() {
+    let (a, b) = tokio::io::duplex(1024);
+    let (mut a, mut b) = (frame(Box::new(a)), frame(Box::new(b)));
+
     let packets = vec![
         SenderToReceiver::ConnRequest {
             version: PROTO_VERSION.into(),
         },
-        SenderToReceiver::FileInfo {
-            files: vec![file("a", 1), dir("d", vec![file("b", 2), dir("e", vec![])])],
-        },
         SenderToReceiver::FileInfo { files: vec![] },
+        // Bigger than any single WebRTC message.
+        SenderToReceiver::FileInfo {
+            files: (0..3000)
+                .map(|i| FilesAvailable::File {
+                    name: format!("file-{i}.bin"),
+                    size: i,
+                })
+                .collect(),
+        },
     ];
     for packet in packets {
-        let wire = packet.to_wire().unwrap();
-        assert_eq!(SenderToReceiver::from_wire(&wire).unwrap(), packet);
+        let (sent, got) = tokio::join!(
+            send_packet(&mut a, &packet),
+            recv_packet::<SenderToReceiver>(&mut b)
+        );
+        sent.unwrap();
+        assert_eq!(got.unwrap(), packet);
     }
 
-    let packets = vec![
+    let replies = vec![
         ReceiverToSender::Ok,
         ReceiverToSender::RejectFiles,
-        ReceiverToSender::WrongVersion {
-            expected: "9.9.9".into(),
-        },
         ReceiverToSender::AcceptFilesSkip {
             files: vec![None, Some(skip_file("a", 5)), Some(skip_dir("d", vec![]))],
         },
     ];
-    for packet in packets {
-        let wire = packet.to_wire().unwrap();
-        assert_eq!(ReceiverToSender::from_wire(&wire).unwrap(), packet);
+    for packet in replies {
+        let (sent, got) = tokio::join!(
+            send_packet(&mut b, &packet),
+            recv_packet::<ReceiverToSender>(&mut a)
+        );
+        sent.unwrap();
+        assert_eq!(got.unwrap(), packet);
     }
-}
 
-#[test]
-fn rkyv_rejects_garbage_and_the_wrong_packet_type() {
-    assert!(ReceiverToSender::from_wire(b"").is_err());
-    assert!(ReceiverToSender::from_wire(b"nonsense bytes here").is_err());
-
-    // Decoding through a shifted slice must not depend on the caller's
-    // buffer alignment.
-    let wire = ReceiverToSender::Ok.to_wire().unwrap();
-    let mut shifted = vec![0u8; 1];
-    shifted.extend_from_slice(&wire);
-    assert_eq!(
-        ReceiverToSender::from_wire(&shifted[1..]).unwrap(),
-        ReceiverToSender::Ok
-    );
+    // A frame that is not gzipped JSON, and a stream that ends.
+    use futures_util::SinkExt;
+    a.send(bytes::Bytes::from_static(b"nonsense"))
+        .await
+        .unwrap();
+    assert!(recv_packet::<ReceiverToSender>(&mut b).await.is_err());
+    drop(a);
+    assert!(matches!(
+        recv_packet::<ReceiverToSender>(&mut b).await,
+        Err(TransferError::Disconnected(_))
+    ));
 }
 
 #[test]
@@ -563,15 +573,22 @@ fn user_errors_are_worded_for_humans() {
 
     assert!(TransferError::UnexpectedPacket.user_error().is_none());
     assert!(TransferError::PeerTimeout.user_error().is_some());
+    assert!(TransferError::HandshakeTimeout.user_error().is_some());
     assert!(TransferError::Protocol("x".into()).user_error().is_none());
     assert!(TransferError::Internal("x").user_error().is_none());
-    assert!(TransferError::UnexpectedConnectionInfo
-        .user_error()
-        .is_none());
-    assert!(TransferError::FileNotFound("x".into())
-        .user_error()
-        .is_none());
-    assert!(TransferError::Io(std::io::Error::other("x"))
-        .user_error()
-        .is_none());
+    assert!(
+        TransferError::UnexpectedConnectionInfo
+            .user_error()
+            .is_none()
+    );
+    assert!(
+        TransferError::FileNotFound("x".into())
+            .user_error()
+            .is_none()
+    );
+    assert!(
+        TransferError::Io(std::io::Error::other("x"))
+            .user_error()
+            .is_none()
+    );
 }

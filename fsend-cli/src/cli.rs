@@ -1,9 +1,4 @@
 // Command-line surface.
-//
-// This module is also `include!`d by `build.rs` to generate shell completions
-// and the man page. That means it must stay free of `mod` declarations, of any
-// reference to the rest of the crate, and of inner (`//!`) doc comments, which
-// are not legal at an `include!` site.
 
 use std::path::PathBuf;
 
@@ -58,7 +53,7 @@ pub enum Mode {
         #[clap(long, short = 'y')]
         auto_accept: bool,
     },
-    /// Print the CLI, protocol and ALPN versions.
+    /// Print the CLI and protocol versions.
     #[clap(name = "version", aliases = &["v"])]
     Version,
 }
