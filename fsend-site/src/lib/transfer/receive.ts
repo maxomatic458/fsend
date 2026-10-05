@@ -1,15 +1,26 @@
 import { PROTO_VERSION } from "../../config";
-import { openReceiverSession } from "../transport/session";
+import {
+  openReceiverSession,
+  type ReceiverSession,
+} from "../transport/session";
 import { getConnectionType } from "../transport/webrtc";
 import {
   flattenTree,
   applySkip,
+  isSafeOffer,
+  retainFiles,
   treeSizeBytes,
   treeSkipBytes,
+  type FlatFile,
 } from "../files/tree";
-import type { TransferSink } from "./sinks";
+import type { ResumeSource, TransferSink } from "./sinks";
 import type { TransferListener } from "./events";
-import type { FilesToSkip, FileSendRecvTree, ReceiverToSender } from "../types";
+import type {
+  FilesAvailable,
+  FilesToSkip,
+  FileSendRecvTree,
+  ReceiverToSender,
+} from "../types";
 
 /// Receives a transfer into `sink`.
 export async function runReceive(
@@ -19,7 +30,7 @@ export async function runReceive(
   emit: TransferListener,
   abort: AbortSignal,
 ): Promise<void> {
-  let session: Awaited<ReturnType<typeof openReceiverSession>> = null;
+  let session: ReceiverSession | null = null;
 
   try {
     emit({ type: "connecting" });
@@ -27,7 +38,6 @@ export async function runReceive(
     session = await openReceiverSession(code, abort, {
       onHandshaking: () => emit({ type: "handshaking" }),
     });
-    if (!session) return;
     const { control, dataChannel, disconnected } = session;
 
     getConnectionType(session.pc)
@@ -50,6 +60,11 @@ export async function runReceive(
     const info = await control.next();
     if (info.type !== "FileInfo") throw new Error("Expected FileInfo");
     const offered = info.files;
+    if (!isSafeOffer(offered)) {
+      await control.send({ type: "RejectFiles" });
+      await control.flush();
+      throw new Error("The sender offered a file with an invalid name");
+    }
 
     const accepted = await Promise.race([
       new Promise<boolean>((resolve) => {
@@ -69,10 +84,9 @@ export async function runReceive(
       throw new Error("Transfer rejected");
     }
 
-    // Resume negotiation
-    const skipInfo: (FilesToSkip | null)[] =
-      resume && sink.canResume
-        ? await sink.existing(offered)
+    const skipInfo =
+      resume && sink.resume
+        ? await resumable(control, sink.resume, offered)
         : offered.map(() => null);
 
     await control.send({
@@ -97,83 +111,15 @@ export async function runReceive(
       })),
     });
 
-    if (flat.length === 0) {
-      await sink.finish(offered);
-      emit({ type: "complete" });
-      return;
+    if (flat.length > 0) {
+      await Promise.race([
+        receiveFiles(dataChannel, sink, flat, emit),
+        disconnected,
+      ]);
     }
-
-    // data
-    let fileIdx = 0;
-    let writtenBytes = flat[0].skipBytes;
-
-    // Buffer chunks from the very first one
-    const queue: Uint8Array[] = [];
-    dataChannel.onmessage = (ev) => {
-      if (!(ev.data instanceof ArrayBuffer) || ev.data.byteLength === 0) return;
-      queue.push(new Uint8Array(ev.data));
-    };
-
-    await sink.open(flat[0].path, flat[0].skipBytes);
-
-    const received = new Promise<void>((resolve, reject) => {
-      let draining = false;
-
-      /// Close finished files and open the next, returns true if the transfer is complete.
-      const advance = async () => {
-        while (
-          fileIdx < flat.length &&
-          writtenBytes >= flat[fileIdx].sizeBytes
-        ) {
-          await sink.closeFile();
-          fileIdx++;
-          if (fileIdx < flat.length) {
-            writtenBytes = flat[fileIdx].skipBytes;
-            await sink.open(flat[fileIdx].path, flat[fileIdx].skipBytes);
-          }
-        }
-        if (fileIdx >= flat.length) {
-          resolve();
-          return true;
-        }
-        return false;
-      };
-
-      const drain = async () => {
-        if (draining) return;
-        draining = true;
-        try {
-          // File that is empty or has been fully skipped (done)
-          if (await advance()) return;
-
-          while (queue.length > 0) {
-            const chunk = queue.shift()!;
-            if (fileIdx >= flat.length) break;
-            await sink.write(chunk);
-            writtenBytes += chunk.length;
-            emit({ type: "progress", bytes: chunk.length });
-            if (await advance()) return;
-          }
-        } catch (err) {
-          reject(err);
-        } finally {
-          draining = false;
-        }
-      };
-
-      dataChannel.onmessage = (ev) => {
-        if (!(ev.data instanceof ArrayBuffer) || ev.data.byteLength === 0)
-          return;
-        queue.push(new Uint8Array(ev.data));
-        drain();
-      };
-
-      drain();
-    });
-
-    await Promise.race([received, disconnected]);
-    session.peer.stop();
-    session.pc.close();
+    await control.send({ type: "Done" });
+    await session.goodbye();
+    session.close();
 
     await sink.finish(offered, (percent) => emit({ type: "packing", percent }));
     emit({ type: "complete" });
@@ -186,4 +132,95 @@ export async function runReceive(
     await sink.closeFile().catch(() => {});
     session?.close();
   }
+}
+
+/// The candidates whose local prefix hashes the same as the sender's.
+async function resumable(
+  control: ReceiverSession["control"],
+  source: ResumeSource,
+  offered: FilesAvailable[],
+): Promise<(FilesToSkip | null)[]> {
+  const candidates = await source.candidates(offered);
+  if (!candidates.some(Boolean)) return candidates;
+
+  await control.send({ type: "ResumeCandidates", files: candidates });
+  const reply = await control.next();
+  if (reply.type !== "PrefixHashes") throw new Error("Expected PrefixHashes");
+  const ours = await source.prefixHashes(candidates);
+  if (ours.length !== reply.hashes.length) {
+    throw new Error("Unexpected PrefixHashes");
+  }
+  const keep = ours.map((hash, i) => hash !== null && hash === reply.hashes[i]);
+  return retainFiles(candidates, keep);
+}
+
+/// Writes the data channel's bytes into `sink`, file after file.
+async function receiveFiles(
+  dataChannel: RTCDataChannel,
+  sink: TransferSink,
+  flat: FlatFile[],
+  emit: TransferListener,
+): Promise<void> {
+  let fileIdx = 0;
+  let writtenBytes = flat[0].skipBytes;
+
+  // Buffer chunks from the very first one
+  const queue: Uint8Array[] = [];
+  dataChannel.onmessage = (ev) => {
+    if (!(ev.data instanceof ArrayBuffer) || ev.data.byteLength === 0) return;
+    queue.push(new Uint8Array(ev.data));
+  };
+
+  await sink.open(flat[0].path, flat[0].skipBytes);
+
+  return new Promise<void>((resolve, reject) => {
+    let draining = false;
+
+    /// Close finished files and open the next, returns true if the transfer is complete.
+    const advance = async () => {
+      while (fileIdx < flat.length && writtenBytes >= flat[fileIdx].sizeBytes) {
+        await sink.closeFile();
+        fileIdx++;
+        if (fileIdx < flat.length) {
+          writtenBytes = flat[fileIdx].skipBytes;
+          await sink.open(flat[fileIdx].path, flat[fileIdx].skipBytes);
+        }
+      }
+      if (fileIdx >= flat.length) {
+        resolve();
+        return true;
+      }
+      return false;
+    };
+
+    const drain = async () => {
+      if (draining) return;
+      draining = true;
+      try {
+        // File that is empty or has been fully skipped (done)
+        if (await advance()) return;
+
+        while (queue.length > 0) {
+          const chunk = queue.shift()!;
+          if (fileIdx >= flat.length) break;
+          await sink.write(chunk);
+          writtenBytes += chunk.length;
+          emit({ type: "progress", bytes: chunk.length });
+          if (await advance()) return;
+        }
+      } catch (err) {
+        reject(err);
+      } finally {
+        draining = false;
+      }
+    };
+
+    dataChannel.onmessage = (ev) => {
+      if (!(ev.data instanceof ArrayBuffer) || ev.data.byteLength === 0) return;
+      queue.push(new Uint8Array(ev.data));
+      drain();
+    };
+
+    drain();
+  });
 }

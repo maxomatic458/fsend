@@ -1,14 +1,22 @@
+import { prefixHash } from "../files/hash";
+import { candidateFiles } from "../files/tree";
 import type { FilesAvailable, FilesToSkip } from "../types";
 
 /// Long enough for the browser to have started reading the blob.
 const REVOKE_DELAY_MS = 60_000;
 
+/// Partial files an earlier attempt left behind.
+export interface ResumeSource {
+  /// Local files that may be a prefix of the offered ones.
+  candidates(offered: FilesAvailable[]): Promise<(FilesToSkip | null)[]>;
+  /// The hash of each candidate file, in tree order.
+  prefixHashes(candidates: (FilesToSkip | null)[]): Promise<(string | null)[]>;
+}
+
 /// Bytes are written into this sink
 export interface TransferSink {
-  /// can the transfer be resumed
-  readonly canResume: boolean;
-  // Which files to fully/partially skip, or null if none.
-  existing(offered: FilesAvailable[]): Promise<(FilesToSkip | null)[]>;
+  /// Set when an interrupted transfer can be resumed.
+  readonly resume?: ResumeSource;
   // open a file with a optional offset.
   open(path: string, skipBytes: number): Promise<void>;
   write(chunk: Uint8Array): Promise<void>;
@@ -29,14 +37,23 @@ export function createDiskSink(
   let writable: FileSystemWritableFileStream | null = null;
 
   return {
-    canResume: true,
+    resume: {
+      async candidates(offered) {
+        const result: (FilesToSkip | null)[] = [];
+        for (const entry of offered) {
+          result.push(await existingFor(dirHandle, entry));
+        }
+        return result;
+      },
 
-    async existing(offered) {
-      const result: (FilesToSkip | null)[] = [];
-      for (const entry of offered) {
-        result.push(await existingFor(dirHandle, entry));
-      }
-      return result;
+      async prefixHashes(candidates) {
+        const hashes: (string | null)[] = [];
+        for (const { path, skip } of candidateFiles(candidates, (_, n) => n)) {
+          const file = path === null ? null : await readFile(dirHandle, path);
+          hashes.push(file && (await prefixHash(file, skip)));
+        }
+        return hashes;
+      },
     },
 
     async open(path, skipBytes) {
@@ -82,7 +99,7 @@ async function existingFor(
     try {
       const handle = await dir.getFileHandle(offered.name);
       const file = await handle.getFile();
-      if (file.size > 0) {
+      if (file.size > 0 && file.size <= offered.size) {
         return { type: "File", name: offered.name, skip: file.size };
       }
     } catch {
@@ -104,6 +121,21 @@ async function existingFor(
   }
 }
 
+async function readFile(
+  dir: FileSystemDirectoryHandle,
+  path: string,
+): Promise<File | null> {
+  const parts = path.split("/");
+  try {
+    for (const part of parts.slice(0, -1)) {
+      dir = await dir.getDirectoryHandle(part);
+    }
+    return await (await dir.getFileHandle(parts[parts.length - 1])).getFile();
+  } catch {
+    return null;
+  }
+}
+
 /// Download to memory
 export function createDownloadSink(): TransferSink {
   const buffers = new Map<string, Uint8Array[]>();
@@ -111,13 +143,6 @@ export function createDownloadSink(): TransferSink {
   let order: string[] = [];
 
   return {
-    canResume: false,
-
-    async existing(offered) {
-      // Nothing is kept between attempts, so there is never anything to skip.
-      return offered.map(() => null);
-    },
-
     async open(path) {
       current = buffers.get(path) ?? [];
       if (!buffers.has(path)) {

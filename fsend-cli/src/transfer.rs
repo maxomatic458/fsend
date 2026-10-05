@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use async_compression::tokio::write::GzipEncoder;
@@ -14,7 +14,8 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 /// Read/write chunk on the data stream.
 pub const BUF_SIZE: usize = 64 * 1024;
-pub const PROTO_VERSION: &str = "3";
+const HASH_BUF_SIZE: usize = 1024 * 1024;
+pub const PROTO_VERSION: &str = "4";
 pub const FSEND_ALPN: &[u8] = b"fsend";
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// How long a incompatible peer gets to read our last packet.
@@ -146,17 +147,14 @@ impl FilesAvailable {
         }
     }
 
+    /// The local files that could be a prefix of this offer.
     pub fn get_skippable(&self, local: &FilesAvailable) -> Option<FilesToSkip> {
         match (self, local) {
             (Self::File { name, size }, Self::File { name: ln, size: ls }) => {
-                if name == ln {
-                    Some(FilesToSkip::File {
-                        name: name.clone(),
-                        skip: if ls > size { 0 } else { *ls },
-                    })
-                } else {
-                    None
-                }
+                (name == ln && (1..=*size).contains(ls)).then(|| FilesToSkip::File {
+                    name: name.clone(),
+                    skip: *ls,
+                })
             }
             (
                 Self::Dir { name, files },
@@ -188,6 +186,36 @@ impl FilesAvailable {
             _ => None,
         }
     }
+}
+
+/// Whether `name` is a single plain path component that displays as written.
+pub fn is_safe_name(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(Component::Normal(_)))
+        && components.next().is_none()
+        && !name.contains('/')
+        && !name.chars().any(|c| {
+            c.is_control() || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+        })
+}
+
+/// Rejects offers that could escape the output directory or misreport their size.
+pub fn check_offer(files: &[FilesAvailable]) -> Result<u64, TransferError> {
+    files.iter().try_fold(0u64, |total, file| {
+        if !is_safe_name(file.name()) {
+            return Err(TransferError::InvalidOffer(format!(
+                "unsafe file name \"{}\"",
+                file.name().escape_debug()
+            )));
+        }
+        let size = match file {
+            FilesAvailable::File { size, .. } => *size,
+            FilesAvailable::Dir { files, .. } => check_offer(files)?,
+        };
+        total
+            .checked_add(size)
+            .ok_or_else(|| TransferError::InvalidOffer("the total size overflows".into()))
+    })
 }
 
 /// The name a path is announced under.
@@ -304,8 +332,8 @@ pub fn plan_transfer(offered: &[FilesAvailable], to_skip: &[Option<FilesToSkip>]
     }
 }
 
-/// What the receiver want's to skip based on whats locally available.
-pub fn skip_list(
+/// Local files that may be resumed, pending a prefix hash check.
+pub fn resume_candidates(
     offered: &[FilesAvailable],
     output_dir: &Path,
     resume: bool,
@@ -321,6 +349,83 @@ pub fn skip_list(
                 .and_then(|local| offer.get_skippable(&local))
         })
         .collect()
+}
+
+/// Every file in `candidates` as `(path, skip)`, in tree order. `root` maps a
+/// top-level entry to its path; anything that does not resolve maps to `None`.
+fn candidate_files(
+    candidates: &[Option<FilesToSkip>],
+    root: impl Fn(usize, &str) -> Option<PathBuf>,
+) -> Vec<(Option<PathBuf>, u64)> {
+    fn walk(node: &FilesToSkip, path: Option<PathBuf>, out: &mut Vec<(Option<PathBuf>, u64)>) {
+        match node {
+            FilesToSkip::File { skip, .. } => out.push((path, *skip)),
+            FilesToSkip::Dir { files, .. } => {
+                for file in files {
+                    let child = path
+                        .as_ref()
+                        .filter(|_| is_safe_name(file.name()))
+                        .map(|p| p.join(file.name()));
+                    walk(file, child, out);
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for (i, candidate) in candidates.iter().enumerate() {
+        if let Some(candidate) = candidate {
+            walk(candidate, root(i, candidate.name()), &mut out);
+        }
+    }
+    out
+}
+
+/// Keeps the candidate files whose flag in `keep` (in tree order) is set.
+fn retain_files(candidates: Vec<Option<FilesToSkip>>, keep: &[bool]) -> Vec<Option<FilesToSkip>> {
+    fn walk(node: FilesToSkip, keep: &mut impl Iterator<Item = bool>) -> Option<FilesToSkip> {
+        match node {
+            FilesToSkip::File { .. } => keep.next().unwrap_or(false).then_some(node),
+            FilesToSkip::Dir { name, files } => {
+                let files: Vec<_> = files.into_iter().filter_map(|f| walk(f, keep)).collect();
+                (!files.is_empty()).then_some(FilesToSkip::Dir { name, files })
+            }
+        }
+    }
+
+    let mut keep = keep.iter().copied();
+    candidates
+        .into_iter()
+        .map(|candidate| candidate.and_then(|c| walk(c, &mut keep)))
+        .collect()
+}
+
+/// xxh3 of the first `len` bytes of `path`, or `None` if it has fewer.
+pub async fn prefix_hash(path: &Path, len: u64) -> Option<String> {
+    let mut file = tokio::fs::File::open(path).await.ok()?.take(len);
+    let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
+    let mut buf = vec![0u8; HASH_BUF_SIZE];
+    let mut read = 0u64;
+    loop {
+        let n = file.read(&mut buf).await.ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        read += n as u64;
+    }
+    (read == len).then(|| format!("{:016x}", hasher.digest()))
+}
+
+async fn prefix_hashes(files: Vec<(Option<PathBuf>, u64)>) -> Vec<Option<String>> {
+    let mut hashes = Vec::with_capacity(files.len());
+    for (path, len) in files {
+        hashes.push(match path {
+            Some(path) => prefix_hash(&path, len).await,
+            None => None,
+        });
+    }
+    hashes
 }
 
 /// Opens a file for receiving.
@@ -373,17 +478,34 @@ impl FilesToSkip {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum SenderToReceiver {
-    ConnRequest { version: String },
-    FileInfo { files: Vec<FilesAvailable> },
+    ConnRequest {
+        version: String,
+    },
+    FileInfo {
+        files: Vec<FilesAvailable>,
+    },
+    /// The sender's hash of each resume candidate, in tree order.
+    PrefixHashes {
+        hashes: Vec<Option<String>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ReceiverToSender {
-    WrongVersion { expected: String },
+    WrongVersion {
+        expected: String,
+    },
     Ok,
     RejectFiles,
-    AcceptFilesSkip { files: Vec<Option<FilesToSkip>> },
+    ResumeCandidates {
+        files: Vec<Option<FilesToSkip>>,
+    },
+    AcceptFilesSkip {
+        files: Vec<Option<FilesToSkip>>,
+    },
+    /// Every file is on disk.
+    Done,
 }
 
 pub async fn compress_gzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -412,6 +534,8 @@ pub enum TransferError {
     WrongVersion(String, String),
     #[error("transfer declined")]
     Declined,
+    #[error("invalid offer: {0}")]
+    InvalidOffer(String),
     #[error("the peer declined the files")]
     PeerDeclined,
     #[error("{} of the given paths do not exist", .0.len())]
@@ -454,6 +578,9 @@ impl TransferError {
     pub fn user_error(&self) -> Option<String> {
         match self {
             Self::Declined => Some("Transfer declined.".to_owned()),
+            Self::InvalidOffer(reason) => {
+                Some(format!("{} refused the offer: {reason}", "error:".red()))
+            }
             Self::PeerDeclined => Some(format!("{} the peer declined the files", "error:".red())),
             Self::Disconnected(reason) => Some(format!(
                 "{} the connection to the peer was lost ({reason}).\n\
@@ -710,7 +837,16 @@ async fn run_send(
 
     waiting_cb();
 
-    let to_skip = match recv_packet::<ReceiverToSender>(&mut control).await? {
+    let mut reply = recv_packet(&mut control).await?;
+    if let ReceiverToSender::ResumeCandidates { files } = &reply {
+        let paths = candidate_files(files, |i, name| {
+            (files_available.get(i)?.name() == name).then(|| args.files[i].clone())
+        });
+        let hashes = prefix_hashes(paths).await;
+        send_packet(&mut control, &SenderToReceiver::PrefixHashes { hashes }).await?;
+        reply = recv_packet(&mut control).await?;
+    }
+    let to_skip = match reply {
         ReceiverToSender::AcceptFilesSkip { files } => files,
         ReceiverToSender::RejectFiles => return Err(TransferError::PeerDeclined),
         _ => return Err(TransferError::UnexpectedPacket),
@@ -734,8 +870,10 @@ async fn run_send(
     }
     data.shutdown().await?;
 
-    // The receiver hangs up once everything is on disk.
-    transport.closed().await
+    match recv_packet(&mut control).await? {
+        ReceiverToSender::Done => Ok(()),
+        _ => Err(TransferError::UnexpectedPacket),
+    }
 }
 
 pub async fn receive_files(
@@ -795,6 +933,11 @@ async fn run_receive(
         SenderToReceiver::FileInfo { files } => files,
         _ => return Err(TransferError::UnexpectedPacket),
     };
+    if let Err(e) = check_offer(&files_offered) {
+        send_packet(&mut control, &ReceiverToSender::RejectFiles).await?;
+        goodbye(transport).await;
+        return Err(e);
+    }
 
     let output_path = match accept_files_cb(&files_offered) {
         Some(p) => p,
@@ -805,7 +948,12 @@ async fn run_receive(
         }
     };
 
-    let files_to_skip = skip_list(&files_offered, &output_path, args.resume);
+    let candidates = resume_candidates(&files_offered, &output_path, args.resume);
+    let files_to_skip = if candidates.iter().any(Option::is_some) {
+        verify_candidates(&mut control, &output_path, candidates).await?
+    } else {
+        candidates
+    };
     let plan = plan_transfer(&files_offered, &files_to_skip);
     initial_progress_cb(&plan.progress);
 
@@ -837,7 +985,41 @@ async fn run_receive(
         }
     }
 
+    send_packet(&mut control, &ReceiverToSender::Done).await?;
+    goodbye(transport).await;
     Ok(())
+}
+
+/// Keeps the candidates whose local prefix hashes the same as the sender's.
+async fn verify_candidates(
+    control: &mut Control,
+    output_path: &Path,
+    candidates: Vec<Option<FilesToSkip>>,
+) -> Result<Vec<Option<FilesToSkip>>, TransferError> {
+    send_packet(
+        control,
+        &ReceiverToSender::ResumeCandidates {
+            files: candidates.clone(),
+        },
+    )
+    .await?;
+    let SenderToReceiver::PrefixHashes { hashes } = recv_packet(control).await? else {
+        return Err(TransferError::UnexpectedPacket);
+    };
+
+    let local = prefix_hashes(candidate_files(&candidates, |_, name| {
+        Some(output_path.join(name))
+    }))
+    .await;
+    if local.len() != hashes.len() {
+        return Err(TransferError::UnexpectedPacket);
+    }
+    let keep: Vec<bool> = local
+        .iter()
+        .zip(&hashes)
+        .map(|(ours, theirs)| ours.is_some() && ours == theirs)
+        .collect();
+    Ok(retain_files(candidates, &keep))
 }
 
 #[cfg(test)]

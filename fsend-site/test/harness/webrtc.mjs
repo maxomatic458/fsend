@@ -10,6 +10,9 @@
 
 /** Offers waiting to be answered, keyed by the token embedded in the SDP. */
 const pendingOffers = new Map();
+
+/** The max-message-size the CLI's WebRTC stack advertises. */
+export const MAX_MESSAGE_SIZE = 64 * 1024;
 let nextId = 0;
 
 class FakeEventTarget {
@@ -66,6 +69,9 @@ export class FakeDataChannel extends FakeEventTarget {
       throw err;
     }
     const buf = toArrayBuffer(data);
+    if (buf.byteLength > MAX_MESSAGE_SIZE) {
+      throw new TypeError(`message of ${buf.byteLength} bytes is too large`);
+    }
     const size = this._instantDrain ? 0 : (buf.byteLength ?? 0);
     this.bufferedAmount += size;
 
@@ -211,12 +217,19 @@ export class FakePeerConnection extends FakeEventTarget {
     return stats;
   }
 
+  /** Like a browser: no events locally, only the peer's channels close. */
   close() {
     if (this.connectionState === "closed") return;
     this.connectionState = "closed";
     this.iceConnectionState = "closed";
-    for (const [, ch] of this._channels) ch.close();
-    this._emit("connectionstatechange", {});
+    for (const [, ch] of this._channels) {
+      ch._closeSilently();
+      const peer = ch._peer;
+      if (peer && peer.readyState !== "closed") {
+        peer.readyState = "closed";
+        peer._emit("close", {});
+      }
+    }
   }
 
   /**

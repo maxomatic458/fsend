@@ -15,7 +15,7 @@ use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelState};
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder,
     RTCIceGatheringState, RTCIceServer, RTCPeerConnectionState, RTCSessionDescription,
-    SettingEngine,
+    SettingEngineBuilder,
 };
 use webrtc::runtime::TokioRuntime;
 
@@ -279,10 +279,11 @@ impl WebRtcTransfer {
         let link_tx = Arc::new(link_tx);
         let gathered = Arc::new(Notify::new());
 
-        let mut settings = SettingEngine::default();
-        settings.set_include_loopback_candidate(config.loopback);
+        let mut settings =
+            SettingEngineBuilder::new().with_include_loopback_candidate(config.loopback);
         if let Some((disconnected, failed, keep_alive)) = config.ice_timeouts {
-            settings.set_ice_timeouts(Some(disconnected), Some(failed), Some(keep_alive));
+            settings =
+                settings.with_ice_timeouts(Some(disconnected), Some(failed), Some(keep_alive));
         }
 
         let ice_servers = if config.stun_servers.is_empty() {
@@ -299,7 +300,7 @@ impl WebRtcTransfer {
 
         let pc = PeerConnectionBuilder::new()
             .with_configuration(rtc_config)
-            .with_setting_engine(settings)
+            .with_setting_engine(settings.build())
             .with_handler(Arc::new(Events {
                 link_tx: link_tx.clone(),
                 gathered: gathered.clone(),

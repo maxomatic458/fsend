@@ -1,4 +1,5 @@
-import { RELAY_URL } from "../../config";
+import { RELAY_URL, GOODBYE_TIMEOUT_MS } from "../../config";
+import { abortable } from "../abort";
 import { RelayClient } from "./relay";
 import {
   createOfferer,
@@ -21,8 +22,10 @@ export interface Session<In, Out> {
   dataChannel: RTCDataChannel;
   pc: RTCPeerConnection;
   peer: DisconnectWatcher;
-  /// Rejects the moment the peer disconnects
+  /// Rejects the moment the peer disconnects or the session is aborted
   disconnected: Promise<never>;
+  /// Waits for the peer to hang up, so our last message reaches it.
+  goodbye(): Promise<void>;
   close(): void;
 }
 
@@ -38,14 +41,25 @@ function assemble<In, Out>(
   pc: RTCPeerConnection,
   controlChannel: RTCDataChannel,
   dataChannel: RTCDataChannel,
+  abort: AbortSignal,
 ): Session<In, Out> {
   const peer = watchDisconnect(pc, [controlChannel, dataChannel]);
+  const disconnected = abortable(peer.promise, abort);
+  disconnected.catch(() => {});
   return {
-    control: createControlChannel<In, Out>(controlChannel, peer.promise),
+    control: createControlChannel<In, Out>(controlChannel, disconnected),
     dataChannel,
     pc,
     peer,
-    disconnected: peer.promise,
+    disconnected,
+    goodbye: () =>
+      new Promise((resolve) => {
+        const timer = setTimeout(resolve, GOODBYE_TIMEOUT_MS);
+        disconnected.catch(() => {
+          clearTimeout(timer);
+          resolve();
+        });
+      }),
     close() {
       peer.stop();
       relay.close();
@@ -60,83 +74,57 @@ export interface SenderSessionHooks {
   onHandshaking(): void;
 }
 
+/** Rejects if the session cannot be set up, including when `abort` fires. */
 export async function openSenderSession(
   abort: AbortSignal,
   hooks: SenderSessionHooks,
-): Promise<SenderSession | null> {
-  const relay = await RelayClient.connect(RELAY_URL);
-  if (abort.aborted) {
+): Promise<SenderSession> {
+  const relay = await RelayClient.connect(RELAY_URL, abort);
+  let pc: RTCPeerConnection | undefined;
+  try {
+    hooks.onCode(await relay.createSession());
+    hooks.onWaitingPeer();
+    await relay.waitForPeer();
+    hooks.onHandshaking();
+
+    const { connection, offerSdp } = await createOfferer();
+    const { controlChannel, dataChannel } = connection;
+    pc = connection.pc;
+    relay.sendExchange(exchange(offerSdp));
+    await applyAnswer(pc, (await relay.recvExchange()).sdp);
+    await waitConnected(pc, [controlChannel, dataChannel], abort);
+    return assemble(relay, pc, controlChannel, dataChannel, abort);
+  } catch (err) {
     relay.close();
-    return null;
+    pc?.close();
+    throw err;
   }
-
-  const code = await relay.createSession();
-  hooks.onCode(code);
-  hooks.onWaitingPeer();
-
-  await relay.waitForPeer();
-  if (abort.aborted) {
-    relay.close();
-    return null;
-  }
-  hooks.onHandshaking();
-
-  const { connection, offerSdp } = await createOfferer();
-  const { pc, controlChannel, dataChannel } = connection;
-  abort.addEventListener("abort", () => {
-    relay.close();
-    pc.close();
-  });
-
-  relay.sendExchange(exchange(offerSdp));
-  const peerInfo = await relay.recvExchange();
-  await applyAnswer(pc, peerInfo.sdp);
-  await waitConnected(pc, [controlChannel, dataChannel]);
-  if (abort.aborted) {
-    relay.close();
-    pc.close();
-    return null;
-  }
-
-  return assemble(relay, pc, controlChannel, dataChannel);
 }
 
+/** Rejects if the session cannot be set up, including when `abort` fires. */
 export async function openReceiverSession(
   code: string,
   abort: AbortSignal,
   hooks: { onHandshaking(): void },
-): Promise<ReceiverSession | null> {
-  const relay = await RelayClient.connect(RELAY_URL);
-  if (abort.aborted) {
+): Promise<ReceiverSession> {
+  const relay = await RelayClient.connect(RELAY_URL, abort);
+  let pc: RTCPeerConnection | undefined;
+  try {
+    await relay.joinSession(code.toUpperCase());
+    const answerer = await createAnswerer((await relay.recvExchange()).sdp);
+    pc = answerer.pc;
+    relay.sendExchange(exchange(answerer.answerSdp));
+
+    const { controlChannel, dataChannel } = await abortable(
+      answerer.channelsReady,
+      abort,
+    );
+    await waitConnected(pc, [controlChannel, dataChannel], abort);
+    hooks.onHandshaking();
+    return assemble(relay, pc, controlChannel, dataChannel, abort);
+  } catch (err) {
     relay.close();
-    return null;
+    pc?.close();
+    throw err;
   }
-
-  await relay.joinSession(code.toUpperCase());
-
-  const senderInfo = await relay.recvExchange();
-  if (abort.aborted) {
-    relay.close();
-    return null;
-  }
-
-  const answerer = await createAnswerer(senderInfo.sdp);
-  const pc = answerer.pc;
-  abort.addEventListener("abort", () => {
-    relay.close();
-    pc.close();
-  });
-
-  relay.sendExchange(exchange(answerer.answerSdp));
-
-  const { controlChannel, dataChannel } = await answerer.channelsReady;
-  await waitConnected(pc, [controlChannel, dataChannel]);
-  if (abort.aborted) {
-    relay.close();
-    pc.close();
-    return null;
-  }
-  hooks.onHandshaking();
-
-  return assemble(relay, pc, controlChannel, dataChannel);
 }

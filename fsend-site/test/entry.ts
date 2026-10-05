@@ -9,7 +9,11 @@ export {
   buildFileTree,
   flattenTree,
   totalSizeBytes,
+  isSafeName,
+  candidateFiles,
+  retainFiles,
 } from "../src/lib/files/tree";
+export { prefixHash } from "../src/lib/files/hash";
 export { watchDisconnect } from "../src/lib/transport/webrtc";
 export {
   PROTO_VERSION,

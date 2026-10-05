@@ -3,8 +3,8 @@
  * getDirectoryHandle/getFileHandle with { create }, createWritable with
  * { keepExistingData }, seek/write/close, getFile and entries.
  *
- * Files live as byte arrays so a test can assert on exact contents, and a
- * writable can be abandoned mid-write to model a transfer that was cut off.
+ * Files live as byte arrays so a test can assert on exact contents. Like
+ * Chromium's swap files, writes only reach the file once the writable closes.
  */
 
 class NotFoundError extends Error {
@@ -57,9 +57,6 @@ class MemoryWritable {
           : new Uint8Array(chunk.data ?? chunk);
     for (let i = 0; i < data.length; i++) this._buf[this._pos + i] = data[i];
     this._pos += data.length;
-    // Commit as we go, so an abandoned writable still leaves partial data on
-    // "disk" — which is exactly what resume relies on.
-    this._handle.bytes = Uint8Array.from(this._buf);
   }
 
   async close() {

@@ -83,12 +83,10 @@ fn skippable_file_resumes_from_local_size() {
 }
 
 #[test]
-fn skippable_file_larger_than_the_offer_starts_over() {
-    // A bigger local file cannot be a prefix of the offer.
-    assert_eq!(
-        file("a", 100).get_skippable(&file("a", 150)),
-        Some(skip_file("a", 0))
-    );
+fn only_a_possible_prefix_is_a_candidate() {
+    // A bigger local file cannot be a prefix of the offer, an empty one is no use.
+    assert_eq!(file("a", 100).get_skippable(&file("a", 150)), None);
+    assert_eq!(file("a", 100).get_skippable(&file("a", 0)), None);
     // Exactly complete is skipped in full.
     assert_eq!(
         file("a", 100).get_skippable(&file("a", 100)),
@@ -414,7 +412,7 @@ fn dot_is_announced_under_its_real_name() {
 }
 
 #[test]
-fn skip_list_reads_the_output_directory() {
+fn resume_candidates_read_the_output_directory() {
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path();
     write(&out.join("big.bin"), &bytes(400, 1));
@@ -429,17 +427,17 @@ fn skip_list_reads_the_output_directory() {
     ];
 
     assert_eq!(
-        skip_list(&offered, out, false),
+        resume_candidates(&offered, out, false),
         vec![None, None, None, None],
         "overwrite mode never skips"
     );
     assert_eq!(
-        skip_list(&offered, out, true),
+        resume_candidates(&offered, out, true),
         vec![
             Some(skip_file("big.bin", 400)),
             Some(skip_dir("d", vec![skip_file("a", 10)])),
             None,
-            Some(skip_file("too-big.bin", 0)),
+            None,
         ]
     );
 }
@@ -571,6 +569,11 @@ fn user_errors_are_worded_for_humans() {
         .unwrap();
     assert!(version.contains("0.1.0") && version.contains("0.0.1"));
 
+    let invalid = TransferError::InvalidOffer("unsafe file name".into())
+        .user_error()
+        .unwrap();
+    assert!(invalid.contains("refused the offer: unsafe file name"));
+
     assert!(TransferError::UnexpectedPacket.user_error().is_none());
     assert!(TransferError::PeerTimeout.user_error().is_some());
     assert!(TransferError::HandshakeTimeout.user_error().is_some());
@@ -590,5 +593,140 @@ fn user_errors_are_worded_for_humans() {
         TransferError::Io(std::io::Error::other("x"))
             .user_error()
             .is_none()
+    );
+}
+
+#[test]
+fn only_plain_names_are_safe() {
+    for name in ["a.txt", ".hidden", "with space", "ü — ✓", "..."] {
+        assert!(is_safe_name(name), "{name:?}");
+    }
+    for name in [
+        "",
+        ".",
+        "..",
+        "../x",
+        "a/b",
+        "a/",
+        "/etc/passwd",
+        "line\nbreak",
+        "\x1b[2Jclear",
+        "invoice\u{202E}fdp.exe",
+        "\u{2066}isolate",
+    ] {
+        assert!(!is_safe_name(name), "{name:?}");
+    }
+    #[cfg(windows)]
+    for name in ["a\\b", "C:x", "C:\\x"] {
+        assert!(!is_safe_name(name), "{name:?}");
+    }
+}
+
+#[test]
+fn offers_are_checked_all_the_way_down() {
+    let ok = vec![dir("d", vec![file("a", 10), dir("e", vec![file("b", 5)])])];
+    assert_eq!(check_offer(&ok).unwrap(), 15);
+
+    let nested = vec![dir("d", vec![dir("e", vec![file("../../x", 1)])])];
+    let err = check_offer(&nested).unwrap_err();
+    assert!(err.to_string().contains("../../x"), "{err}");
+
+    let escaped = check_offer(&[file("\u{1b}[2J", 1)])
+        .unwrap_err()
+        .to_string();
+    assert!(!escaped.contains('\u{1b}'), "{escaped:?}");
+    let escaped = check_offer(&[file("a\u{202E}b", 1)])
+        .unwrap_err()
+        .to_string();
+    assert!(!escaped.contains('\u{202E}'), "{escaped:?}");
+
+    let overflow = vec![file("a", u64::MAX), dir("d", vec![file("b", 1)])];
+    assert!(matches!(
+        check_offer(&overflow),
+        Err(TransferError::InvalidOffer(_))
+    ));
+}
+
+/// Shared with the web app's test suite, which must produce the same hashes.
+const HASH_VECTORS: [(usize, &str); 3] = [
+    (0, "2d06800538d394c2"),
+    (1000, "33ef703fb2b20ed1"),
+    (300_000, "5d12941f4cf541c5"),
+];
+
+fn hash_input(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+#[tokio::test]
+async fn prefix_hashes_cover_exactly_the_prefix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("f.bin");
+    write(&path, &hash_input(300_000));
+
+    for (len, expected) in HASH_VECTORS {
+        assert_eq!(
+            prefix_hash(&path, len as u64).await.as_deref(),
+            Some(expected),
+            "{len}"
+        );
+    }
+    assert_eq!(prefix_hash(&path, 300_001).await, None, "file too short");
+    assert_eq!(prefix_hash(&tmp.path().join("nope"), 1).await, None);
+}
+
+#[test]
+fn candidates_walk_and_filter_in_tree_order() {
+    let candidates = vec![
+        Some(skip_file("top.bin", 4)),
+        None,
+        Some(skip_dir(
+            "d",
+            vec![
+                skip_file("a", 1),
+                skip_dir("e", vec![skip_file("b", 2)]),
+                skip_file("..", 3),
+            ],
+        )),
+    ];
+    let root = Path::new("out");
+    let files = candidate_files(&candidates, |_, name| Some(root.join(name)));
+    assert_eq!(
+        files,
+        vec![
+            (Some(root.join("top.bin")), 4),
+            (Some(root.join("d/a")), 1),
+            (Some(root.join("d/e/b")), 2),
+            (None, 3),
+        ]
+    );
+
+    assert_eq!(
+        retain_files(candidates.clone(), &[false, true, false, true]),
+        vec![
+            None,
+            None,
+            Some(skip_dir("d", vec![skip_file("a", 1), skip_file("..", 3)])),
+        ]
+    );
+    assert_eq!(retain_files(candidates, &[]), vec![None, None, None]);
+}
+
+#[test]
+fn new_packets_keep_their_wire_format() {
+    let json = |p: &ReceiverToSender| serde_json::to_string(p).unwrap();
+    assert_eq!(json(&ReceiverToSender::Done), r#"{"type":"Done"}"#);
+    assert_eq!(
+        json(&ReceiverToSender::ResumeCandidates {
+            files: vec![Some(skip_file("a", 4)), None]
+        }),
+        r#"{"type":"ResumeCandidates","files":[{"type":"File","name":"a","skip":4},null]}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&SenderToReceiver::PrefixHashes {
+            hashes: vec![Some("00ff".into()), None]
+        })
+        .unwrap(),
+        r#"{"type":"PrefixHashes","hashes":["00ff",null]}"#
     );
 }

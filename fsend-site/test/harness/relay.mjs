@@ -5,6 +5,7 @@
  */
 
 const sessions = new Map(); // code -> { sender, receiver, capabilities }
+const sockets = new Set();
 let codeCounter = 0;
 
 function nextCode() {
@@ -29,6 +30,7 @@ class FakeWebSocket {
     this.onclose = null;
     this._session = null;
     this._role = null;
+    sockets.add(this);
     setTimeout(() => {
       if (this.readyState !== 0) return;
       this.readyState = 1;
@@ -44,6 +46,7 @@ class FakeWebSocket {
   }
 
   send(raw) {
+    if (this.readyState !== 1) return;
     const msg = JSON.parse(raw);
 
     if (msg.type === "create_session") {
@@ -91,9 +94,18 @@ class FakeWebSocket {
   }
 
   close() {
+    if (this.readyState === 3) return;
     this.readyState = 3;
-    this.onclose?.({});
+    sockets.delete(this);
+    // Like the relay: a sender that leaves takes its session with it.
+    if (this._role === "sender") sessions.delete(this._session);
+    setTimeout(() => this.onclose?.({}), 0);
   }
+}
+
+/** Hangs up on every client without a word, as an idle proxy does. */
+export function dropRelayConnections() {
+  for (const socket of [...sockets]) socket.close();
 }
 
 export function installRelay(globals) {
@@ -102,5 +114,6 @@ export function installRelay(globals) {
 
 export function resetRelay() {
   sessions.clear();
+  sockets.clear();
   codeCounter = 0;
 }

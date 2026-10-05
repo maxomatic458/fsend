@@ -642,6 +642,175 @@ pub mod suite {
         assert_eq!(std::fs::read(f.out.join("movie.bin")).unwrap(), data);
     }
 
+    pub async fn resume_restarts_files_that_differ_locally(pair: PairFn) {
+        let f = fixture();
+        let album = sample_tree(&f.src);
+        write(&f.out.join("album/a.txt"), &bytes(10_000, 1)[..4_000]);
+        write(&f.out.join("album/nested/b.txt"), &bytes(30_000, 9));
+
+        let o = run(
+            pair().await,
+            vec![album],
+            &f.out,
+            RunOptions {
+                resume: true,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        o.unwrap();
+        assert_eq!(snapshot(&f.out), snapshot(&f.src));
+        assert_eq!(o.sent, 6_000 + 70_000 + 3);
+    }
+
+    pub async fn resume_resends_a_same_size_file_that_differs(pair: PairFn) {
+        let f = fixture();
+        let data = bytes(50_000, 4);
+        write(&f.src.join("done.bin"), &data);
+        write(&f.out.join("done.bin"), &bytes(50_000, 5));
+
+        let o = run(
+            pair().await,
+            vec![f.src.join("done.bin")],
+            &f.out,
+            RunOptions {
+                resume: true,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        o.unwrap();
+        assert_eq!(std::fs::read(f.out.join("done.bin")).unwrap(), data);
+        assert_eq!(o.sent, 50_000);
+    }
+
+    pub async fn sender_fails_when_the_receiver_cannot_store_the_files(pair: PairFn) {
+        let f = fixture();
+        write(&f.src.join("photo.jpg"), &bytes(1_000, 1));
+        std::fs::create_dir_all(f.out.join("photo.jpg")).unwrap();
+
+        let o = run(
+            pair().await,
+            vec![f.src.join("photo.jpg")],
+            &f.out,
+            RunOptions::default(),
+        )
+        .await;
+
+        assert!(o.recv.is_err(), "{:?}", o.recv);
+        assert!(o.send.is_err(), "the sender reported success");
+    }
+
+    /// Offers `files` from a hand-rolled sender, streaming `data` if accepted.
+    /// Returns the receiver's answer, its result and whether it prompted.
+    async fn offer_raw(
+        pair: PairFn,
+        files: Vec<FilesAvailable>,
+        data: &[u8],
+        out: &Path,
+    ) -> (ReceiverToSender, Result<(), TransferError>, bool) {
+        let Peers {
+            mut sender,
+            mut receiver,
+            ..
+        } = pair().await;
+        let peer = async {
+            let mut control = frame(sender.control().await.unwrap());
+            send_packet(
+                &mut control,
+                &SenderToReceiver::ConnRequest {
+                    version: PROTO_VERSION.into(),
+                },
+            )
+            .await
+            .unwrap();
+            let _: ReceiverToSender = recv_packet(&mut control).await.unwrap();
+            send_packet(&mut control, &SenderToReceiver::FileInfo { files })
+                .await
+                .unwrap();
+            let reply: ReceiverToSender = recv_packet(&mut control).await.unwrap();
+            if matches!(reply, ReceiverToSender::AcceptFilesSkip { .. }) {
+                let mut stream = sender.data().await.unwrap();
+                stream.write_all(data).await.unwrap();
+                stream.shutdown().await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(5), sender.closed()).await;
+            }
+            drop(control);
+            sender.close(false).await;
+            reply
+        };
+
+        let mut prompted = false;
+        let mut offer = |_: &[FilesAvailable]| {
+            prompted = true;
+            Some(out.to_path_buf())
+        };
+        let (mut progress, mut read) = (no_progress, no_data);
+        let receive = receive_files(
+            receiver.as_mut(),
+            ReceiveArgs { resume: false },
+            &mut progress,
+            &mut offer,
+            &mut read,
+        );
+        let (reply, result) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(peer, receive)
+        })
+        .await
+        .expect("the offer hung");
+        (reply, result, prompted)
+    }
+
+    fn file(name: &str, size: u64) -> FilesAvailable {
+        FilesAvailable::File {
+            name: name.into(),
+            size,
+        }
+    }
+
+    pub async fn refuses_names_that_escape_the_output_dir(pair: PairFn) {
+        let f = fixture();
+        let escaped = f.out.parent().unwrap().join("escaped.txt");
+        let absolute = f.src.join("absolute.txt");
+        let offer = vec![FilesAvailable::Dir {
+            name: "photos".into(),
+            files: vec![
+                file("../../escaped.txt", 4),
+                file(absolute.to_str().unwrap(), 4),
+            ],
+        }];
+
+        let (reply, result, _) = offer_raw(pair, offer, b"evilevil", &f.out).await;
+
+        assert!(!escaped.exists(), "wrote outside the output directory");
+        assert!(!absolute.exists(), "wrote to an absolute path");
+        assert_eq!(reply, ReceiverToSender::RejectFiles);
+        assert!(
+            matches!(result, Err(TransferError::InvalidOffer(_))),
+            "{result:?}"
+        );
+    }
+
+    pub async fn refuses_offers_that_would_spoof_the_prompt(pair: PairFn) {
+        let offers = [
+            vec![file("\x1b[1A\x1b[2Kreport.pdf", 1)],
+            vec![file("invoice\u{202E}fdp.exe", 1)],
+            vec![file("a", u64::MAX), file("b", 2)],
+        ];
+        for offer in offers {
+            let f = fixture();
+            let (reply, result, prompted) = offer_raw(pair, offer, b"x", &f.out).await;
+            assert!(!prompted, "the prompt must not show a spoofed offer");
+            assert_eq!(reply, ReceiverToSender::RejectFiles);
+            assert!(
+                matches!(result, Err(TransferError::InvalidOffer(_))),
+                "{result:?}"
+            );
+        }
+    }
+
     pub async fn a_missing_file_fails_the_transfer(pair: PairFn) {
         let f = fixture();
 

@@ -13,13 +13,18 @@ export type FileSendRecvTree =
 // Control channel messages
 export type SenderToReceiver =
   | { type: "ConnRequest"; version: string }
-  | { type: "FileInfo"; files: FilesAvailable[] };
+  | { type: "FileInfo"; files: FilesAvailable[] }
+  /// The sender's hash of each resume candidate, in tree order.
+  | { type: "PrefixHashes"; hashes: (string | null)[] };
 
 export type ReceiverToSender =
   | { type: "Ok" }
   | { type: "WrongVersion"; expected: string }
+  | { type: "ResumeCandidates"; files: (FilesToSkip | null)[] }
   | { type: "AcceptFilesSkip"; files: (FilesToSkip | null)[] }
-  | { type: "RejectFiles" };
+  | { type: "RejectFiles" }
+  /// Every file is stored.
+  | { type: "Done" };
 
 // Relay protocol messages
 export type ClientMessage =

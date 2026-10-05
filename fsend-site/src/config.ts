@@ -8,8 +8,11 @@ export const STUN_SERVERS = [
 
 export const ICE_GATHERING_TIMEOUT_MS = 5_000;
 export const CONNECT_TIMEOUT_MS = 30_000;
-export const PROTO_VERSION = "3";
-export const MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
+/// How long the peer gets to read our last message before we hang up.
+export const GOODBYE_TIMEOUT_MS = 5_000;
+export const PROTO_VERSION = "4";
+/// Largest data channel message every peer accepts.
+export const MAX_MESSAGE_BYTES = 16 * 1024;
 export const FRAME_HEADER_BYTES = 4;
 export const DATA_CHUNK_BYTES = 16383;
 export const MAX_BUFFERED_BYTES = 1_048_576;

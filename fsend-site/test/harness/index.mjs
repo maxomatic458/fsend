@@ -3,11 +3,11 @@
  * are written against.
  */
 import { installWebRtc, resetWebRtc } from "./webrtc.mjs";
-import { installRelay, resetRelay } from "./relay.mjs";
+import { installRelay, resetRelay, dropRelayConnections } from "./relay.mjs";
 import { installDom, resetDom, getDownloads } from "./dom.mjs";
 import { MemoryDirectoryHandle } from "./fs-access.mjs";
 
-export { MemoryDirectoryHandle, getDownloads };
+export { MemoryDirectoryHandle, getDownloads, dropRelayConnections };
 
 let peerConnections = [];
 
@@ -204,3 +204,13 @@ export function waitFor(
 }
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Rejects if `promise` has not settled after `ms`. */
+export function within(promise, ms, label = "operation") {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} hung`)), ms);
+    timer.unref?.();
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}

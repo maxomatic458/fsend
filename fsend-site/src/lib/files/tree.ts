@@ -102,12 +102,17 @@ export function entrySizeBytes(entry: FilesAvailable): number {
   return totalSizeBytes(entry.files);
 }
 
+export interface FlatFile {
+  path: string;
+  skipBytes: number;
+  sizeBytes: number;
+}
+
 export function flattenTree(
   trees: FileSendRecvTree[],
   prefix = "",
-): Array<{ path: string; skipBytes: number; sizeBytes: number }> {
-  const result: Array<{ path: string; skipBytes: number; sizeBytes: number }> =
-    [];
+): FlatFile[] {
+  const result: FlatFile[] = [];
   for (const tree of trees) {
     const path = prefix ? `${prefix}/${tree.name}` : tree.name;
     if (tree.type === "File") {
@@ -173,4 +178,62 @@ export function toSendRecvTree(available: FilesAvailable): FileSendRecvTree {
     name: available.name,
     files: available.files.map(toSendRecvTree),
   };
+}
+
+const UNSAFE_CHARS = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/;
+
+/** Whether `name` is a single plain path component that displays as written. */
+export function isSafeName(name: string): boolean {
+  return (
+    name !== "" &&
+    name !== "." &&
+    name !== ".." &&
+    !/[/\\]/.test(name) &&
+    !UNSAFE_CHARS.test(name)
+  );
+}
+
+export function isSafeOffer(files: FilesAvailable[]): boolean {
+  return files.every(
+    (f) => isSafeName(f.name) && (f.type === "File" || isSafeOffer(f.files)),
+  );
+}
+
+/**
+ * Every file in `candidates` as its path and skip, in tree order. `root` maps a
+ * top-level entry to its path; anything that does not resolve is null.
+ */
+export function candidateFiles(
+  candidates: (FilesToSkip | null)[],
+  root: (index: number, name: string) => string | null,
+): { path: string | null; skip: number }[] {
+  const out: { path: string | null; skip: number }[] = [];
+  const walk = (node: FilesToSkip, path: string | null) => {
+    if (node.type === "File") {
+      out.push({ path, skip: node.skip });
+      return;
+    }
+    for (const child of node.files) {
+      const safe = path !== null && isSafeName(child.name);
+      walk(child, safe ? `${path}/${child.name}` : null);
+    }
+  };
+  candidates.forEach((c, i) => c && walk(c, root(i, c.name)));
+  return out;
+}
+
+/** Keeps the candidate files whose flag in `keep` (in tree order) is set. */
+export function retainFiles(
+  candidates: (FilesToSkip | null)[],
+  keep: boolean[],
+): (FilesToSkip | null)[] {
+  let next = 0;
+  const walk = (node: FilesToSkip): FilesToSkip | null => {
+    if (node.type === "File") return keep[next++] ? node : null;
+    const files = node.files
+      .map((child) => walk(child))
+      .filter((child) => child !== null);
+    return files.length > 0 ? { ...node, files } : null;
+  };
+  return candidates.map((c) => c && walk(c));
 }

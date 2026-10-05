@@ -106,11 +106,13 @@ export function applyAnswer(
 export function waitConnected(
   pc: RTCPeerConnection,
   channels: RTCDataChannel[],
+  abort: AbortSignal,
   timeoutMs = CONNECT_TIMEOUT_MS,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const cleanup = () => {
       clearTimeout(timer);
+      abort.removeEventListener("abort", onAbort);
       pc.removeEventListener("connectionstatechange", onState);
       for (const ch of channels) ch.removeEventListener("open", check);
     };
@@ -130,6 +132,10 @@ export function waitConnected(
       }
     }
 
+    function onAbort() {
+      settle(new Error("Aborted"));
+    }
+
     function onState() {
       if (pc.connectionState === "failed") {
         settle(new Error("WebRTC connection failed"));
@@ -143,11 +149,16 @@ export function waitConnected(
       timeoutMs,
     );
 
+    if (abort.aborted) {
+      onAbort();
+      return;
+    }
     if (pc.connectionState === "failed") {
       settle(new Error("WebRTC connection failed"));
       return;
     }
 
+    abort.addEventListener("abort", onAbort);
     pc.addEventListener("connectionstatechange", onState);
     for (const ch of channels) ch.addEventListener("open", check);
 

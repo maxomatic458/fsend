@@ -1,28 +1,35 @@
+import { onAbort } from "../abort";
 import type { ClientMessage, ServerMessage, ConnectionInfo } from "../types";
 
 export class RelayClient {
-  private ws: WebSocket;
   private queue: ServerMessage[] = [];
   private waiters: Array<(msg: ServerMessage) => void> = [];
+  private fail: (err: Error) => void = () => {};
+  /** Rejects once the connection is gone. */
+  private readonly lost: Promise<never>;
 
-  private constructor(ws: WebSocket) {
-    this.ws = ws;
+  private constructor(private readonly ws: WebSocket) {
+    this.lost = new Promise<never>((_, reject) => (this.fail = reject));
+    this.lost.catch(() => {});
     ws.onmessage = (ev) => {
       const msg: ServerMessage = JSON.parse(ev.data);
-      if (this.waiters.length > 0) {
-        this.waiters.shift()!(msg);
-      } else {
-        this.queue.push(msg);
-      }
+      const waiter = this.waiters.shift();
+      if (waiter) waiter(msg);
+      else this.queue.push(msg);
     };
+    ws.onclose = () => this.fail(new Error("Lost the connection to the relay"));
   }
 
-  static connect(url: string): Promise<RelayClient> {
-    return new Promise((resolve, reject) => {
-      const ws = new WebSocket(url);
-      ws.onopen = () => resolve(new RelayClient(ws));
-      ws.onerror = () => reject(new Error("Failed to connect to relay"));
+  /** Connects to the relay; aborting closes the connection. */
+  static async connect(url: string, abort: AbortSignal): Promise<RelayClient> {
+    const relay = new RelayClient(new WebSocket(url));
+    const opened = new Promise<void>((resolve, reject) => {
+      relay.ws.onopen = () => resolve();
+      relay.ws.onerror = () => reject(new Error("Failed to connect to relay"));
     });
+    onAbort(abort, () => relay.close());
+    await Promise.race([opened, relay.lost]);
+    return relay;
   }
 
   private send(msg: ClientMessage): void {
@@ -30,12 +37,12 @@ export class RelayClient {
   }
 
   private recv(): Promise<ServerMessage> {
-    if (this.queue.length > 0) {
-      return Promise.resolve(this.queue.shift()!);
-    }
-    return new Promise((resolve) => {
+    const queued = this.queue.shift();
+    if (queued) return Promise.resolve(queued);
+    const next = new Promise<ServerMessage>((resolve) => {
       this.waiters.push(resolve);
     });
+    return Promise.race([next, this.lost]);
   }
 
   async createSession(): Promise<string> {
@@ -73,5 +80,6 @@ export class RelayClient {
 
   close(): void {
     this.ws.close();
+    this.fail(new Error("Closed the connection to the relay"));
   }
 }

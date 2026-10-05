@@ -117,6 +117,26 @@ async fn interrupted_by_the_sender_then_resumed() {
     suite::interrupted_by_the_sender_then_resumed(pair).await
 }
 #[tokio::test]
+async fn resume_restarts_files_that_differ_locally() {
+    suite::resume_restarts_files_that_differ_locally(pair).await
+}
+#[tokio::test]
+async fn resume_resends_a_same_size_file_that_differs() {
+    suite::resume_resends_a_same_size_file_that_differs(pair).await
+}
+#[tokio::test]
+async fn sender_fails_when_the_receiver_cannot_store_the_files() {
+    suite::sender_fails_when_the_receiver_cannot_store_the_files(pair).await
+}
+#[tokio::test]
+async fn refuses_names_that_escape_the_output_dir() {
+    suite::refuses_names_that_escape_the_output_dir(pair).await
+}
+#[tokio::test]
+async fn refuses_offers_that_would_spoof_the_prompt() {
+    suite::refuses_offers_that_would_spoof_the_prompt(pair).await
+}
+#[tokio::test]
 async fn a_missing_file_fails_the_transfer() {
     suite::a_missing_file_fails_the_transfer(pair).await
 }

@@ -3,19 +3,23 @@ import {
   DATA_CHUNK_BYTES,
   MAX_BUFFERED_BYTES,
 } from "../../config";
-import { openSenderSession } from "../transport/session";
+import { openSenderSession, type SenderSession } from "../transport/session";
 import { getConnectionType } from "../transport/webrtc";
 import {
   buildFileTree,
+  candidateFiles,
   flattenTree,
   applySkip,
   treeSizeBytes,
   treeSkipBytes,
 } from "../files/tree";
 import { collectFiles } from "../files/source";
+import { prefixHash } from "../files/hash";
 import type { TransferListener } from "./events";
 import type {
   SelectedEntry,
+  FilesAvailable,
+  FilesToSkip,
   FileSendRecvTree,
   SenderToReceiver,
 } from "../types";
@@ -25,7 +29,7 @@ export async function runSend(
   emit: TransferListener,
   abort: AbortSignal,
 ): Promise<void> {
-  let session: Awaited<ReturnType<typeof openSenderSession>> = null;
+  let session: SenderSession | null = null;
 
   try {
     const fileTree = await buildFileTree(entries);
@@ -36,7 +40,6 @@ export async function runSend(
       onWaitingPeer: () => emit({ type: "waitingPeer" }),
       onHandshaking: () => emit({ type: "handshaking" }),
     });
-    if (!session) return;
     const { control, dataChannel, peer, disconnected } = session;
 
     // cosmetic: fetched in the background, ignored if it fails.
@@ -65,7 +68,12 @@ export async function runSend(
     } as SenderToReceiver);
     emit({ type: "waitingAccept" });
 
-    const answer = await control.next();
+    let answer = await control.next();
+    if (answer.type === "ResumeCandidates") {
+      const hashes = await prefixHashes(fileTree, files, answer.files);
+      await control.send({ type: "PrefixHashes", hashes });
+      answer = await control.next();
+    }
     if (answer.type === "RejectFiles") {
       throw new Error("Receiver rejected the files");
     }
@@ -118,8 +126,9 @@ export async function runSend(
       }
     }
 
-    // The receiver closes once it has consumed everything.
-    await disconnected.catch(() => {});
+    if ((await control.next()).type !== "Done") {
+      throw new Error("Unexpected response");
+    }
     emit({ type: "complete" });
   } catch (err: any) {
     if (!abort.aborted) {
@@ -128,4 +137,20 @@ export async function runSend(
   } finally {
     session?.close();
   }
+}
+
+/// Our hash of each resume candidate's prefix, in tree order.
+async function prefixHashes(
+  offered: FilesAvailable[],
+  files: Map<string, File>,
+  candidates: (FilesToSkip | null)[],
+): Promise<(string | null)[]> {
+  const root = (i: number, name: string) =>
+    offered[i]?.name === name ? name : null;
+  const hashes: (string | null)[] = [];
+  for (const { path, skip } of candidateFiles(candidates, root)) {
+    const file = path === null ? undefined : files.get(path);
+    hashes.push(file ? await prefixHash(file, skip) : null);
+  }
+  return hashes;
 }

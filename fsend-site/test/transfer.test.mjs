@@ -12,6 +12,8 @@ import {
   bytes,
   waitFor,
   sleep,
+  within,
+  dropRelayConnections,
 } from "./harness/index.mjs";
 
 const { runSend, runReceive, createDiskSink, createDownloadSink } =
@@ -24,19 +26,20 @@ beforeEach(() => {
 });
 afterEach(() => resetBrowserEnv());
 
+/** Byte equality, without asking assert to diff megabytes on failure. */
+function assertBytes(actual, expected, message = "contents differ") {
+  assert.ok(
+    actual && Buffer.from(actual).equals(Buffer.from(expected)),
+    `${message} (${actual?.length ?? "missing"} vs ${expected.length} bytes)`,
+  );
+}
+
 /** Assert two snapshots have identical paths and bytes. */
 function assertFiles(actual, expected) {
-  assert.deepEqual(
-    Object.keys(actual).sort(),
-    Object.keys(expected).sort(),
-    "file paths differ",
-  );
+  const paths = (snapshot) => Object.keys(snapshot).sort().join("\n");
+  assert.ok(paths(actual) === paths(expected), "file paths differ");
   for (const path of Object.keys(expected)) {
-    assert.deepEqual(
-      Array.from(actual[path]),
-      Array.from(expected[path]),
-      `contents differ for ${path}`,
-    );
+    assertBytes(actual[path], expected[path], `contents differ for ${path}`);
   }
 }
 
@@ -64,9 +67,28 @@ async function transfer(spec, { mode = "file", resume = false, dir } = {}) {
     new AbortController().signal,
   );
 
-  await Promise.all([senderDone, receiverDone]);
+  await within(Promise.all([senderDone, receiverDone]), 20_000, "transfer");
   return { dirHandle, send: send.record, recv: recv.record };
 }
+
+/** Starts a sender and resolves once it has a share code. */
+async function startSender(spec, signal = new AbortController().signal) {
+  const send = makeRecorder();
+  const done = runSend(makeEntries(spec), send.emit, signal);
+  const code = await waitFor(() => send.record.code, { label: "share code" });
+  return { send: send.record, done, code };
+}
+
+async function writeFile(dir, name, data) {
+  const writable = await (
+    await dir.getFileHandle(name, { create: true })
+  ).createWritable();
+  await writable.write(data);
+  await writable.close();
+}
+
+const hex = (data) =>
+  Array.from(data, (b) => b.toString(16).padStart(2, "0")).join("");
 
 describe("complete transfers (File System Access API)", () => {
   test("a single file arrives byte-for-byte", async () => {
@@ -158,7 +180,7 @@ describe("complete transfers (fallback, no File System Access API)", () => {
     assert.equal(downloads.length, 1);
     assert.equal(downloads[0].name, "report.pdf");
     const got = new Uint8Array(await downloads[0].blob.arrayBuffer());
-    assert.deepEqual(Array.from(got), Array.from(spec["report.pdf"]));
+    assertBytes(got, spec["report.pdf"]);
   });
 
   test("a folder is delivered as a zip", async () => {
@@ -346,11 +368,7 @@ describe("interrupted transfers", () => {
     const senderDone = runSend(makeEntries(spec), send.emit, controller.signal);
     await waitFor(() => send.record.code, { label: "share code" });
     controller.abort();
-    // No peer ever arrives, so the sender stays parked in waitForPeer and its
-    // promise never settles — the page would simply unmount. What matters is
-    // that the user is shown nothing.
-    void senderDone;
-    await sleep(50);
+    await within(senderDone, 2000, "aborted sender");
 
     assert.equal(
       send.record.error,
@@ -398,9 +416,9 @@ describe("resuming an interrupted download", () => {
     const partial = dirHandle.snapshot()["movie.bin"];
     assert.ok(partial.length > 0, "partial data should be on disk");
     assert.ok(partial.length < payload.length, "should not be complete yet");
-    assert.deepEqual(
-      Array.from(partial),
-      Array.from(payload.subarray(0, partial.length)),
+    assertBytes(
+      partial,
+      payload.subarray(0, partial.length),
       "the partial prefix must match the source",
     );
 
@@ -460,5 +478,185 @@ describe("relay behaviour", () => {
     const { recv, send } = await transfer({ "x.bin": bytes(100, 131) });
     assert.equal(send.error, null);
     assert.equal(recv.error, null);
+  });
+});
+
+describe("resume only trusts matching data", () => {
+  test("a local file with other contents is downloaded again", async () => {
+    const spec = { "movie.bin": bytes(500_000, 1) };
+    const dir = new MemoryDirectoryHandle();
+    await writeFile(dir, "movie.bin", bytes(200_000, 2));
+
+    const { send, recv } = await transfer(spec, { resume: true, dir });
+
+    assert.equal(send.error, null);
+    assert.equal(recv.error, null);
+    assertFiles(dir.snapshot(), expectedSnapshot(spec));
+    assert.equal(send.progress, 500_000);
+  });
+
+  test("a local file larger than the offer is replaced", async () => {
+    const spec = { "notes.txt": bytes(1000, 3) };
+    const dir = new MemoryDirectoryHandle();
+    await writeFile(dir, "notes.txt", bytes(3000, 4));
+
+    const { recv } = await transfer(spec, { resume: true, dir });
+
+    assert.equal(recv.error, null);
+    assertFiles(dir.snapshot(), expectedSnapshot(spec));
+  });
+});
+
+describe("relay connection", () => {
+  test("a sender whose relay connection drops is told so", async () => {
+    const { send, done } = await startSender({ "a.bin": bytes(10, 1) });
+    dropRelayConnections();
+
+    await within(done, 2000, "sender");
+    assert.match(send.error ?? "", /relay/i);
+  });
+
+  test("cancelling the sender frees its share code", async () => {
+    const controller = new AbortController();
+    const { send, code } = await startSender(
+      { "a.bin": bytes(10, 1) },
+      controller.signal,
+    );
+    controller.abort();
+    await sleep(10);
+
+    const recv = makeRecorder();
+    const done = runReceive(
+      code,
+      createDiskSink(new MemoryDirectoryHandle()),
+      false,
+      recv.emit,
+      new AbortController().signal,
+    );
+    await within(done, 2000, "receiver");
+    assert.match(recv.record.error ?? "", /unknown session/);
+    assert.equal(send.error, null);
+  });
+
+  test("cancelling a receiver that is still connecting settles", async () => {
+    // A sender that creates a session and then never answers.
+    const stalled = new WebSocket("wss://relay.test/ws");
+    await new Promise((resolve) => (stalled.onopen = resolve));
+    const code = await new Promise((resolve) => {
+      stalled.onmessage = (ev) => resolve(JSON.parse(ev.data).code);
+      stalled.send(
+        JSON.stringify({ type: "create_session", capabilities: ["web_rtc"] }),
+      );
+    });
+
+    const recv = makeRecorder();
+    const controller = new AbortController();
+    const done = runReceive(
+      code,
+      createDiskSink(new MemoryDirectoryHandle()),
+      false,
+      recv.emit,
+      controller.signal,
+    );
+    await sleep(20);
+    controller.abort();
+
+    await within(done, 2000, "receiver");
+    assert.equal(recv.record.error, null);
+  });
+});
+
+describe("large and hostile offers", () => {
+  test("a folder with thousands of files can be offered", async () => {
+    const folder = {};
+    for (let i = 0; i < 10_000; i++) {
+      folder[`${hex(bytes(8, i + 1))}.bin`] = bytes(0);
+    }
+    const spec = { photos: folder };
+
+    const { dirHandle, send, recv } = await transfer(spec);
+
+    assert.equal(send.error, null);
+    assert.equal(recv.error, null);
+    assertFiles(dirHandle.snapshot(), expectedSnapshot(spec));
+  });
+
+  test("the receiver refuses names that are not plain file names", async () => {
+    const specs = [
+      { "../escape.txt": bytes(10, 1), "b.txt": bytes(10, 2) },
+      { "\u001b[2Jreport.pdf": bytes(10, 3) },
+    ];
+    for (const spec of specs) {
+      const { send, done } = await startSender(spec);
+      const recv = makeRecorder();
+      const received = runReceive(
+        send.code,
+        createDownloadSink(),
+        false,
+        recv.emit,
+        new AbortController().signal,
+      );
+      await within(Promise.all([done, received]), 5000, "transfer");
+
+      assert.equal(recv.record.offered, null, "the offer must not be shown");
+      assert.ok(recv.record.error);
+      assert.match(send.error ?? "", /reject/i);
+      assert.equal(getDownloads().length, 0);
+    }
+  });
+});
+
+describe("cancelling and failing", () => {
+  test("cancelling a download keeps what has arrived", async () => {
+    const payload = bytes(2_000_000, 7);
+    const dir = new MemoryDirectoryHandle();
+    const { send, done: sent } = await startSender({ "movie.bin": payload });
+    void sent;
+
+    const recv = makeRecorder();
+    const controller = new AbortController();
+    const done = runReceive(
+      send.code,
+      createDiskSink(dir),
+      false,
+      recv.emit,
+      controller.signal,
+    );
+    await waitFor(() => recv.record.progress > 200_000, {
+      label: "partial download",
+    });
+    controller.abort();
+
+    await within(done, 2000, "cancelled receiver");
+    const partial = dir.snapshot()["movie.bin"];
+    assert.ok(partial?.length > 0, "what arrived must be on disk");
+    assert.ok(partial.length < payload.length, "cancelling must stop it");
+    assertBytes(partial, payload.subarray(0, partial.length));
+    assert.equal(recv.record.error, null);
+    assert.equal(recv.record.complete, false);
+  });
+
+  test("the sender does not report success when the receiver fails to save", async () => {
+    const sink = createDiskSink(new MemoryDirectoryHandle());
+    const failing = {
+      ...sink,
+      write: async () => {
+        throw new Error("disk full");
+      },
+    };
+    const { send, done } = await startSender({ "a.bin": bytes(1000, 1) });
+    const recv = makeRecorder();
+    const received = runReceive(
+      send.code,
+      failing,
+      false,
+      recv.emit,
+      new AbortController().signal,
+    );
+    await within(Promise.all([done, received]), 5000, "transfer");
+
+    assert.match(recv.record.error ?? "", /disk full/);
+    assert.equal(send.complete, false, "the sender reported success");
+    assert.ok(send.error);
   });
 });
