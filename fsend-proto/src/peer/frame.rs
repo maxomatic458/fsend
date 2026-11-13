@@ -1,6 +1,7 @@
-use std::{borrow::Cow, io::Read};
+use std::{borrow::Cow, cell::RefCell, io::Read};
 
 use thiserror::Error;
+use zstd::bulk::Compressor;
 
 use super::{
     Message,
@@ -8,8 +9,12 @@ use super::{
 };
 
 const HEADER_BYTES: usize = 4;
-const ZSTD: u8 = 1;
+pub(super) const ZSTD: u8 = 1;
 const ZSTD_LEVEL: i32 = 1;
+
+thread_local! {
+    static COMPRESSOR: RefCell<Option<Compressor<'static>>> = const { RefCell::new(None) };
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum FrameError {
@@ -33,37 +38,75 @@ pub fn encode(message: &impl Message) -> Result<Vec<u8>, FrameError> {
     if json.len() > MAX_MESSAGE_BYTES {
         return Err(FrameError::MessageTooLarge);
     }
-    let (flags, payload) = if json.len() > COMPRESS_ABOVE {
-        let compressed =
-            zstd::bulk::compress(&json, ZSTD_LEVEL).map_err(|_| FrameError::Compression)?;
-        (ZSTD, compressed)
-    } else {
-        (0, json)
+    let frame = match (json.len() > COMPRESS_ABOVE)
+        .then(|| compress(&json))
+        .flatten()
+    {
+        Some(compressed) if compressed.len() < json.len() => frame(ZSTD, &[&compressed]),
+        _ => frame(0, &[&json]),
     };
-    let len = payload.len() + 1;
-    if len > MAX_FRAME_BYTES {
-        return Err(FrameError::TooLarge(len));
+    if frame.len() - HEADER_BYTES > MAX_FRAME_BYTES {
+        return Err(FrameError::TooLarge(frame.len() - HEADER_BYTES));
     }
-    let mut frame = Vec::with_capacity(HEADER_BYTES + len);
-    frame.extend_from_slice(&(len as u32).to_be_bytes());
-    frame.push(flags);
-    frame.extend_from_slice(&payload);
     Ok(frame)
 }
 
-/// Reassembles messages from control stream bytes split anywhere.
-#[derive(Debug, Default)]
-pub struct FrameDecoder {
-    buffer: Vec<u8>,
+/// `payload` at zstd level 1, with a compressor kept per thread.
+pub(super) fn compress(payload: &[u8]) -> Option<Vec<u8>> {
+    COMPRESSOR.with_borrow_mut(|compressor| {
+        if compressor.is_none() {
+            *compressor = Compressor::new(ZSTD_LEVEL).ok();
+        }
+        compressor.as_mut()?.compress(payload).ok()
+    })
 }
 
-impl FrameDecoder {
-    pub fn push(&mut self, data: &[u8]) {
+/// A frame of `flags` and the `payload` parts, joined.
+pub(super) fn frame(flags: u8, payload: &[&[u8]]) -> Vec<u8> {
+    let len = payload.iter().map(|part| part.len()).sum::<usize>() + 1;
+    let mut frame = Vec::with_capacity(HEADER_BYTES + len);
+    frame.extend_from_slice(&(len as u32).to_be_bytes());
+    frame.push(flags);
+    for part in payload {
+        frame.extend_from_slice(part);
+    }
+    frame
+}
+
+/// Splits frames of at most `max_len` bytes off a stream split anywhere.
+#[derive(Debug)]
+pub(super) struct Deframer {
+    buffer: Vec<u8>,
+    max_len: usize,
+}
+
+impl Deframer {
+    pub(super) fn new(max_len: usize) -> Self {
+        Self {
+            buffer: Vec::new(),
+            max_len,
+        }
+    }
+
+    pub(super) fn push(&mut self, data: &[u8]) {
         self.buffer.extend_from_slice(data);
     }
 
-    /// The next complete message; after an error the stream is unusable.
-    pub fn next_message<M: Message>(&mut self) -> Result<Option<M>, FrameError> {
+    /// Whether no partial frame is buffered.
+    pub(super) fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    /// The length of the first buffered frame, once its header is in, and its bytes so far.
+    pub(super) fn first(&self) -> Option<(usize, &[u8])> {
+        let header = self.buffer.first_chunk::<HEADER_BYTES>()?;
+        let len = u32::from_be_bytes(*header) as usize;
+        let end = self.buffer.len().min(HEADER_BYTES + len);
+        Some((len, &self.buffer[HEADER_BYTES..end]))
+    }
+
+    /// The flags and payload of the next complete frame.
+    pub(super) fn next(&mut self) -> Result<Option<(u8, Vec<u8>)>, FrameError> {
         let Some(header) = self.buffer.first_chunk::<HEADER_BYTES>() else {
             return Ok(None);
         };
@@ -71,20 +114,43 @@ impl FrameDecoder {
         if len == 0 {
             return Err(FrameError::Empty);
         }
-        if len > MAX_FRAME_BYTES {
+        if len > self.max_len {
             return Err(FrameError::TooLarge(len));
         }
-        let Some(frame) = self.buffer.get(HEADER_BYTES..HEADER_BYTES + len) else {
+        let Some(frame) = self.buffer.get(HEADER_BYTES + 1..HEADER_BYTES + len) else {
             return Ok(None);
         };
-        let message = decode(frame);
+        let next = (self.buffer[HEADER_BYTES], frame.to_vec());
         self.buffer.drain(..HEADER_BYTES + len);
-        message.map(Some)
+        Ok(Some(next))
     }
 }
 
-fn decode<M: Message>(frame: &[u8]) -> Result<M, FrameError> {
-    let (&flags, payload) = frame.split_first().ok_or(FrameError::Empty)?;
+/// Reassembles messages from control stream bytes split anywhere.
+#[derive(Debug)]
+pub struct FrameDecoder(Deframer);
+
+impl Default for FrameDecoder {
+    fn default() -> Self {
+        Self(Deframer::new(MAX_FRAME_BYTES))
+    }
+}
+
+impl FrameDecoder {
+    pub fn push(&mut self, data: &[u8]) {
+        self.0.push(data);
+    }
+
+    /// The next complete message; after an error the stream is unusable.
+    pub fn next_message<M: Message>(&mut self) -> Result<Option<M>, FrameError> {
+        match self.0.next()? {
+            Some((flags, payload)) => decode(flags, &payload).map(Some),
+            None => Ok(None),
+        }
+    }
+}
+
+fn decode<M: Message>(flags: u8, payload: &[u8]) -> Result<M, FrameError> {
     let json = match flags {
         0 => Cow::Borrowed(payload),
         ZSTD => Cow::Owned(decompress(payload)?),

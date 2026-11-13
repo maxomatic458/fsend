@@ -154,6 +154,8 @@ export function makeRecorder({ onOffered } = {}) {
     code: null,
     states: [],
     progress: 0,
+    /// The largest progress step.
+    largestStep: 0,
     complete: false,
     error: null,
     offered: null,
@@ -181,6 +183,7 @@ export function makeRecorder({ onOffered } = {}) {
         break;
       case "progress":
         record.progress += event.bytes;
+        record.largestStep = Math.max(record.largestStep, event.bytes);
         record.present[event.entry] += event.bytes;
         break;
       case "connectionType":

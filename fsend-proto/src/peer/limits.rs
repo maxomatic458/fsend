@@ -31,3 +31,6 @@ pub const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// For the peer to read our last message and hang up.
 pub const GOODBYE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// File bytes in a data stream block.
+pub const MAX_BLOCK_BYTES: usize = 1024 * 1024;

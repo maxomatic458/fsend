@@ -7,6 +7,8 @@ import {
   HELLO_TIMEOUT_MS,
   IDLE_TIMEOUT_MS,
   RECV_WINDOW,
+  BlockDecoder,
+  Progress,
   acceptPlan,
   filesToCheck,
   planReceive,
@@ -147,23 +149,52 @@ async function receive(
   let written = 0;
   let acked = 0;
   let ackedAt = performance.now();
-  // The rest of a chunk that ends one file and starts the next.
+  const decoder = new BlockDecoder();
+  // File bytes count as their blocks arrive, in proportion.
+  const progress = new Progress(entries, files, topOf);
+  let decoded = 0;
+  let arrived = 0;
+  const countArrived = () => {
+    const now = decoded + decoder.partial();
+    if (now <= arrived) return;
+    for (const [entry, n] of progress.advance(now - arrived)) {
+      emit({ type: "progress", entry, bytes: n });
+    }
+    arrived = now;
+  };
+  const nextBlock = async () => {
+    for (;;) {
+      let block;
+      try {
+        block = decoder.next();
+      } catch (err) {
+        throw protocolError(messageOf(err));
+      }
+      if (block) {
+        decoded += block.length;
+        countArrived();
+        return block;
+      }
+      const chunk = await peer.receive(IDLE_TIMEOUT_MS, SENDER_IDLE);
+      // The sender says nothing while it sends.
+      if (!(chunk instanceof Uint8Array)) throw unexpected(chunk);
+      decoder.push(chunk);
+      countArrived();
+    }
+  };
+  // The rest of a block that ends one file and starts the next.
   let pending: Uint8Array | undefined;
   for (const { id, offset } of files) {
     const entry = entries[id];
     const size = entrySize(entry);
     await sink.open(entry.path, offset);
     for (let position = offset; position < size;) {
-      const chunk =
-        pending ?? (await peer.receive(IDLE_TIMEOUT_MS, SENDER_IDLE));
-      // The sender says nothing while it sends.
-      if (!(chunk instanceof Uint8Array)) throw unexpected(chunk);
-      const n = Math.min(chunk.length, size - position);
-      await sink.write(chunk.subarray(0, n));
-      pending = n < chunk.length ? chunk.subarray(n) : undefined;
+      const block = pending ?? (await nextBlock());
+      const n = Math.min(block.length, size - position);
+      await sink.write(block.subarray(0, n));
+      pending = n < block.length ? block.subarray(n) : undefined;
       position += n;
       written += n;
-      emit({ type: "progress", entry: topOf[id], bytes: n });
       if (
         written - acked >= ACK_STEP ||
         performance.now() - ackedAt >= ACK_INTERVAL_MS
@@ -175,7 +206,9 @@ async function receive(
     }
     await sink.closeFile();
   }
-  if (pending) throw protocolError("the sender sent more bytes than accepted");
+  if (pending || !decoder.isEmpty()) {
+    throw protocolError("the sender sent more bytes than accepted");
+  }
 
   peer.send({ type: "done" });
   await peer.goodbye();

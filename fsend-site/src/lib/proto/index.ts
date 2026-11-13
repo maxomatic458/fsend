@@ -125,6 +125,55 @@ export class FrameDecoder<M extends PeerMessage> {
   }
 }
 
+/** A data stream block of `data`, 1 to `MAX_BLOCK_BYTES` file bytes, compressed if that helps. */
+export const encodeBlock = (data: Uint8Array): Uint8Array =>
+  wasm.encodeBlock(data, true);
+
+/** Reassembles the file bytes of blocks from data stream bytes split anywhere. */
+export class BlockDecoder {
+  private inner = new wasm.BlockDecoder();
+
+  push(data: Uint8Array): void {
+    this.inner.push(data);
+  }
+
+  /** Whether no partial block is buffered. */
+  isEmpty(): boolean {
+    return this.inner.isEmpty();
+  }
+
+  /** The file bytes of the first buffered block, in proportion to how much of it arrived. */
+  partial(): number {
+    return this.inner.partial();
+  }
+
+  /** The file bytes of the next complete block; throws on a malformed one. */
+  next(): Uint8Array | undefined {
+    return this.inner.nextBlock();
+  }
+}
+
+/** Turns counts of data stream bytes into progress per top-level entry, in stream order. */
+export class Progress {
+  private inner: wasm.Progress;
+
+  constructor(entries: Entry[], files: AcceptedFile[], topOf: number[]) {
+    this.inner = new wasm.Progress(
+      JSON.stringify(entries),
+      JSON.stringify(files),
+      Uint32Array.from(topOf),
+    );
+  }
+
+  /** The bytes of each top-level entry among the next `n`, as `[entry, bytes]`. */
+  advance(n: number): [number, number][] {
+    const flat = this.inner.advance(n);
+    const steps: [number, number][] = [];
+    for (let i = 0; i < flat.length; i += 2) steps.push([flat[i], flat[i + 1]]);
+    return steps;
+  }
+}
+
 /** The highest protocol version both sides speak. */
 export const negotiate = (
   version: number,

@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use resume::Fingerprint;
 
+pub mod block;
 pub mod frame;
 pub mod limits;
 pub mod offer;

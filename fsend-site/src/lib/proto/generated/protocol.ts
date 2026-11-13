@@ -12,6 +12,7 @@ export const ACK_INTERVAL_MS = 1000;
 export const HELLO_TIMEOUT_MS = 30000;
 export const IDLE_TIMEOUT_MS = 60000;
 export const GOODBYE_TIMEOUT_MS = 5000;
+export const MAX_BLOCK_BYTES = 1048576;
 
 export type ClientMessage = { "type": "create", version: number, transports: Array<Transport>, } | { "type": "join", version: number, nameplate: string, transports: Array<Transport>, };
 

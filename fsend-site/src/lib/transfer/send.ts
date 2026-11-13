@@ -6,16 +6,22 @@ import {
   entrySize,
   fingerprintOf,
   type Outgoing,
+  type Source,
 } from "../files/tree";
 import {
   IDLE_TIMEOUT_MS,
+  MAX_BLOCK_BYTES,
   MIN_RECV_WINDOW,
   checkAccept,
   checkLengths,
+  encodeBlock,
+  Progress,
   encodeOffer,
   loadProto,
   presentBytes,
   topEntries,
+  type AcceptedFile,
+  type Entry,
   type ReceiverMessage,
 } from "../proto";
 import {
@@ -125,31 +131,33 @@ async function send(
   };
 
   channel.bufferedAmountLowThreshold = MAX_BUFFERED_BYTES / 2;
-  for (const { id, offset } of files) {
-    const source = sources[id]!;
-    const size = entrySize(entries[id]);
-    for (let position = offset; position < size;) {
-      // Also notices a peer that is gone.
-      for (let m = peer.poll(); m; m = peer.poll()) ack(m);
-      while (sent - acked >= window) {
-        ack(await peer.next(IDLE_TIMEOUT_MS, RECEIVER_IDLE));
-      }
+  const reader = new BlockReader(entries, sources, files);
+  const progress = new Progress(entries, files, topOf);
+  while (!reader.done) {
+    // Also notices a peer that is gone.
+    for (let m = peer.poll(); m; m = peer.poll()) ack(m);
+    while (sent - acked >= window) {
+      ack(await peer.next(IDLE_TIMEOUT_MS, RECEIVER_IDLE));
+    }
+    const bytes = await reader.read(window - (sent - acked));
+    const block = encodeBlock(bytes);
+    sent += bytes.length;
+    // The block's file bytes count in proportion to its bytes sent.
+    let counted = 0;
+    for (let offset = 0; offset < block.length; offset += DATA_CHUNK_BYTES) {
       if (channel.bufferedAmount > MAX_BUFFERED_BYTES) {
         await Promise.race([
           new Promise((resolve) => (channel.onbufferedamountlow = resolve)),
           peer.stopped,
         ]);
       }
-
-      const n = Math.min(
-        DATA_CHUNK_BYTES,
-        size - position,
-        window - (sent - acked),
-      );
-      channel.send(await source.slice(position, position + n).arrayBuffer());
-      position += n;
-      sent += n;
-      emit({ type: "progress", entry: topOf[id], bytes: n });
+      const end = Math.min(offset + DATA_CHUNK_BYTES, block.length);
+      channel.send(block.slice(offset, end));
+      const now = Math.floor((bytes.length * end) / block.length);
+      for (const [entry, n] of progress.advance(now - counted)) {
+        emit({ type: "progress", entry, bytes: n });
+      }
+      counted = now;
     }
   }
 
@@ -157,5 +165,50 @@ async function send(
     const message = await peer.next(IDLE_TIMEOUT_MS, RECEIVER_IDLE);
     if (message.type === "done") return;
     ack(message);
+  }
+}
+
+/** Reads the accepted bytes of the offered files in order, a block at a time. */
+class BlockReader {
+  /** Bytes still to read. */
+  private left: number;
+  private file = 0;
+  private position: number;
+
+  constructor(
+    private entries: Entry[],
+    private sources: (Source | null)[],
+    private files: AcceptedFile[],
+  ) {
+    this.left = files.reduce(
+      (n, { id, offset }) => n + entrySize(entries[id]) - offset,
+      0,
+    );
+    this.position = files[0]?.offset ?? 0;
+  }
+
+  get done(): boolean {
+    return this.left === 0;
+  }
+
+  /** Up to `max` (and a block's worth of) bytes. */
+  async read(max: number): Promise<Uint8Array> {
+    const bytes = new Uint8Array(Math.min(max, this.left, MAX_BLOCK_BYTES));
+    let filled = 0;
+    while (filled < bytes.length) {
+      const { id } = this.files[this.file];
+      const size = entrySize(this.entries[id]);
+      if (this.position === size) {
+        this.position = this.files[++this.file].offset;
+        continue;
+      }
+      const n = Math.min(size - this.position, bytes.length - filled);
+      const slice = this.sources[id]!.slice(this.position, this.position + n);
+      bytes.set(new Uint8Array(await slice.arrayBuffer()), filled);
+      filled += n;
+      this.position += n;
+    }
+    this.left -= filled;
+    return bytes;
   }
 }

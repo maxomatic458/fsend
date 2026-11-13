@@ -3,6 +3,7 @@
 //!     cargo bench
 //!     FSEND_BENCH_MIB=1024 FSEND_BENCH_RUNS=5 cargo bench
 //!     cargo bench -- webrtc
+//!     FSEND_BENCH_ZSTD=0 cargo bench
 
 use std::future::Future;
 use std::io::Write;
@@ -49,6 +50,11 @@ fn write_payload(path: &Path, bytes: u64) {
     file.flush().unwrap();
 }
 
+/// Whether the sender tries to compress.
+fn compress() -> bool {
+    env_or("FSEND_BENCH_ZSTD", 1) != 0
+}
+
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().unwrap()
 }
@@ -57,7 +63,7 @@ fn send_harness(payload: PathBuf, transfer: impl Future<Output = Box<dyn Transpo
     runtime().block_on(async {
         let outgoing = build_offer(&[payload]).expect("offer");
         let mut transfer = transfer.await;
-        send_files(transfer.as_mut(), &outgoing, &mut |_| {})
+        send_files(transfer.as_mut(), &outgoing, compress(), &mut |_| {})
             .await
             .expect("send");
     });

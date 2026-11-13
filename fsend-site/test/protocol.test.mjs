@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { jsonFrame } from "./harness/index.mjs";
 
 const {
+  BlockDecoder,
+  encodeBlock,
   encodeFrame,
   FrameDecoder,
   Role,
@@ -70,6 +72,50 @@ describe("control frames", () => {
       assert.throws(() => decoder.next());
     });
   }
+});
+
+describe("data blocks", () => {
+  const text = new TextEncoder().encode("fsend ".repeat(100_000));
+  const noise = Uint8Array.from(
+    { length: 50_000 },
+    (_, i) => ((i * 7919) % 251) ^ (i >> 3),
+  );
+
+  test("compressible blocks shrink, others go raw, and both round-trip", () => {
+    const packed = encodeBlock(text);
+    assert.equal(packed[4], 1);
+    assert.ok(packed.length < text.length / 10);
+    const random = crypto.getRandomValues(new Uint8Array(60_000));
+    const stored = encodeBlock(random);
+    assert.equal(stored[4], 0);
+    assert.equal(stored.length, random.length + 5);
+
+    const decoder = new BlockDecoder();
+    const got = [];
+    const bytes = new Uint8Array([...packed, ...stored, ...encodeBlock(noise)]);
+    for (let i = 0; i < bytes.length; i += 1000) {
+      decoder.push(bytes.subarray(i, i + 1000));
+      for (let b = decoder.next(); b; b = decoder.next()) got.push(b);
+    }
+    assert.deepEqual(got, [text, random, noise]);
+    assert.ok(decoder.isEmpty());
+  });
+
+  test("a block holds 1 to MAX_BLOCK_BYTES bytes", () => {
+    assert.throws(() => encodeBlock(new Uint8Array(0)), /a block holds/);
+    assert.throws(
+      () => encodeBlock(new Uint8Array(1024 * 1024 + 1)),
+      /a block holds/,
+    );
+  });
+
+  test("a malformed block is an error", () => {
+    const block = encodeBlock(text);
+    block[4] = 0x7f;
+    const decoder = new BlockDecoder();
+    decoder.push(block);
+    assert.throws(() => decoder.next(), /flags/);
+  });
 });
 
 describe("relay messages", () => {

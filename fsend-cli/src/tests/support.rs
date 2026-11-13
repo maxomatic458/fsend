@@ -105,6 +105,7 @@ pub type PairFn = fn() -> Pin<Box<dyn Future<Output = Peers> + Send>>;
 pub struct RunOptions {
     /// Replace conflicting files instead of skipping them.
     pub replace: bool,
+    pub no_compression: bool,
     pub decline: bool,
     /// Abort the sender once it has handed this many bytes to the transport.
     pub abort_sender_after: Option<u64>,
@@ -121,6 +122,8 @@ pub struct Tally {
     pub present: Vec<u64>,
     /// Bytes moved this session.
     pub moved: u64,
+    /// The largest progress step.
+    pub largest_step: u64,
     pub offered: bool,
 }
 
@@ -141,6 +144,7 @@ impl Tally {
             Event::Progress { entry, bytes } => {
                 self.present[entry] += bytes;
                 self.moved += bytes;
+                self.largest_step = self.largest_step.max(bytes);
             }
         }
     }
@@ -220,7 +224,12 @@ pub async fn run_offer(peers: Peers, outgoing: &Outgoing, out: &Path, opts: RunO
         }
     };
 
-    let send = send_files(sender.as_mut(), outgoing, &mut on_send);
+    let send = send_files(
+        sender.as_mut(),
+        outgoing,
+        !opts.no_compression,
+        &mut on_send,
+    );
     let recv = receive_files(
         receiver.as_mut(),
         &mut on_offer,
@@ -296,6 +305,8 @@ macro_rules! transport_suite {
             sends_a_file_larger_than_the_buffers,
             sends_a_directory_tree,
             sends_several_entries_at_once,
+            sends_compressible_data_either_way,
+            progress_moves_in_small_steps,
             sends_the_current_directory,
             receiver_can_decline,
             resumes_a_partial_file,
@@ -527,6 +538,55 @@ pub mod suite {
         assert!(!f.out.join("secret.txt").exists());
     }
 
+    pub async fn sends_compressible_data_either_way(pair: PairFn) {
+        for no_compression in [false, true] {
+            let f = fixture();
+            // Blocks that span files, and one file of several blocks.
+            let text = b"all work and no play makes jack a dull boy\n".repeat(60_000);
+            write(&f.src.join("d/big.txt"), &text);
+            for i in 0..50 {
+                write(&f.src.join(format!("d/small-{i}.txt")), &text[..i * 997]);
+            }
+            write(&f.src.join("d/noise.bin"), &bytes(300_000, 7));
+
+            let opts = RunOptions {
+                no_compression,
+                ..Default::default()
+            };
+            let o = run(pair().await, vec![f.src.join("d")], &f.out, opts).await;
+
+            o.unwrap();
+            assert_eq!(snapshot(&f.out), snapshot(&f.src));
+            let total = o.sender.initial.unwrap()[0].2;
+            assert_eq!(o.sender.moved, total);
+            assert_eq!(o.receiver.moved, total);
+        }
+    }
+
+    pub async fn progress_moves_in_small_steps(pair: PairFn) {
+        let f = fixture();
+        write(&f.src.join("big.bin"), &bytes(3 * MAX_BLOCK_BYTES, 8));
+
+        let o = run(
+            pair().await,
+            vec![f.src.join("big.bin")],
+            &f.out,
+            RunOptions::default(),
+        )
+        .await;
+
+        o.unwrap();
+        // One write or read of the data stream at most, not a block.
+        for side in [&o.sender, &o.receiver] {
+            assert!(
+                side.largest_step <= BUF_SIZE as u64,
+                "{}",
+                side.largest_step
+            );
+            assert_eq!(side.moved, 3 * MAX_BLOCK_BYTES as u64);
+        }
+    }
+
     pub async fn resumes_a_partial_file(pair: PairFn) {
         let f = fixture();
         let data = bytes(200_000, 3);
@@ -691,6 +751,15 @@ pub mod suite {
         assert_eq!(o.sender.moved, 10);
     }
 
+    /// Progress counts blocks as they arrive, so it runs ahead of what is
+    /// written by the rest of the block being written and the next one.
+    fn arrived_ahead_of_disk(moved: u64, written: u64) {
+        assert!(
+            (written..written + 2 * MAX_BLOCK_BYTES as u64).contains(&moved),
+            "{moved} bytes counted, {written} written"
+        );
+    }
+
     const INTERRUPT_SIZE: usize = 3 * 1024 * 1024;
     const INTERRUPT_AFTER: u64 = 1024 * 1024;
 
@@ -720,7 +789,7 @@ pub mod suite {
             (INTERRUPT_AFTER..data.len() as u64).contains(&partial),
             "partial file of {partial} bytes"
         );
-        assert_eq!(partial, o.receiver.moved);
+        arrived_ahead_of_disk(o.receiver.moved, partial);
         assert_eq!(
             std::fs::read(f.out.join("movie.bin")).unwrap(),
             &data[..partial as usize],
@@ -774,7 +843,7 @@ pub mod suite {
             partial < data.len() as u64,
             "partial file of {partial} bytes"
         );
-        assert_eq!(partial, o.receiver.moved);
+        arrived_ahead_of_disk(o.receiver.moved, partial);
         assert_eq!(
             std::fs::read(f.out.join("movie.bin")).unwrap_or_default(),
             &data[..partial as usize]
@@ -860,7 +929,7 @@ pub mod suite {
         } = pair().await;
         let outgoing = build_offer(&[f.src.join("a.txt")]).unwrap();
         let mut event = no_event;
-        let send = send_files(sender.as_mut(), &outgoing, &mut event);
+        let send = send_files(sender.as_mut(), &outgoing, true, &mut event);
         tokio::join!(fake_receiver(&mut receiver, raw), send)
     }
 

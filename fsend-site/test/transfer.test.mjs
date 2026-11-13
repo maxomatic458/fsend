@@ -291,7 +291,7 @@ describe("browser storage (OPFS)", () => {
   test("an interrupted transfer resumes from storage", async () => {
     const storage = await openStorage();
     const spec = { "movie.bin": bytes(2_000_000, 184) };
-    const first = await staged(storage, spec, { cutAfter: 200_000 });
+    const first = await staged(storage, spec, { cutAfter: 1_300_000 });
     assert.ok(first.recv.error, "the first attempt fails");
     const partial = storage.incoming.snapshot()["movie.bin"].length;
     assert.ok(partial > 0 && partial < 2_000_000, `${partial} bytes kept`);
@@ -558,6 +558,94 @@ describe("interrupted transfers", () => {
   });
 });
 
+describe("compression", () => {
+  /** Runs a transfer of `spec`, counting the bytes on the sender's data channel. */
+  async function counted(spec, tamper) {
+    const send = makeRecorder();
+    const recv = makeRecorder();
+    const senderDone = runSend(
+      makeEntries(spec),
+      send.emit,
+      new AbortController().signal,
+    );
+    const code = await waitFor(() => send.record.code, { label: "share code" });
+    const dir = new MemoryDirectoryHandle();
+    const receiverDone = runReceive(
+      code,
+      createFolderSink(dir),
+      "skip",
+      recv.emit,
+      new AbortController().signal,
+    );
+    const channel = await waitFor(
+      () => peerConnections[0]?._channels.get("data"),
+      { label: "sender data channel" },
+    );
+    const realSend = channel.send.bind(channel);
+    let wire = 0;
+    channel.send = (data) => {
+      wire += data.byteLength;
+      realSend(tamper ? tamper(data) : data);
+    };
+    await Promise.all([senderDone, receiverDone]);
+    return { dir, wire, send: send.record, recv: recv.record };
+  }
+
+  test("compressible files cross in far fewer bytes", async () => {
+    const line = new TextEncoder().encode(
+      "all work and no play\n".repeat(150_000),
+    );
+    const spec = {
+      "log.txt": line,
+      notes: Object.fromEntries(
+        Array.from({ length: 30 }, (_, i) => [
+          `n${i}.txt`,
+          line.slice(0, i * 500),
+        ]),
+      ),
+      "noise.bin": bytes(200_000, 191),
+    };
+    const { dir, wire, send, recv } = await counted(spec);
+    assert.equal(recv.error, null);
+    assertFiles(dir.snapshot(), expectedSnapshot(spec));
+    const total = Object.values(expectedSnapshot(spec)).reduce(
+      (n, b) => n + b.length,
+      0,
+    );
+    assert.equal(send.progress, total, "progress counts file bytes");
+    assert.ok(
+      wire < 200_000 + total / 10,
+      `${wire} bytes on the wire for ${total}`,
+    );
+  });
+
+  test("progress moves a data channel message at a time, not a block", async () => {
+    const spec = { "big.bin": bytes(3 * 1024 * 1024, 193) };
+    const { send, recv } = await counted(spec);
+    assert.equal(recv.error, null);
+    for (const side of [send, recv]) {
+      assert.equal(side.progress, 3 * 1024 * 1024);
+      assert.ok(side.largestStep <= 16 * 1024, `steps of ${side.largestStep}`);
+    }
+  });
+
+  test("a malformed block fails the receiver", async () => {
+    let first = true;
+    const { send, recv } = await counted(
+      { "a.txt": bytes(5000, 192) },
+      (data) => {
+        if (!first) return data;
+        first = false;
+        const copy = new Uint8Array(data);
+        copy[4] = 0x7f;
+        return copy;
+      },
+    );
+    assert.match(recv.error ?? "", /^Protocol error/);
+    assert.match(send.error ?? "", /^The other side failed/);
+  });
+});
+
 describe("protocol errors", () => {
   const offer = {
     type: "offer",
@@ -637,7 +725,8 @@ describe("resuming an interrupted download", () => {
         new AbortController().signal,
       );
 
-      await waitFor(() => recv.record.progress > 200_000, {
+      // Past the first block, so some of it is on disk.
+      await waitFor(() => recv.record.progress > 1_300_000, {
         label: "partial download",
       });
       peerConnections[0].simulateAbruptDisconnect();

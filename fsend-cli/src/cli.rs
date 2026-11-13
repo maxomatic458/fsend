@@ -34,6 +34,10 @@ pub enum Mode {
         /// Files or folders to send.
         #[clap(required = true)]
         files: Vec<PathBuf>,
+
+        /// Send the data as is instead of zstd-compressing it where that helps.
+        #[clap(long)]
+        no_compression: bool,
     },
     /// Receive files or folders using a share code.
     #[clap(name = "receive", aliases = &["r"])]

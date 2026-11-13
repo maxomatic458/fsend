@@ -6,10 +6,11 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use colored::Colorize;
+use fsend_proto::peer::block::{self, BlockDecoder, Progress};
 use fsend_proto::peer::frame::{self, FrameDecoder};
 use fsend_proto::peer::limits::{
-    ACK_INTERVAL, ACK_STEP, GOODBYE_TIMEOUT, HELLO_TIMEOUT, IDLE_TIMEOUT, MAX_DEPTH,
-    MIN_RECV_WINDOW, RECV_WINDOW,
+    ACK_INTERVAL, ACK_STEP, GOODBYE_TIMEOUT, HELLO_TIMEOUT, IDLE_TIMEOUT, MAX_BLOCK_BYTES,
+    MAX_DEPTH, MIN_RECV_WINDOW, RECV_WINDOW,
 };
 use fsend_proto::peer::offer::{self, EntryError, OfferError, TopEntry};
 use fsend_proto::peer::resume::{self, Conflict, ConflictPolicy, Fingerprint, Local};
@@ -17,13 +18,17 @@ use fsend_proto::peer::{
     self, AcceptedFile, Cancel, CheckedFile, Entry, ErrorCode, ErrorReport, Hello, Message,
     ReceiverMessage, SenderMessage,
 };
+use futures_util::StreamExt;
+use futures_util::stream::FuturesOrdered;
 use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
-/// Read/write chunk on the data stream.
+/// Read chunk on the streams.
 pub const BUF_SIZE: usize = 64 * 1024;
+/// Data blocks compressed at once.
+const COMPRESS_WORKERS: usize = 4;
 
 const SENDER_HELLO: &str = "the sender did not say hello in time";
 const RECEIVER_HELLO: &str = "the receiver did not say hello in time";
@@ -514,15 +519,17 @@ fn remaining(entries: &[Entry], files: &[AcceptedFile]) -> u64 {
         .sum()
 }
 
+/// Sends `outgoing`, zstd-compressing the data where that helps if `compress`.
 pub async fn send_files(
     transport: &mut dyn Transport,
     outgoing: &Outgoing,
+    compress: bool,
     on_event: EventCb<'_>,
 ) -> Result<(), TransferError> {
     let result = match transport.control().await {
         Ok(stream) => {
             let mut control = Control::new(stream);
-            let result = send(transport, &mut control, outgoing, on_event).await;
+            let result = send(transport, &mut control, outgoing, compress, on_event).await;
             explain(transport, &mut control, result, SenderMessage::Error).await
         }
         Err(e) => Err(e),
@@ -535,6 +542,7 @@ async fn send(
     transport: &mut dyn Transport,
     control: &mut SenderControl,
     outgoing: &Outgoing,
+    compress: bool,
     on_event: EventCb<'_>,
 ) -> Result<(), TransferError> {
     control
@@ -582,34 +590,42 @@ async fn send(
         present: &offer::present(entries, &files),
     });
 
-    if remaining(entries, &files) > 0 {
+    let mut reader = BlockReader::new(outgoing, &files);
+    let mut progress = Progress::new(entries, &files, &top_of);
+    if !reader.is_done() {
         let mut data = transport.data().await?;
-        let mut buf = vec![0; BUF_SIZE];
-        for &AcceptedFile { id, offset } in &files {
-            let id = id as usize;
-            let mut left = entries[id].size() - offset;
-            if left == 0 {
-                continue;
+        // Blocks in order, compressed a few at a time.
+        let mut encoding = FuturesOrdered::new();
+        loop {
+            while encoding.len() < COMPRESS_WORKERS && !reader.is_done() && window.room() > 0 {
+                let bytes = reader.read(window.room()).await?;
+                window.sent += bytes.len() as u64;
+                encoding.push_back(tokio::task::spawn_blocking(move || {
+                    (block::encode(&bytes, compress), bytes.len() as u64)
+                }));
             }
-            let mut file = File::open(&outgoing.sources[id]).await?;
-            file.seek(io::SeekFrom::Start(offset)).await?;
-            while left > 0 {
-                while window.room() == 0 {
-                    window.ack(control.recv_within(IDLE_TIMEOUT, RECEIVER_IDLE).await?)?;
+            let Some(encoded) = encoding.next().await else {
+                if reader.is_done() {
+                    break;
                 }
-                let n = left.min(window.room()).min(BUF_SIZE as u64);
-                let chunk = &mut buf[..n as usize];
-                file.read_exact(chunk).await?;
-                timeout(IDLE_TIMEOUT, window.write(data.as_mut(), chunk, control))
-                    .await
-                    .map_err(|_| TransferError::Timeout(RECEIVER_IDLE))??;
-                left -= n;
-                window.sent += n;
-                on_event(Event::Progress {
-                    entry: top_of[id],
-                    bytes: n,
-                });
-            }
+                window.ack(control.recv_within(IDLE_TIMEOUT, RECEIVER_IDLE).await?)?;
+                continue;
+            };
+            let (frame, raw) =
+                encoded.map_err(|_| TransferError::Internal("encoding a block failed"))?;
+            // The block's file bytes count in proportion to its bytes written.
+            let mut counted = 0;
+            let mut on_written = |written: usize| {
+                let now = raw * written as u64 / frame.len() as u64;
+                for (entry, bytes) in progress.advance(now - counted) {
+                    on_event(Event::Progress { entry, bytes });
+                }
+                counted = now;
+            };
+            let write = window.write(data.as_mut(), &frame, control, &mut on_written);
+            timeout(IDLE_TIMEOUT, write)
+                .await
+                .map_err(|_| TransferError::Timeout(RECEIVER_IDLE))??;
         }
         timeout(IDLE_TIMEOUT, data.shutdown())
             .await
@@ -621,6 +637,58 @@ async fn send(
             ReceiverMessage::Done => return Ok(()),
             message => window.ack(message)?,
         }
+    }
+}
+
+/// Reads the accepted bytes of the offered files in order, a block at a time.
+struct BlockReader<'a> {
+    outgoing: &'a Outgoing,
+    files: std::slice::Iter<'a, AcceptedFile>,
+    /// The file being read and the bytes left in it.
+    current: Option<(File, u64)>,
+    left: u64,
+}
+
+impl<'a> BlockReader<'a> {
+    fn new(outgoing: &'a Outgoing, files: &'a [AcceptedFile]) -> Self {
+        Self {
+            outgoing,
+            files: files.iter(),
+            current: None,
+            left: remaining(&outgoing.entries, files),
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        self.left == 0
+    }
+
+    /// Up to `max` (and a block's worth of) bytes.
+    async fn read(&mut self, max: u64) -> io::Result<Vec<u8>> {
+        let len = max.min(self.left).min(MAX_BLOCK_BYTES as u64) as usize;
+        let mut bytes = vec![0; len];
+        let mut filled = 0;
+        while filled < len {
+            let (file, left) = match &mut self.current {
+                Some((file, left)) if *left > 0 => (file, left),
+                _ => {
+                    let next = self.files.next().expect("bytes are left");
+                    let id = next.id as usize;
+                    let mut file = File::open(&self.outgoing.sources[id]).await?;
+                    file.seek(io::SeekFrom::Start(next.offset)).await?;
+                    let left = self.outgoing.entries[id].size() - next.offset;
+                    self.current = Some((file, left));
+                    continue;
+                }
+            };
+            let n = (*left).min((len - filled) as u64);
+            file.read_exact(&mut bytes[filled..filled + n as usize])
+                .await?;
+            filled += n as usize;
+            *left -= n;
+        }
+        self.left -= len as u64;
+        Ok(bytes)
     }
 }
 
@@ -636,18 +704,25 @@ impl Window {
         self.size - (self.sent - self.acked)
     }
 
-    /// Writes `chunk` to the data stream, taking acks as they arrive.
+    /// Writes `frame` to the data stream a piece at a time, taking acks as
+    /// they arrive and telling `on_written` how much of it is written.
     async fn write(
         &mut self,
         data: &mut dyn ByteStream,
-        mut chunk: &[u8],
+        frame: &[u8],
         control: &mut SenderControl,
+        on_written: &mut (dyn FnMut(usize) + Send),
     ) -> Result<(), TransferError> {
-        while !chunk.is_empty() {
+        let mut written = 0;
+        while written < frame.len() {
+            let piece = &frame[written..frame.len().min(written + BUF_SIZE)];
             tokio::select! {
-                written = data.write(chunk) => match written? {
+                n = data.write(piece) => match n? {
                     0 => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
-                    n => chunk = &chunk[n..],
+                    n => {
+                        written += n;
+                        on_written(written);
+                    }
                 },
                 message = control.recv() => self.ack(message?)?,
             }
@@ -762,20 +837,20 @@ async fn receive(
     } else {
         None
     };
+    let mut progress = Progress::new(&entries, &files, &top_of);
     for &AcceptedFile { id, offset } in &files {
         let id = id as usize;
         let size = entries[id].size();
         let mut file = open_for_receive(&paths[id], offset).await?;
         let received = match &mut incoming {
             Some(incoming) => {
-                let mut on_bytes = |bytes| {
-                    on_event(Event::Progress {
-                        entry: top_of[id],
-                        bytes,
-                    })
+                let mut on_arrived = |bytes| {
+                    for (entry, bytes) in progress.advance(bytes) {
+                        on_event(Event::Progress { entry, bytes });
+                    }
                 };
                 incoming
-                    .write_to(&mut file, size - offset, control, &mut on_bytes)
+                    .write_to(&mut file, size - offset, control, &mut on_arrived)
                     .await
             }
             None => Ok(()),
@@ -784,6 +859,11 @@ async fn receive(
         file.flush().await?;
         received?;
         finish_received_file(&mut file, size).await?;
+    }
+    if incoming.is_some_and(|incoming| !incoming.is_empty()) {
+        return Err(TransferError::Protocol(
+            "the sender sent more bytes than accepted".into(),
+        ));
     }
 
     control.send(&ReceiverMessage::Done).await?;
@@ -844,6 +924,13 @@ async fn verify(
 struct Incoming {
     stream: Box<dyn ByteStream>,
     buf: Vec<u8>,
+    decoder: BlockDecoder,
+    /// The block being written, and how much of it is.
+    block: Vec<u8>,
+    taken: usize,
+    /// File bytes of the blocks decoded so far, and of those counted as arrived.
+    decoded: u64,
+    arrived: u64,
     written: u64,
     acked: u64,
     acked_at: Instant,
@@ -854,24 +941,43 @@ impl Incoming {
         Self {
             stream,
             buf: vec![0; BUF_SIZE],
+            decoder: BlockDecoder::default(),
+            block: Vec::new(),
+            taken: 0,
+            decoded: 0,
+            arrived: 0,
             written: 0,
             acked: 0,
             acked_at: Instant::now(),
         }
     }
 
-    /// Writes the next `len` bytes of the stream to `file`.
-    async fn write_to(
+    /// Whether nothing past the accepted bytes arrived.
+    fn is_empty(&self) -> bool {
+        self.taken == self.block.len() && self.decoder.is_empty()
+    }
+
+    /// Decodes the next block once the current one is written, telling
+    /// `on_arrived` about file bytes as their blocks arrive, in proportion.
+    async fn fill(
         &mut self,
-        file: &mut File,
-        mut len: u64,
         control: &mut ReceiverControl,
-        on_bytes: &mut (dyn FnMut(u64) + Send),
+        on_arrived: &mut (dyn FnMut(u64) + Send),
     ) -> Result<(), TransferError> {
-        while len > 0 {
-            let want = len.min(BUF_SIZE as u64) as usize;
+        while self.taken == self.block.len() {
+            if let Some(block) = self
+                .decoder
+                .next_block()
+                .map_err(|e| TransferError::Protocol(e.to_string()))?
+            {
+                self.decoded += block.len() as u64;
+                self.block = block;
+                self.taken = 0;
+                self.count_arrived(on_arrived);
+                return Ok(());
+            }
             let n = tokio::select! {
-                read = timeout(IDLE_TIMEOUT, self.stream.read(&mut self.buf[..want])) => {
+                read = timeout(IDLE_TIMEOUT, self.stream.read(&mut self.buf)) => {
                     read.map_err(|_| TransferError::Timeout(SENDER_IDLE))??
                 }
                 // The sender says nothing while it sends.
@@ -884,10 +990,36 @@ impl Incoming {
                     _ => TransferError::Disconnected("the data stream ended early".into()),
                 });
             }
-            file.write_all(&self.buf[..n]).await?;
+            self.decoder.push(&self.buf[..n]);
+            self.count_arrived(on_arrived);
+        }
+        Ok(())
+    }
+
+    fn count_arrived(&mut self, on_arrived: &mut (dyn FnMut(u64) + Send)) {
+        let arrived = self.decoded + self.decoder.partial();
+        if arrived > self.arrived {
+            on_arrived(arrived - self.arrived);
+            self.arrived = arrived;
+        }
+    }
+
+    /// Writes the next `len` bytes of the stream to `file`.
+    async fn write_to(
+        &mut self,
+        file: &mut File,
+        mut len: u64,
+        control: &mut ReceiverControl,
+        on_arrived: &mut (dyn FnMut(u64) + Send),
+    ) -> Result<(), TransferError> {
+        while len > 0 {
+            self.fill(control, on_arrived).await?;
+            let n = len.min((self.block.len() - self.taken) as u64) as usize;
+            file.write_all(&self.block[self.taken..self.taken + n])
+                .await?;
+            self.taken += n;
             len -= n as u64;
             self.written += n as u64;
-            on_bytes(n as u64);
             if self.written - self.acked >= ACK_STEP || self.acked_at.elapsed() >= ACK_INTERVAL {
                 control
                     .send(&ReceiverMessage::Ack {

@@ -2,7 +2,7 @@ use fsend_proto::{
     code::{Code, CodeError},
     pairing::{self, PairingError, Signal},
     peer::{
-        self, ReceiverMessage, SenderMessage, frame, offer,
+        self, ReceiverMessage, SenderMessage, block, frame, limits, offer,
         resume::{self, Fingerprint},
     },
     relay::ServerMessage,
@@ -173,6 +173,74 @@ impl FrameDecoder {
     }
 }
 
+/// A data stream block of `data`, 1 to `MAX_BLOCK_BYTES` file bytes, compressed if `compress` and that helps.
+#[wasm_bindgen(js_name = encodeBlock)]
+pub fn encode_block(data: &[u8], compress: bool) -> Result<Vec<u8>, JsError> {
+    if !(1..=limits::MAX_BLOCK_BYTES).contains(&data.len()) {
+        return Err(JsError::new("a block holds 1 to MAX_BLOCK_BYTES bytes"));
+    }
+    Ok(block::encode(data, compress))
+}
+
+/// Reassembles the file bytes of blocks from data stream bytes split anywhere.
+#[wasm_bindgen]
+#[derive(Default)]
+pub struct BlockDecoder(block::BlockDecoder);
+
+#[wasm_bindgen]
+impl BlockDecoder {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, data: &[u8]) {
+        self.0.push(data);
+    }
+
+    /// Whether no partial block is buffered.
+    #[wasm_bindgen(js_name = isEmpty)]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The file bytes of the first buffered block, in proportion to how much of it arrived.
+    pub fn partial(&self) -> f64 {
+        self.0.partial() as f64
+    }
+
+    /// The file bytes of the next complete block; throws on a malformed one.
+    #[wasm_bindgen(js_name = nextBlock)]
+    pub fn next_block(&mut self) -> Result<Option<Vec<u8>>, JsError> {
+        Ok(self.0.next_block()?)
+    }
+}
+
+/// Turns counts of data stream bytes into progress per top-level entry, in stream order.
+#[wasm_bindgen]
+pub struct Progress(block::Progress);
+
+#[wasm_bindgen]
+impl Progress {
+    /// For the JSON `AcceptedFile[]` `files` of the JSON `Entry[]` `entries`, with `top_of` from `topEntries`.
+    #[wasm_bindgen(constructor)]
+    pub fn new(entries: &str, files: &str, top_of: &[u32]) -> Result<Progress, JsError> {
+        let entries: Vec<_> = serde_json::from_str(entries)?;
+        let files: Vec<_> = serde_json::from_str(files)?;
+        let top_of: Vec<usize> = top_of.iter().map(|&top| top as usize).collect();
+        Ok(Self(block::Progress::new(&entries, &files, &top_of)))
+    }
+
+    /// `[top, bytes, top, bytes, ...]`: the bytes of each top-level entry among the next `n`.
+    pub fn advance(&mut self, n: f64) -> Vec<f64> {
+        self.0
+            .advance(n as u64)
+            .into_iter()
+            .flat_map(|(top, bytes)| [top as f64, bytes as f64])
+            .collect()
+    }
+}
+
 /// The highest protocol version both sides speak.
 #[wasm_bindgen]
 pub fn negotiate(version: u32, min_version: u32) -> Option<u32> {
@@ -277,7 +345,7 @@ mod bindings {
         code::NAMEPLATE_LEN,
         pairing::{ConnectionInfo, Sealed},
         peer::{
-            AcceptedFile, Cancel, CheckedFile, Entry, ErrorReport, Hello, limits,
+            AcceptedFile, Cancel, CheckedFile, Entry, ErrorReport, Hello,
             offer::TopEntry,
             resume::{Conflict, ConflictPolicy, Local, Plan},
         },
@@ -331,7 +399,8 @@ mod bindings {
              export const ACK_INTERVAL_MS = {};\n\
              export const HELLO_TIMEOUT_MS = {};\n\
              export const IDLE_TIMEOUT_MS = {};\n\
-             export const GOODBYE_TIMEOUT_MS = {};\n",
+             export const GOODBYE_TIMEOUT_MS = {};\n\
+             export const MAX_BLOCK_BYTES = {};\n",
             fsend_proto::code::CODE_LEN,
             peer::VERSION,
             peer::MIN_VERSION,
@@ -342,6 +411,7 @@ mod bindings {
             limits::HELLO_TIMEOUT.as_millis(),
             limits::IDLE_TIMEOUT.as_millis(),
             limits::GOODBYE_TIMEOUT.as_millis(),
+            limits::MAX_BLOCK_BYTES,
         );
         let expected = decls
             .iter()

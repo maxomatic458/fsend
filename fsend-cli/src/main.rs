@@ -52,7 +52,10 @@ async fn run() -> color_eyre::Result<()> {
         .init();
 
     match args.mode {
-        Mode::Send { files } => run_send(&args.relay_url, &args.download_url, files).await?,
+        Mode::Send {
+            files,
+            no_compression,
+        } => run_send(&args.relay_url, &args.download_url, files, !no_compression).await?,
         Mode::Receive {
             on_conflict,
             output_dir,
@@ -165,6 +168,7 @@ async fn run_send(
     relay_url: &str,
     download_url: &str,
     files: Vec<PathBuf>,
+    compress: bool,
 ) -> color_eyre::Result<()> {
     let missing: Vec<_> = files.iter().filter(|f| !f.exists()).cloned().collect();
 
@@ -189,7 +193,7 @@ async fn run_send(
     announce_connection(transport.as_ref()).await;
 
     let mut progress = Progress::default();
-    transfer::send_files(transport.as_mut(), &outgoing, &mut |event| {
+    transfer::send_files(transport.as_mut(), &outgoing, compress, &mut |event| {
         progress.on_event(event)
     })
     .await?;
