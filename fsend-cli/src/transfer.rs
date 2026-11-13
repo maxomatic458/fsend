@@ -5,190 +5,22 @@ use async_compression::tokio::write::GzipEncoder;
 use async_trait::async_trait;
 use bytes::Bytes;
 use colored::Colorize;
+use fsend_proto::peer::{
+    FileSendRecvTree, FilesAvailable, FilesToSkip, MAX_FRAME_BYTES, PROTO_VERSION,
+    ReceiverToSender, SenderToReceiver,
+};
 use futures_util::{SinkExt, StreamExt};
+use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 /// Read/write chunk on the data stream.
 pub const BUF_SIZE: usize = 64 * 1024;
-pub const PROTO_VERSION: &str = "3";
-pub const FSEND_ALPN: &[u8] = b"fsend";
-pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// How long a incompatible peer gets to read our last packet.
 const GOODBYE_TIMEOUT: Duration = Duration::from_secs(5);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
-
-#[derive(Debug, PartialEq, Clone, Hash, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum FileSendRecvTree {
-    File {
-        name: String,
-        skip: u64,
-        size: u64,
-    },
-    Dir {
-        name: String,
-        files: Vec<FileSendRecvTree>,
-    },
-}
-
-impl FileSendRecvTree {
-    pub fn name(&self) -> &str {
-        match self {
-            Self::File { name, .. } | Self::Dir { name, .. } => name,
-        }
-    }
-
-    pub fn size(&self) -> u64 {
-        match self {
-            Self::File { size, .. } => *size,
-            Self::Dir { files, .. } => files.iter().map(|f| f.size()).sum(),
-        }
-    }
-
-    pub fn skip(&self) -> u64 {
-        match self {
-            Self::File { skip, .. } => *skip,
-            Self::Dir { files, .. } => files.iter().map(|f| f.skip()).sum(),
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Clone, Hash, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum FilesAvailable {
-    File {
-        name: String,
-        size: u64,
-    },
-    Dir {
-        name: String,
-        files: Vec<FilesAvailable>,
-    },
-}
-
-impl FilesAvailable {
-    pub fn name(&self) -> &str {
-        match self {
-            Self::File { name, .. } | Self::Dir { name, .. } => name,
-        }
-    }
-
-    pub fn size(&self) -> u64 {
-        match self {
-            Self::File { size, .. } => *size,
-            Self::Dir { files, .. } => files.iter().map(|f| f.size()).sum(),
-        }
-    }
-
-    pub fn to_send_recv_tree(&self) -> FileSendRecvTree {
-        match self {
-            Self::File { name, size } => FileSendRecvTree::File {
-                name: name.clone(),
-                skip: 0,
-                size: *size,
-            },
-            Self::Dir { name, files } => FileSendRecvTree::Dir {
-                name: name.clone(),
-                files: files.iter().map(|f| f.to_send_recv_tree()).collect(),
-            },
-        }
-    }
-
-    pub fn remove_skipped(&self, to_skip: &FilesToSkip) -> Option<FileSendRecvTree> {
-        match (self, to_skip) {
-            (Self::File { name, size }, FilesToSkip::File { name: sn, skip }) => {
-                if name == sn && size <= skip {
-                    None
-                } else {
-                    Some(FileSendRecvTree::File {
-                        name: name.clone(),
-                        skip: if name == sn { *skip } else { 0 },
-                        size: *size,
-                    })
-                }
-            }
-            (
-                Self::Dir { name, files },
-                FilesToSkip::Dir {
-                    name: sn,
-                    files: sf,
-                },
-            ) => {
-                if name != sn {
-                    return Some(self.to_send_recv_tree());
-                }
-                let mut remaining = Vec::new();
-                for file in files {
-                    if let Some(skip_file) = sf.iter().find(|s| s.name() == file.name()) {
-                        if let Some(r) = file.remove_skipped(skip_file) {
-                            remaining.push(r);
-                        }
-                    } else {
-                        remaining.push(file.to_send_recv_tree());
-                    }
-                }
-                if remaining.is_empty() {
-                    None
-                } else {
-                    Some(FileSendRecvTree::Dir {
-                        name: name.clone(),
-                        files: remaining,
-                    })
-                }
-            }
-            // A file offered where a directory exists locally (e.g file.txt offered, but file.txt/ exists, or vice versa)
-            // cannot be resumed; transfer it in full.
-            _ => Some(self.to_send_recv_tree()),
-        }
-    }
-
-    pub fn get_skippable(&self, local: &FilesAvailable) -> Option<FilesToSkip> {
-        match (self, local) {
-            (Self::File { name, size }, Self::File { name: ln, size: ls }) => {
-                if name == ln {
-                    Some(FilesToSkip::File {
-                        name: name.clone(),
-                        skip: if ls > size { 0 } else { *ls },
-                    })
-                } else {
-                    None
-                }
-            }
-            (
-                Self::Dir { name, files },
-                Self::Dir {
-                    name: ln,
-                    files: lf,
-                },
-            ) => {
-                if name != ln {
-                    return None;
-                }
-                let mut skippable = Vec::new();
-                for file in files {
-                    if let Some(lm) = lf.iter().find(|l| l.name() == file.name())
-                        && let Some(s) = file.get_skippable(lm)
-                    {
-                        skippable.push(s);
-                    }
-                }
-                if skippable.is_empty() {
-                    None
-                } else {
-                    Some(FilesToSkip::Dir {
-                        name: name.clone(),
-                        files: skippable,
-                    })
-                }
-            }
-            _ => None,
-        }
-    }
-}
 
 /// The name a path is announced under.
 fn entry_name(path: &Path) -> std::io::Result<String> {
@@ -340,50 +172,6 @@ pub async fn finish_received_file(file: &mut tokio::fs::File, size: u64) -> std:
     file.set_len(size).await?;
     file.sync_all().await?;
     file.shutdown().await
-}
-
-#[derive(Debug, PartialEq, Clone, Hash, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum FilesToSkip {
-    File {
-        name: String,
-        skip: u64,
-    },
-    Dir {
-        name: String,
-        files: Vec<FilesToSkip>,
-    },
-}
-
-impl FilesToSkip {
-    pub fn name(&self) -> &str {
-        match self {
-            Self::File { name, .. } | Self::Dir { name, .. } => name,
-        }
-    }
-
-    pub fn skip(&self) -> u64 {
-        match self {
-            Self::File { skip, .. } => *skip,
-            Self::Dir { files, .. } => files.iter().map(|f| f.skip()).sum(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum SenderToReceiver {
-    ConnRequest { version: String },
-    FileInfo { files: Vec<FilesAvailable> },
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum ReceiverToSender {
-    WrongVersion { expected: String },
-    Ok,
-    RejectFiles,
-    AcceptFilesSkip { files: Vec<Option<FilesToSkip>> },
 }
 
 pub async fn compress_gzip(data: &[u8]) -> std::io::Result<Vec<u8>> {

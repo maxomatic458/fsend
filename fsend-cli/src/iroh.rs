@@ -6,6 +6,7 @@ use iroh::endpoint::{Connection, ConnectionError, VarInt, presets};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr, Watcher};
 
 use crate::transfer::*;
+use fsend_proto::peer::FSEND_ALPN;
 use fsend_proto::relay::ConnectionInfo;
 
 /// Resolving Home relay and direct address timeout.

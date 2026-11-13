@@ -84,21 +84,13 @@ pub enum ServerMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::pinned;
 
     fn webrtc() -> ConnectionInfo {
         ConnectionInfo::WebRtc {
             sdp: "v=0".into(),
             ice_candidates: vec!["c".into()],
         }
-    }
-
-    /// Each message serializes to exactly this JSON and parses back.
-    fn pinned<T>(message: T, json: &str)
-    where
-        T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug,
-    {
-        assert_eq!(serde_json::to_string(&message).unwrap(), json);
-        assert_eq!(serde_json::from_str::<T>(json).unwrap(), message);
     }
 
     #[test]

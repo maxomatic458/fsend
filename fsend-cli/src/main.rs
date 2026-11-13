@@ -14,8 +14,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 use fsend_cli::cli::{Args, Mode};
 use fsend_cli::iroh::IrohTransfer;
 use fsend_cli::relay::RelayClient;
-use fsend_cli::transfer::{self, FilesAvailable, ReceiveArgs, SendArgs, TransferError, Transport};
+use fsend_cli::transfer::{self, ReceiveArgs, SendArgs, TransferError, Transport};
 use fsend_cli::webrtc::WebRtcTransfer;
+use fsend_proto::peer::{FilesAvailable, PROTO_VERSION};
 use fsend_proto::relay::{ConnectionInfo, Protocol};
 
 #[tokio::main]
@@ -74,7 +75,7 @@ fn log_filter(level: tracing::Level) -> Targets {
 fn print_version() {
     let rows = [
         ("fsend-cli", env!("CARGO_PKG_VERSION").to_owned()),
-        ("protocol", transfer::PROTO_VERSION.to_owned()),
+        ("protocol", PROTO_VERSION.to_owned()),
     ];
 
     for (label, value) in rows {
