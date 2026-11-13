@@ -2,6 +2,7 @@ import { createSignal, createEffect, onCleanup, Show } from "solid-js";
 import { FiCopy, FiCheck } from "solid-icons/fi";
 import qrcode from "qrcode-generator";
 import { Button } from "./Button";
+import { codeLink } from "../lib/proto";
 
 interface ShareCodeProps {
   code: string;
@@ -16,7 +17,7 @@ export function ShareCode(props: ShareCodeProps) {
 
   // Built from the current origin so a link copied while running locally
   // points at the local server rather than production.
-  const shareUrl = () => `${window.location.origin}/receive/${props.code}`;
+  const shareUrl = () => codeLink(window.location.origin, props.code);
 
   const qrSvg = () => {
     const qr = qrcode(0, "M");

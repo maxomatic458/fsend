@@ -2,7 +2,6 @@ import { createMemo, createSignal } from "solid-js";
 import { runSend } from "../lib/transfer/send";
 import { collectFiles } from "../lib/files/source";
 import { buildFileTree, entrySizeBytes } from "../lib/files/tree";
-import { SESSION_EXPIRY_SECS } from "../config";
 import { createTransferRun, stepOf } from "./createTransferRun";
 import type { SelectedEntry } from "../lib/types";
 
@@ -72,7 +71,7 @@ export function createSendSession() {
         switch (event.type) {
           case "code":
             setShareCode(event.code);
-            setExpiresAtMs(Date.now() + SESSION_EXPIRY_SECS * 1000);
+            setExpiresAtMs(Date.now() + event.expiresInSecs * 1000);
             setState("waiting");
             break;
           case "handshaking":

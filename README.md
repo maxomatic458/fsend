@@ -5,7 +5,7 @@ fsend is a peer-to-peer file transfer webapp and CLI tool.
 > `fsend-site` (the webapp) uses WebRTC for the connection, without a fallback relay. So depending on your network/browser, it may not work. `fsend-cli` makes use of [iroh](https://github.com/n0-computer/iroh) which provides a fallback relay by default.
 
 ## Features
-- **P2P File Transfer**: Directly send files between devices. The relay server only introduces the two peers — file data never passes through it.
+- **P2P File Transfer**: Directly send files between devices. The relay server only introduces the two peers - file data never passes through it.
 - **Web and CLI Interface**: fsend is available as a web application and a command-line tool, and the two interoperate.
 - **Resumable Transfers**: If the connection is lost, the transfer can be resumed from where it left off (see the browser support table below).
 - **Files and Folders**: Send individual files or whole folders — the directory structure is preserved on the receiving side.
@@ -72,16 +72,20 @@ The transfer speed should be within 80-90% of `min(sender_up, receiver_down)`.
 #### Sending files
 ```bash
 $ fsend send <file_path>
-Session code: 123456
+Code: K7Q29XMV4P
 
 On the other peer, run:
 
-  fsend receive 123456
+  fsend receive K7Q29XMV4P
+
+or open in a browser:
+
+  https://fsend.sh/receive#K7Q29XMV4P
 ```
 
 #### Receiving files
 ```bash
-$ fsend receive 123456
+$ fsend receive K7Q29XMV4P
 ```
 
 ## Licenses

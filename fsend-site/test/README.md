@@ -15,8 +15,9 @@ node test/run.mjs --test-name-pattern=resume
 
 ## How it works
 
-`test/run.mjs` bundles `test/entry.ts` (a barrel over `src/lib`) into plain ESM
-with esbuild, then runs Node's built-in test runner. Bundling rather than
+`test/run.mjs` builds the protocol wasm (`scripts/build-wasm.mjs`), bundles
+`test/entry.ts` (a barrel over `src/lib`) into plain ESM with esbuild, then runs
+Node's built-in test runner. The harness loads the wasm from disk. Bundling rather than
 mocking means the code under test is the code that ships — no reimplementation
 to drift out of sync.
 
@@ -25,7 +26,7 @@ to drift out of sync.
 | Module          | Stands in for                              | Notes                                                                                                                                                                                                                                                        |
 | --------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `webrtc.mjs`    | `RTCPeerConnection`, `RTCDataChannel`      | Loopback pair. Messages are copied and delivered asynchronously in order; `bufferedAmount` rises and falls so backpressure is real. Exposes `simulateAbruptDisconnect()` — the peer vanishes with no graceful close, which a browser will not do on command. |
-| `relay.mjs`     | `WebSocket` + fsend-relay                  | Speaks the same JSON protocol as `src/lib/types.ts`: session creation, join, peer-joined, SDP exchange.                                                                                                                                                      |
+| `relay.mjs`     | `WebSocket` + fsend-relay                  | Speaks relay protocol 1: create, join, paired, and verbatim forwarding of binary signal frames. Pairing runs in the app's real wasm.                                                                                                                         |
 | `fs-access.mjs` | File System Access API                     | In-memory directories and files. Writables commit as they go, so an abandoned one leaves partial data behind — which is what resume reads. `snapshot()` flattens a tree to `{ path: bytes }`.                                                                |
 | `dom.mjs`       | Object URLs, anchor download, `FileReader` | Captures what would have been downloaded. `FileReader` is needed because jszip reads Blob input through it.                                                                                                                                                  |
 
@@ -42,7 +43,8 @@ to drift out of sync.
   sender's tab disappears mid-receive, offer rejected, sender aborted.
 - **Resume:** a cut-off download continues and ends byte-perfect, sending only
   the remainder; resuming with nothing on disk transfers everything.
-- **Relay:** unknown share code surfaces an error.
+- **Relay:** unknown and malformed codes surface errors, a wrong password fails
+  on both sides, a share link works as the code.
 - **`watchDisconnect` unit tests:** graceful close, `failed` on either
   transport, a blip that recovers, a blip that does not, and `stop()`.
 

@@ -12,7 +12,7 @@ export interface TransferEntry {
 
 export type TransferEvent =
   /// Sender only
-  | { type: "code"; code: string }
+  | { type: "code"; code: string; expiresInSecs: number }
   | { type: "waitingPeer" }
   | { type: "connecting" }
   | { type: "handshaking" }

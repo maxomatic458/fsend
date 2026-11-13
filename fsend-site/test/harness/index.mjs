@@ -2,12 +2,24 @@
  * Installs the fake browser environment and provides the helpers the scenarios
  * are written against.
  */
+import { readFileSync } from "node:fs";
 import { installWebRtc, resetWebRtc } from "./webrtc.mjs";
 import { installRelay, resetRelay } from "./relay.mjs";
 import { installDom, resetDom, getDownloads } from "./dom.mjs";
 import { MemoryDirectoryHandle } from "./fs-access.mjs";
 
 export { MemoryDirectoryHandle, getDownloads };
+
+// The app loads its wasm with fetch(); hand it the bytes up front instead.
+const { initSync } = await import("../.build/app.mjs");
+initSync({
+  module: readFileSync(
+    new URL(
+      "../../src/lib/proto/pkg/fsend_proto_wasm_bg.wasm",
+      import.meta.url,
+    ),
+  ),
+});
 
 let peerConnections = [];
 

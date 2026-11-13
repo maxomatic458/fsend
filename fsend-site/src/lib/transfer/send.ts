@@ -32,7 +32,8 @@ export async function runSend(
     const files = await collectFiles(entries);
 
     session = await openSenderSession(abort, {
-      onCode: (code) => emit({ type: "code", code }),
+      onCode: (code, expiresInSecs) =>
+        emit({ type: "code", code, expiresInSecs }),
       onWaitingPeer: () => emit({ type: "waitingPeer" }),
       onHandshaking: () => emit({ type: "handshaking" }),
     });

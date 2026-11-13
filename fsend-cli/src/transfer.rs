@@ -224,7 +224,7 @@ pub enum TransferError {
     HandshakeTimeout,
     #[error("the endpoint closed while waiting for the peer")]
     EndpointClosed,
-    #[error("the relay handed over connection info for another transport")]
+    #[error("the peer sent connection info for another transport")]
     UnexpectedConnectionInfo,
     #[error("webrtc: {0}")]
     WebRtc(#[from] webrtc::error::Error),

@@ -11,7 +11,6 @@ import {
   makeRecorder,
   bytes,
   waitFor,
-  sleep,
 } from "./harness/index.mjs";
 
 const { runSend, runReceive, createDiskSink, createDownloadSink } =
@@ -346,11 +345,8 @@ describe("interrupted transfers", () => {
     const senderDone = runSend(makeEntries(spec), send.emit, controller.signal);
     await waitFor(() => send.record.code, { label: "share code" });
     controller.abort();
-    // No peer ever arrives, so the sender stays parked in waitForPeer and its
-    // promise never settles — the page would simply unmount. What matters is
-    // that the user is shown nothing.
-    void senderDone;
-    await sleep(50);
+    // Aborting closes the relay connection, which ends the wait for a peer.
+    await senderDone;
 
     assert.equal(
       send.record.error,
@@ -443,17 +439,71 @@ describe("resuming an interrupted download", () => {
 });
 
 describe("relay behaviour", () => {
-  test("an unknown share code surfaces an error", async () => {
+  const receive = async (code) => {
     const recv = makeRecorder();
     await runReceive(
-      "NOPE0000",
+      code,
       createDiskSink(new MemoryDirectoryHandle()),
       false,
       recv.emit,
       new AbortController().signal,
     );
-    assert.ok(recv.record.error, "receiver should report the bad code");
     assert.equal(recv.record.complete, false);
+    return recv.record.error ?? "";
+  };
+
+  test("an unknown share code surfaces an error", async () => {
+    assert.match(await receive("ZZZZ000000"), /no transfer with this code/i);
+  });
+
+  test("a malformed code is rejected before contacting the relay", async () => {
+    assert.match(await receive("K7Q2"), /invalid code/i);
+  });
+
+  test("a wrong password fails on both sides", async () => {
+    const send = makeRecorder();
+    const senderDone = runSend(
+      makeEntries({ "x.bin": bytes(100, 141) }),
+      send.emit,
+      new AbortController().signal,
+    );
+    const code = await waitFor(() => send.record.code, { label: "share code" });
+    const last = code.endsWith("0") ? "1" : "0";
+    const error = await receive(`${code.slice(0, -1)}${last}`);
+    await senderDone;
+
+    assert.match(error, /did not match/i);
+    assert.match(send.record.error ?? "", /did not match/i);
+  });
+
+  test("only the bare code is accepted", async () => {
+    const code = "K7Q29XMV4P";
+    for (const input of [`https://fsend.sh/receive#${code}`, ` ${code}`]) {
+      assert.match(await receive(input), /invalid code/i, input);
+    }
+  });
+
+  test("a lowercase code is accepted", async () => {
+    const send = makeRecorder();
+    const recv = makeRecorder();
+    const senderDone = runSend(
+      makeEntries({ "x.bin": bytes(100, 151) }),
+      send.emit,
+      new AbortController().signal,
+    );
+    const code = await waitFor(() => send.record.code, { label: "share code" });
+    assert.equal(code, code.toUpperCase(), "codes are shown upper-case");
+    await runReceive(
+      code.toLowerCase(),
+      createDiskSink(new MemoryDirectoryHandle()),
+      false,
+      recv.emit,
+      new AbortController().signal,
+    );
+    await senderDone;
+
+    assert.equal(recv.record.error, null);
+    assert.ok(recv.record.complete);
   });
 
   test("the connection is reported as direct", async () => {

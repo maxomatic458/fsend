@@ -20,3 +20,4 @@ export { createSendSession } from "../src/primitives/createSendSession";
 export { createProgressTracker } from "../src/primitives/createProgressTracker";
 export { summarize } from "../src/lib/stats";
 export { createRoot } from "solid-js";
+export { initSync } from "../src/lib/proto/pkg/fsend_proto_wasm";

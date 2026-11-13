@@ -147,7 +147,7 @@ export const OSES: Os[] = [
 
 export const USAGE = [
   { label: "Send", command: "fsend send file.txt folder/" },
-  { label: "Receive", command: "fsend receive 123456" },
+  { label: "Receive", command: "fsend receive K7Q29XMV4P" },
 ];
 
 export function detectPlatform(): { os: Os["id"]; key: string } {

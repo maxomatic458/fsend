@@ -8,13 +8,13 @@ authors.workspace = true
 [dependencies]
 fsend-proto.workspace = true
 axum = { version = "0.8.9", features = ["ws"] }
-futures = "0.3"
 clap.workspace = true
-dashmap = "6.1.0"
-rand = "0.10.1"
+serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["full"] }
-tower = "0.5.3"
-tower-http = { version = "0.6.8", features = ["cors"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+futures-util = "0.3.34"
+tokio-tungstenite.workspace = true

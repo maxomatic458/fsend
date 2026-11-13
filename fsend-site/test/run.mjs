@@ -1,14 +1,17 @@
 /**
- * Bundles src/lib to plain ESM with esbuild, then runs the suite under Node's
- * built-in test runner. Bundling (rather than mocking modules) means the tests
- * exercise the same code the browser ships.
+ * Builds the protocol wasm, bundles src/lib to plain ESM with esbuild, then
+ * runs the suite under Node's built-in test runner. Bundling (rather than
+ * mocking modules) means the tests exercise the same code the browser ships.
  */
 import { build } from "esbuild";
+import { buildWasm } from "../scripts/build-wasm.mjs";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
+
+buildWasm();
 
 await build({
   entryPoints: [join(here, "entry.ts")],

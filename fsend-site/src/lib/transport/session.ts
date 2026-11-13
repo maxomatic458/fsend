@@ -1,5 +1,4 @@
-import { RELAY_URL } from "../../config";
-import { RelayClient } from "./relay";
+import { RelayConnection } from "./relay";
 import {
   createOfferer,
   createAnswerer,
@@ -9,11 +8,17 @@ import {
   type DisconnectWatcher,
 } from "./webrtc";
 import { createControlChannel, type ControlChannel } from "./control";
-import type {
-  SenderToReceiver,
-  ReceiverToSender,
-  ConnectionInfo,
-} from "../types";
+import {
+  loadProto,
+  parseCode,
+  Rendezvous,
+  type ConnectionInfo,
+  type Transport,
+} from "../proto";
+import type { SenderToReceiver, ReceiverToSender } from "../types";
+
+const APP = "fsend-web";
+const TRANSPORTS: Transport[] = ["webrtc"];
 
 /// Live peer to peer session
 export interface Session<In, Out> {
@@ -29,12 +34,30 @@ export interface Session<In, Out> {
 export type SenderSession = Session<ReceiverToSender, SenderToReceiver>;
 export type ReceiverSession = Session<SenderToReceiver, ReceiverToSender>;
 
-function exchange(sdp: string): ConnectionInfo {
+function webRtcInfo(sdp: string): ConnectionInfo {
   return { type: "web_rtc", sdp, ice_candidates: [] };
 }
 
+function sdpOf(info: ConnectionInfo): string {
+  if (info.type !== "web_rtc") {
+    throw new Error("The peer sent connection details for another transport");
+  }
+  return info.sdp;
+}
+
+/// Pairs over the relay; aborting closes the connection, failing whatever waits on it.
+async function pair(
+  start: () => Rendezvous,
+  abort: AbortSignal,
+): Promise<RelayConnection> {
+  await loadProto();
+  const relay = new RelayConnection(start());
+  if (abort.aborted) relay.close();
+  else abort.addEventListener("abort", () => relay.close());
+  return relay;
+}
+
 function assemble<In, Out>(
-  relay: RelayClient,
   pc: RTCPeerConnection,
   controlChannel: RTCDataChannel,
   dataChannel: RTCDataChannel,
@@ -48,14 +71,13 @@ function assemble<In, Out>(
     disconnected: peer.promise,
     close() {
       peer.stop();
-      relay.close();
       pc.close();
     },
   };
 }
 
 export interface SenderSessionHooks {
-  onCode(code: string): void;
+  onCode(code: string, expiresInSecs: number): void;
   onWaitingPeer(): void;
   onHandshaking(): void;
 }
@@ -64,41 +86,31 @@ export async function openSenderSession(
   abort: AbortSignal,
   hooks: SenderSessionHooks,
 ): Promise<SenderSession | null> {
-  const relay = await RelayClient.connect(RELAY_URL);
-  if (abort.aborted) {
+  const relay = await pair(() => Rendezvous.sender(TRANSPORTS, APP), abort);
+  try {
+    const { code, expires_in } = await relay.expect("code");
+    hooks.onCode(code, expires_in);
+    hooks.onWaitingPeer();
+
+    await relay.expect("paired");
+    hooks.onHandshaking();
+
+    const { connection, offerSdp } = await createOfferer();
+    const { pc, controlChannel, dataChannel } = connection;
+    abort.addEventListener("abort", () => pc.close());
+
+    relay.sendConnection(webRtcInfo(offerSdp));
+    await applyAnswer(pc, sdpOf(await relay.connection()));
+    await waitConnected(pc, [controlChannel, dataChannel]);
+    if (abort.aborted) {
+      pc.close();
+      return null;
+    }
+
+    return assemble(pc, controlChannel, dataChannel);
+  } finally {
     relay.close();
-    return null;
   }
-
-  const code = await relay.createSession();
-  hooks.onCode(code);
-  hooks.onWaitingPeer();
-
-  await relay.waitForPeer();
-  if (abort.aborted) {
-    relay.close();
-    return null;
-  }
-  hooks.onHandshaking();
-
-  const { connection, offerSdp } = await createOfferer();
-  const { pc, controlChannel, dataChannel } = connection;
-  abort.addEventListener("abort", () => {
-    relay.close();
-    pc.close();
-  });
-
-  relay.sendExchange(exchange(offerSdp));
-  const peerInfo = await relay.recvExchange();
-  await applyAnswer(pc, peerInfo.sdp);
-  await waitConnected(pc, [controlChannel, dataChannel]);
-  if (abort.aborted) {
-    relay.close();
-    pc.close();
-    return null;
-  }
-
-  return assemble(relay, pc, controlChannel, dataChannel);
 }
 
 export async function openReceiverSession(
@@ -106,37 +118,33 @@ export async function openReceiverSession(
   abort: AbortSignal,
   hooks: { onHandshaking(): void },
 ): Promise<ReceiverSession | null> {
-  const relay = await RelayClient.connect(RELAY_URL);
-  if (abort.aborted) {
+  await loadProto();
+  const parsed = parseCode(code);
+  if ("error" in parsed) throw new Error(`Invalid code: ${parsed.message}`);
+
+  const relay = await pair(
+    () => Rendezvous.receiver(parsed.code, TRANSPORTS, APP),
+    abort,
+  );
+  try {
+    await relay.expect("paired");
+
+    const answerer = await createAnswerer(sdpOf(await relay.connection()));
+    const pc = answerer.pc;
+    abort.addEventListener("abort", () => pc.close());
+
+    relay.sendConnection(webRtcInfo(answerer.answerSdp));
+
+    const { controlChannel, dataChannel } = await answerer.channelsReady;
+    await waitConnected(pc, [controlChannel, dataChannel]);
+    if (abort.aborted) {
+      pc.close();
+      return null;
+    }
+    hooks.onHandshaking();
+
+    return assemble(pc, controlChannel, dataChannel);
+  } finally {
     relay.close();
-    return null;
   }
-
-  await relay.joinSession(code.toUpperCase());
-
-  const senderInfo = await relay.recvExchange();
-  if (abort.aborted) {
-    relay.close();
-    return null;
-  }
-
-  const answerer = await createAnswerer(senderInfo.sdp);
-  const pc = answerer.pc;
-  abort.addEventListener("abort", () => {
-    relay.close();
-    pc.close();
-  });
-
-  relay.sendExchange(exchange(answerer.answerSdp));
-
-  const { controlChannel, dataChannel } = await answerer.channelsReady;
-  await waitConnected(pc, [controlChannel, dataChannel]);
-  if (abort.aborted) {
-    relay.close();
-    pc.close();
-    return null;
-  }
-  hooks.onHandshaking();
-
-  return assemble(relay, pc, controlChannel, dataChannel);
 }

@@ -8,3 +8,4 @@ secring.*
 *.gpg
 
 publish-apt.sh
+docs/PROTOCOL.md

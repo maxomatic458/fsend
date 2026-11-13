@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-pub const DEFAULT_RELAY_URL: &str = "wss://relay.fsend.sh/ws";
+pub const DEFAULT_RELAY_URL: &str = "wss://relay.fsend.sh";
 pub const DEFAULT_DOWNLOAD_URL: &str = "https://fsend.sh";
 
 #[derive(Parser)]
@@ -14,11 +14,11 @@ pub struct Args {
     #[clap(long, short, default_value = "error")]
     pub log_level: tracing::Level,
 
-    /// Relay server used to introduce the two peers.
+    /// Relay server used to introduce the two peers. `/relay` is appended to it.
     #[clap(long, default_value = DEFAULT_RELAY_URL)]
     pub relay_url: String,
 
-    /// Site the receiver opens. `/receive/<code>` is appended to it.
+    /// Site the receiver opens. `/receive#<code>` is appended to it.
     #[clap(long, default_value = DEFAULT_DOWNLOAD_URL)]
     pub download_url: String,
 
@@ -35,7 +35,7 @@ pub enum Mode {
         #[clap(required = true)]
         files: Vec<PathBuf>,
     },
-    /// Receive files or folders using a share code or link.
+    /// Receive files or folders using a share code.
     #[clap(name = "receive", aliases = &["r"])]
     Receive {
         /// Overwrite existing files instead of resuming them.
@@ -46,7 +46,7 @@ pub enum Mode {
         #[clap(long, short, default_value = ".")]
         output_dir: PathBuf,
 
-        /// Share code, or a link such as https://fsend.sh/receive/AB12CD34
+        /// Share code, e.g. K7Q29XMV4P
         code: String,
 
         /// Accept the offer without prompting.

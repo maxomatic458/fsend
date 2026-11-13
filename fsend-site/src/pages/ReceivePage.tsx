@@ -1,5 +1,5 @@
-import { Show } from "solid-js";
-import { useNavigate, useParams } from "@solidjs/router";
+import { createEffect, Show } from "solid-js";
+import { useLocation, useNavigate } from "@solidjs/router";
 import { Title, Meta, Link } from "@solidjs/meta";
 import { FiFolder } from "solid-icons/fi";
 import { SITE_URL } from "../lib/links";
@@ -18,12 +18,17 @@ import { formatBytes } from "../lib/format";
 
 export function ReceivePage() {
   const navigate = useNavigate();
-  const params = useParams<{ code?: string }>();
-  const receive = createReceiveSession(params.code ?? "");
+  const location = useLocation();
+  const receive = createReceiveSession();
   const toDisk = () => receive.mode() === "disk";
 
   createWindowDropTarget(() => {});
   const exitGuard = createExitGuard(receive.isTransferring);
+
+  // Share links carry the code in the fragment, which never reaches a server.
+  createEffect(() => {
+    if (location.hash) receive.setCode(location.hash.slice(1));
+  });
 
   const goBack = () => navigate("/");
   const cancelTransfer = () => exitGuard.withoutPrompt(goBack);
@@ -59,11 +64,9 @@ export function ReceivePage() {
           <div class="w-full max-w-[560px] mx-auto flex flex-col items-center gap-4 pt-6">
             <CodeInput
               value={receive.code()}
-              onChange={receive.setCode}
+              onInput={receive.setCode}
               onComplete={() => receive.isReady() && receive.start()}
             />
-
-            <p class="text-sm text-ink-dim">Paste the sender's link instead</p>
 
             <div class="w-full flex flex-col gap-3">
               {/* If the File System Access API is available the user can choose download type */}

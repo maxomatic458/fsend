@@ -1,84 +1,64 @@
 use serde::{Deserialize, Serialize};
 
+pub const VERSION: u32 = 1;
+pub const PATH: &str = "/relay";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
-pub enum Protocol {
-    WebRtc,
+pub enum Transport {
     Iroh,
+    Webrtc,
 }
 
-/// How to reach a peer, forwarded by the relay as is.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "type")]
-pub enum ConnectionInfo {
-    WebRtc {
-        sdp: String,
-        ice_candidates: Vec<String>,
-    },
-    Iroh {
-        node_id: String,
-        addrs: Vec<String>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CreateSessionRequest {
-    pub capabilities: Vec<Protocol>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct JoinSessionRequest {
-    pub code: String,
-    pub capabilities: Vec<Protocol>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExchangeRequest {
-    pub connection_info: ConnectionInfo,
-}
-
+/// Control messages are text frames; signals after `paired` are binary frames.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum ClientMessage {
-    CreateSession(CreateSessionRequest),
-    JoinSession(JoinSessionRequest),
-    Exchange(ExchangeRequest),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CreateSessionAnswer {
-    pub code: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct JoinSessionAnswer {
-    pub protocol: Protocol,
-}
-
-/// Sent to the sender when a peer joins their session.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PeerJoinedAnswer {
-    pub protocol: Protocol,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExchangeAnswer {
-    pub connection_info: ConnectionInfo,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ErrorAnswer {
-    pub message: String,
+    Create {
+        version: u32,
+        transports: Vec<Transport>,
+    },
+    Join {
+        version: u32,
+        nameplate: String,
+        transports: Vec<Transport>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum ServerMessage {
-    CreateSession(CreateSessionAnswer),
-    JoinSession(JoinSessionAnswer),
-    PeerJoined(PeerJoinedAnswer),
-    Exchange(ExchangeAnswer),
-    Error(ErrorAnswer),
+    Created {
+        nameplate: String,
+        /// Seconds until an unjoined session expires.
+        expires_in: u32,
+    },
+    /// Sent to both sides once the receiver joined.
+    Paired {
+        transport: Transport,
+    },
+    Error {
+        code: ErrorCode,
+        message: String,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    Version,
+    NotFound,
+    Expired,
+    NoCommonTransport,
+    PeerLeft,
+    Busy,
+    Protocol,
+    #[serde(other)]
+    Unknown,
 }
 
 #[cfg(test)]
@@ -86,70 +66,85 @@ mod tests {
     use super::*;
     use crate::testing::pinned;
 
-    fn webrtc() -> ConnectionInfo {
-        ConnectionInfo::WebRtc {
-            sdp: "v=0".into(),
-            ice_candidates: vec!["c".into()],
-        }
-    }
-
     #[test]
     fn client_messages_keep_their_wire_format() {
         pinned(
-            ClientMessage::CreateSession(CreateSessionRequest {
-                capabilities: vec![Protocol::Iroh, Protocol::WebRtc],
-            }),
-            r#"{"type":"create_session","capabilities":["iroh","web_rtc"]}"#,
+            ClientMessage::Create {
+                version: 1,
+                transports: vec![Transport::Iroh, Transport::Webrtc],
+            },
+            r#"{"type":"create","version":1,"transports":["iroh","webrtc"]}"#,
         );
         pinned(
-            ClientMessage::JoinSession(JoinSessionRequest {
-                code: "AB12CD34".into(),
-                capabilities: vec![Protocol::WebRtc],
-            }),
-            r#"{"type":"join_session","code":"AB12CD34","capabilities":["web_rtc"]}"#,
-        );
-        pinned(
-            ClientMessage::Exchange(ExchangeRequest {
-                connection_info: webrtc(),
-            }),
-            r#"{"type":"exchange","connection_info":{"type":"web_rtc","sdp":"v=0","ice_candidates":["c"]}}"#,
+            ClientMessage::Join {
+                version: 1,
+                nameplate: "K7Q2".into(),
+                transports: vec![Transport::Webrtc],
+            },
+            r#"{"type":"join","version":1,"nameplate":"K7Q2","transports":["webrtc"]}"#,
         );
     }
 
     #[test]
     fn server_messages_keep_their_wire_format() {
         pinned(
-            ServerMessage::CreateSession(CreateSessionAnswer {
-                code: "AB12CD34".into(),
-            }),
-            r#"{"type":"create_session","code":"AB12CD34"}"#,
+            ServerMessage::Created {
+                nameplate: "K7Q2".into(),
+                expires_in: 300,
+            },
+            r#"{"type":"created","nameplate":"K7Q2","expires_in":300}"#,
         );
         pinned(
-            ServerMessage::JoinSession(JoinSessionAnswer {
-                protocol: Protocol::Iroh,
-            }),
-            r#"{"type":"join_session","protocol":"iroh"}"#,
+            ServerMessage::Paired {
+                transport: Transport::Iroh,
+            },
+            r#"{"type":"paired","transport":"iroh"}"#,
         );
         pinned(
-            ServerMessage::PeerJoined(PeerJoinedAnswer {
-                protocol: Protocol::WebRtc,
-            }),
-            r#"{"type":"peer_joined","protocol":"web_rtc"}"#,
+            ServerMessage::Error {
+                code: ErrorCode::NoCommonTransport,
+                message: "m".into(),
+            },
+            r#"{"type":"error","code":"no_common_transport","message":"m"}"#,
         );
-        pinned(
-            ServerMessage::Exchange(ExchangeAnswer {
-                connection_info: ConnectionInfo::Iroh {
-                    node_id: "n".into(),
-                    addrs: vec!["10.0.0.1:1234".into()],
-                },
-            }),
-            r#"{"type":"exchange","connection_info":{"type":"iroh","node_id":"n","addrs":["10.0.0.1:1234"]}}"#,
+    }
+
+    #[test]
+    fn unknown_message_types_codes_and_fields_are_tolerated() {
+        let parse = |json| serde_json::from_str::<ServerMessage>(json).unwrap();
+        assert_eq!(
+            parse(r#"{"type":"motd","text":"hi"}"#),
+            ServerMessage::Unknown
         );
-        pinned(
-            ServerMessage::Error(ErrorAnswer {
-                message: "session not found".into(),
-            }),
-            r#"{"type":"error","message":"session not found"}"#,
+        assert_eq!(
+            parse(r#"{"type":"paired","transport":"webrtc","extra":1}"#),
+            ServerMessage::Paired {
+                transport: Transport::Webrtc
+            }
+        );
+        assert_eq!(
+            parse(r#"{"type":"error","code":"teapot","message":""}"#),
+            ServerMessage::Error {
+                code: ErrorCode::Unknown,
+                message: String::new()
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_transports_are_rejected() {
+        for json in [
+            r#"{"type":"create","version":1,"transports":["iroh","quic"]}"#,
+            r#"{"type":"join","version":1,"nameplate":"K7Q2","transports":["quic"]}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ClientMessage>(json).is_err(),
+                "{json}"
+            );
+        }
+        assert!(
+            serde_json::from_str::<ServerMessage>(r#"{"type":"paired","transport":"quic"}"#)
+                .is_err()
         );
     }
 }

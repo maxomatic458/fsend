@@ -1,0 +1,28 @@
+[package]
+name = "fsend-proto-wasm"
+description = "WebAssembly bindings of fsend-proto for the fsend web app"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fsend-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+wasm-bindgen = "=0.2.130"
+
+# Browser randomness for getrandom
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4.3", features = ["wasm_js"] }
+getrandom-02 = { package = "getrandom", version = "0.2.17", features = ["js"] }
+
+[dev-dependencies]
+fsend-proto = { workspace = true, features = ["ts"] }
+ts-rs = "12.0.1"

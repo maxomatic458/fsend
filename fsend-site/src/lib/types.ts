@@ -21,25 +21,6 @@ export type ReceiverToSender =
   | { type: "AcceptFilesSkip"; files: (FilesToSkip | null)[] }
   | { type: "RejectFiles" };
 
-// Relay protocol messages
-export type ClientMessage =
-  | { type: "create_session"; capabilities: string[] }
-  | { type: "join_session"; code: string; capabilities: string[] }
-  | { type: "exchange"; connection_info: ConnectionInfo };
-
-export type ServerMessage =
-  | { type: "create_session"; code: string }
-  | { type: "join_session"; protocol: string }
-  | { type: "peer_joined"; protocol: string }
-  | { type: "exchange"; connection_info: ConnectionInfo }
-  | { type: "error"; message: string };
-
-export interface ConnectionInfo {
-  type: "web_rtc";
-  sdp: string;
-  ice_candidates: string[];
-}
-
 export interface SelectedEntry {
   kind: "file" | "directory";
   name: string;

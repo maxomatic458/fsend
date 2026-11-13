@@ -13,11 +13,14 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use fsend_cli::cli::{Args, Mode};
 use fsend_cli::iroh::IrohTransfer;
-use fsend_cli::relay::RelayClient;
-use fsend_cli::transfer::{self, ReceiveArgs, SendArgs, TransferError, Transport};
+use fsend_cli::relay::{APP, Relay, RelayError, TRANSPORTS};
+use fsend_cli::transfer::{self, ReceiveArgs, SendArgs, TransferError};
 use fsend_cli::webrtc::WebRtcTransfer;
+use fsend_proto::code::Code;
+use fsend_proto::pairing::ConnectionInfo;
 use fsend_proto::peer::{FilesAvailable, PROTO_VERSION};
-use fsend_proto::relay::{ConnectionInfo, Protocol};
+use fsend_proto::relay::Transport;
+use fsend_proto::rendezvous::Rendezvous;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -25,10 +28,15 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     };
 
-    match report
+    let user_error = report
         .downcast_ref::<TransferError>()
         .and_then(TransferError::user_error)
-    {
+        .or_else(|| {
+            report
+                .downcast_ref::<RelayError>()
+                .and_then(RelayError::user_error)
+        });
+    match user_error {
         Some(msg) => eprintln!("{msg}"),
         None => eprintln!("{report:?}"),
     }
@@ -83,44 +91,29 @@ fn print_version() {
     }
 }
 
-/// Accepts a bare code or a share link like `https://fsend.sh/receive/AB12CD34`.
-/// Codes are uppercase, so a hand-typed lowercase one is normalised too.
-fn parse_code(input: &str) -> String {
-    let cleaned = input.trim();
-    let cleaned = cleaned.split(['?', '#']).next().unwrap_or(cleaned);
-    let cleaned = cleaned.trim_end_matches('/');
-    cleaned.rsplit('/').next().unwrap_or(cleaned).to_uppercase()
-}
-
-/// The link a receiver can open in a browser, e.g.
-/// `https://fsend.sh` + `AB12CD34` -> `https://fsend.sh/receive/AB12CD34`.
-fn download_link(base: &str, code: &str) -> String {
-    format!("{}/receive/{}", base.trim_end_matches('/'), code)
-}
-
 async fn connect_as_sender(
-    protocol: Protocol,
-    relay: &mut RelayClient,
-) -> color_eyre::Result<Box<dyn Transport>> {
-    match protocol {
-        Protocol::Iroh => {
+    via: Transport,
+    relay: &mut Relay,
+) -> color_eyre::Result<Box<dyn transfer::Transport>> {
+    match via {
+        Transport::Iroh => {
             let endpoint = IrohTransfer::create_endpoint().await?;
             let my_info = IrohTransfer::local_connection_info(&endpoint).await;
 
-            relay.send_exchange(my_info).await?;
-            let _peer_info = relay.recv_exchange().await?;
+            relay.send_connection(my_info).await?;
+            let _peer_info = relay.connection().await?;
 
             Ok(Box::new(IrohTransfer::accept(endpoint).await?))
         }
-        Protocol::WebRtc => {
+        Transport::Webrtc => {
             let (mut wrt, offer_sdp) = WebRtcTransfer::create_offerer().await?;
             let my_info = ConnectionInfo::WebRtc {
                 sdp: offer_sdp,
                 ice_candidates: vec![],
             };
 
-            relay.send_exchange(my_info).await?;
-            let peer_info = relay.recv_exchange().await?;
+            relay.send_connection(my_info).await?;
+            let peer_info = relay.connection().await?;
 
             let answer_sdp = match &peer_info {
                 ConnectionInfo::WebRtc { sdp, .. } => sdp.clone(),
@@ -134,21 +127,21 @@ async fn connect_as_sender(
 }
 
 async fn connect_as_receiver(
-    protocol: Protocol,
-    relay: &mut RelayClient,
-) -> color_eyre::Result<Box<dyn Transport>> {
-    match protocol {
-        Protocol::Iroh => {
+    transport: Transport,
+    relay: &mut Relay,
+) -> color_eyre::Result<Box<dyn transfer::Transport>> {
+    match transport {
+        Transport::Iroh => {
             let endpoint = IrohTransfer::create_endpoint().await?;
             let my_info = IrohTransfer::local_connection_info(&endpoint).await;
 
-            let peer_info = relay.recv_exchange().await?;
-            relay.send_exchange(my_info).await?;
+            let peer_info = relay.connection().await?;
+            relay.send_connection(my_info).await?;
 
             Ok(Box::new(IrohTransfer::connect(endpoint, peer_info).await?))
         }
-        Protocol::WebRtc => {
-            let peer_info = relay.recv_exchange().await?;
+        Transport::Webrtc => {
+            let peer_info = relay.connection().await?;
             let offer_sdp = match &peer_info {
                 ConnectionInfo::WebRtc { sdp, .. } => sdp.clone(),
                 _ => return Err(TransferError::UnexpectedConnectionInfo.into()),
@@ -159,7 +152,7 @@ async fn connect_as_receiver(
                 sdp: answer_sdp,
                 ice_candidates: vec![],
             };
-            relay.send_exchange(my_info).await?;
+            relay.send_connection(my_info).await?;
 
             wrt.wait_connected().await?;
             Ok(Box::new(wrt))
@@ -178,22 +171,24 @@ async fn run_send(
         return Err(TransferError::PathsNotFound(missing).into());
     }
 
-    let mut relay = RelayClient::connect(relay_url).await?;
-    let code = relay
-        .create_session(vec![Protocol::Iroh, Protocol::WebRtc])
-        .await?;
+    let rendezvous = Rendezvous::sender(TRANSPORTS.to_vec(), APP);
+    let mut relay = Relay::connect(relay_url, rendezvous).await?;
+    let code = relay.code().await?;
+    let link = code.link(download_url);
+    let code = code.to_string();
 
-    println!("Session code: {}\n", code.bright_white());
+    println!("Code: {}\n", code.bright_white());
     println!("On the other peer, run:\n");
     println!("  {} {}\n", "fsend receive".yellow(), code.yellow());
 
     println!("or open in a browser:\n");
-    println!("  {}\n", download_link(download_url, &code).blue());
+    println!("  {}\n", link.blue());
 
-    let protocol = relay.wait_for_peer().await?;
-    tracing::info!("peer joined, negotiated protocol: {:?}", protocol);
+    let transport = relay.paired().await?;
+    tracing::info!("paired via {transport:?}");
 
-    let mut transport = connect_as_sender(protocol, &mut relay).await?;
+    let mut transport = connect_as_sender(transport, &mut relay).await?;
+    drop(relay);
     announce_connection(transport.as_ref()).await;
 
     let progress = Progress::default();
@@ -217,15 +212,15 @@ async fn run_receive(
     resume: bool,
     auto_accept: bool,
 ) -> color_eyre::Result<()> {
-    let code = parse_code(&code);
+    let code: Code = code.parse().map_err(RelayError::from)?;
 
-    let mut relay = RelayClient::connect(relay_url).await?;
-    let protocol = relay
-        .join_session(code, vec![Protocol::Iroh, Protocol::WebRtc])
-        .await?;
-    tracing::info!("joined session, negotiated protocol: {:?}", protocol);
+    let rendezvous = Rendezvous::receiver(&code, TRANSPORTS.to_vec(), APP);
+    let mut relay = Relay::connect(relay_url, rendezvous).await?;
+    let transport = relay.paired().await?;
+    tracing::info!("paired via {transport:?}");
 
-    let mut transport = connect_as_receiver(protocol, &mut relay).await?;
+    let mut transport = connect_as_receiver(transport, &mut relay).await?;
+    drop(relay);
     announce_connection(transport.as_ref()).await;
 
     let progress = Progress::default();
@@ -251,7 +246,7 @@ async fn run_receive(
     Ok(())
 }
 
-async fn announce_connection(transport: &dyn Transport) {
+async fn announce_connection(transport: &dyn transfer::Transport) {
     tokio::time::sleep(Duration::from_secs(2)).await;
     let conn_type = transport.connection_type_name();
     println!("Connection type: {}", colorize_conn_type(&conn_type));
@@ -393,49 +388,6 @@ fn colorize_conn_type(conn_type: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fsend_cli::cli::DEFAULT_DOWNLOAD_URL;
-
-    #[test]
-    fn accepts_codes_and_share_links() {
-        assert_eq!(parse_code("AB12CD34"), "AB12CD34");
-        assert_eq!(parse_code("ab12cd34"), "AB12CD34");
-        assert_eq!(parse_code("  AB12CD34\n"), "AB12CD34");
-        assert_eq!(parse_code("https://fsend.sh/receive/AB12CD34"), "AB12CD34");
-        assert_eq!(
-            parse_code("http://localhost:3000/receive/YJ6HM1DC"),
-            "YJ6HM1DC"
-        );
-        // Trailing slash, query and fragment must not end up in the code.
-        assert_eq!(parse_code("https://fsend.sh/receive/AB12CD34/"), "AB12CD34");
-        assert_eq!(
-            parse_code("https://fsend.sh/receive/AB12CD34?ref=x"),
-            "AB12CD34"
-        );
-        assert_eq!(
-            parse_code("https://fsend.sh/receive/AB12CD34#top"),
-            "AB12CD34"
-        );
-    }
-
-    #[test]
-    fn builds_the_download_link() {
-        assert_eq!(
-            download_link("https://fsend.sh", "AB12CD34"),
-            "https://fsend.sh/receive/AB12CD34"
-        );
-        // A trailing slash must not double up.
-        assert_eq!(
-            download_link("http://localhost:3000/", "AB12CD34"),
-            "http://localhost:3000/receive/AB12CD34"
-        );
-    }
-
-    #[test]
-    fn a_printed_link_is_accepted_back_as_a_code() {
-        let code = "AB12CD34";
-        let link = download_link(DEFAULT_DOWNLOAD_URL, code);
-        assert_eq!(parse_code(&link), code);
-    }
 
     #[test]
     fn progress_bars_fill_files_in_order() {

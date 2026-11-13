@@ -1,5 +1,8 @@
+pub mod code;
+pub mod pairing;
 pub mod peer;
 pub mod relay;
+pub mod rendezvous;
 
 #[cfg(test)]
 mod testing {

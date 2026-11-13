@@ -17,5 +17,4 @@ export const routes = [
   { path: "/send", component: page(SendPage) },
   { path: "/download", component: page(DownloadPage) },
   { path: "/receive", component: page(ReceivePage) },
-  { path: "/receive/:code", component: page(ReceivePage) },
 ];

@@ -1,97 +1,110 @@
-/**
- * In-process stand-in for fsend-relay, speaking the same JSON protocol as
- * src/lib/types.ts, plus a WebSocket shim so RelayClient connects to it
- * unmodified.
- */
+const ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const TRANSPORTS = ["iroh", "webrtc"];
+const sessions = new Map(); // nameplate -> { sender, transports }
+let counter = 0;
 
-const sessions = new Map(); // code -> { sender, receiver, capabilities }
-let codeCounter = 0;
-
-function nextCode() {
-  // Same shape as the real relay: 8 chars, A-Z0-9.
-  const n = (++codeCounter).toString(36).toUpperCase().padStart(4, "0");
-  return `TEST${n}`.slice(0, 8);
-}
-
-function negotiate(a, b) {
-  if (a.includes("iroh") && b.includes("iroh")) return "iroh";
-  if (a.includes("web_rtc") && b.includes("web_rtc")) return "web_rtc";
-  return null;
+function nextNameplate() {
+  // Four symbols of the code alphabet, like the real relay hands out.
+  let n = ++counter;
+  let nameplate = "";
+  for (let i = 0; i < 4; i++, n = Math.floor(n / 32)) {
+    nameplate = ALPHABET[n % ALPHABET.length] + nameplate;
+  }
+  return nameplate;
 }
 
 class FakeWebSocket {
+  static CONNECTING = 0;
+  static OPEN = 1;
+  static CLOSED = 3;
+
   constructor(url) {
     this.url = url;
-    this.readyState = 0;
+    this.readyState = FakeWebSocket.CONNECTING;
     this.onopen = null;
     this.onmessage = null;
     this.onerror = null;
     this.onclose = null;
-    this._session = null;
-    this._role = null;
+    this._peer = null;
+    this._nameplate = null;
     setTimeout(() => {
-      if (this.readyState !== 0) return;
-      this.readyState = 1;
+      if (this.readyState !== FakeWebSocket.CONNECTING) return;
+      if (!url.endsWith("/relay")) return this.close();
+      this.readyState = FakeWebSocket.OPEN;
       this.onopen?.({});
     }, 0);
   }
 
-  _deliver(obj) {
+  _deliver(data) {
     setTimeout(() => {
-      if (this.readyState === 1)
-        this.onmessage?.({ data: JSON.stringify(obj) });
+      if (this.readyState === FakeWebSocket.OPEN) this.onmessage?.({ data });
     }, 0);
   }
 
-  send(raw) {
-    const msg = JSON.parse(raw);
+  _json(message) {
+    this._deliver(JSON.stringify(message));
+  }
 
-    if (msg.type === "create_session") {
-      const code = nextCode();
-      sessions.set(code, {
-        sender: this,
-        receiver: null,
-        capabilities: msg.capabilities,
-      });
-      this._session = code;
-      this._role = "sender";
-      this._deliver({ type: "create_session", code });
+  _fail(code) {
+    this._json({ type: "error", code, message: code });
+    setTimeout(() => this.close(), 0);
+  }
+
+  send(frame) {
+    if (typeof frame !== "string") {
+      if (!this._peer) return this._fail("protocol");
+      // A copy, as an ArrayBuffer for binaryType "arraybuffer".
+      return this._peer._deliver(new Uint8Array(frame).buffer);
+    }
+    // Only the first message is a text frame.
+    if (this._nameplate || this._peer) return this._fail("protocol");
+
+    const msg = JSON.parse(frame);
+    if (msg.version !== 1) return this._fail("version");
+    if (!msg.transports?.every((t) => TRANSPORTS.includes(t))) {
+      return this._fail("protocol");
+    }
+
+    if (msg.type === "create") {
+      const nameplate = nextNameplate();
+      sessions.set(nameplate, { sender: this, transports: msg.transports });
+      this._nameplate = nameplate;
+      this._json({ type: "created", nameplate, expires_in: 300 });
       return;
     }
 
-    if (msg.type === "join_session") {
-      const session = sessions.get(msg.code);
-      if (!session) {
-        this._deliver({ type: "error", message: "unknown session" });
-        return;
+    if (msg.type === "join") {
+      const session = sessions.get(msg.nameplate);
+      sessions.delete(msg.nameplate);
+      if (!session) return this._fail("not_found");
+      const transport = session.transports.find((t) =>
+        msg.transports.includes(t),
+      );
+      if (!transport) {
+        session.sender._fail("no_common_transport");
+        return this._fail("no_common_transport");
       }
-      const protocol = negotiate(session.capabilities, msg.capabilities);
-      if (!protocol) {
-        this._deliver({ type: "error", message: "no common protocol" });
-        return;
+      this._peer = session.sender;
+      session.sender._peer = this;
+      for (const side of [this, session.sender]) {
+        side._json({ type: "paired", transport });
       }
-      session.receiver = this;
-      this._session = msg.code;
-      this._role = "receiver";
-      this._deliver({ type: "join_session", protocol });
-      session.sender._deliver({ type: "peer_joined", protocol });
       return;
     }
 
-    if (msg.type === "exchange") {
-      const session = sessions.get(this._session);
-      if (!session) return;
-      const peer = this._role === "sender" ? session.receiver : session.sender;
-      peer?._deliver({
-        type: "exchange",
-        connection_info: msg.connection_info,
-      });
-      return;
-    }
+    this._fail("protocol");
   }
 
   close() {
-    this.readyState = 3;
+    if (this.readyState === FakeWebSocket.CLOSED) return;
+    this.readyState = FakeWebSocket.CLOSED;
+    if (this._nameplate) sessions.delete(this._nameplate);
+    const peer = this._peer;
+    this._peer = null;
+    if (peer?._peer === this) {
+      peer._peer = null;
+      peer._fail("peer_left");
+    }
     this.onclose?.({});
   }
 }
@@ -102,5 +115,5 @@ export function installRelay(globals) {
 
 export function resetRelay() {
   sessions.clear();
-  codeCounter = 0;
+  counter = 0;
 }

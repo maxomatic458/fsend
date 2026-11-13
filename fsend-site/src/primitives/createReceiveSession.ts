@@ -7,6 +7,7 @@ import {
 } from "../lib/files/storage";
 import { createDiskSink, createDownloadSink } from "../lib/transfer/sinks";
 import { createTransferRun, stepOf } from "./createTransferRun";
+import { CODE_LENGTH } from "../lib/proto";
 import type { FilesAvailable } from "../lib/types";
 
 export type ReceiveState =
@@ -18,7 +19,7 @@ export type ReceiveState =
   | "completed"
   | "error";
 
-export function createReceiveSession(initialCode = "") {
+export function createReceiveSession() {
   const [state, setState] = createSignal<ReceiveState>("input");
   const run = createTransferRun();
 
@@ -28,7 +29,7 @@ export function createReceiveSession(initialCode = "") {
     canUseDisk ? "disk" : "download",
   );
 
-  const [code, setCodeRaw] = createSignal(normalizeCode(initialCode));
+  const [code, setCodeRaw] = createSignal("");
   const [offered, setOffered] = createSignal<FilesAvailable[]>([]);
   const [folder, setFolder] = createSignal<FileSystemDirectoryHandle | null>(
     null,
@@ -51,7 +52,8 @@ export function createReceiveSession(initialCode = "") {
 
   /// Writing to disk needs somewhere to write before it can start.
   const isReady = () =>
-    code().length === 8 && (mode() === "download" || folder() !== null);
+    code().length === CODE_LENGTH &&
+    (mode() === "download" || folder() !== null);
 
   const start = () => {
     if (!isReady()) return;
@@ -129,7 +131,7 @@ export function createReceiveSession(initialCode = "") {
     /** Which of Enter code / Connect / Receive is in progress. */
     step: () => stepOf(state(), "input"),
     code,
-    setCode: (value: string) => setCodeRaw(normalizeCode(value)),
+    setCode: setCodeRaw,
     offered,
     folder,
     resume,
@@ -145,11 +147,4 @@ export function createReceiveSession(initialCode = "") {
       setState("input");
     },
   };
-}
-
-function normalizeCode(input: string): string {
-  return input
-    .toUpperCase()
-    .replace(/[^A-Z0-9]/g, "")
-    .slice(0, 8);
 }
