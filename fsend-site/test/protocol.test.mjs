@@ -8,6 +8,7 @@ const {
   Role,
   acceptFiles,
   checkAccept,
+  parseServerMessage,
   presentBytes,
   topEntries,
   validateOffer,
@@ -62,6 +63,30 @@ describe("control frames", () => {
       const decoder = new FrameDecoder(Role.Receiver);
       decoder.push(frame);
       assert.throws(() => decoder.next());
+    });
+  }
+});
+
+describe("relay messages", () => {
+  test("a valid message parses", () => {
+    assert.deepEqual(
+      parseServerMessage('{"type":"paired","transport":"webrtc","extra":1}'),
+      { type: "paired", transport: "webrtc" },
+    );
+  });
+
+  for (const [name, text] of [
+    ["an unknown message", '{"type":"motd","text":"hi"}'],
+    ["an unknown error code", '{"type":"error","code":"teapot","message":""}'],
+    ["an unknown transport", '{"type":"paired","transport":"quic"}'],
+    [
+      "a client message",
+      '{"type":"join","version":1,"nameplate":"K7Q2","transports":[]}',
+    ],
+    ["malformed JSON", "{"],
+  ]) {
+    test(`${name} is an error`, () => {
+      assert.throws(() => parseServerMessage(text));
     });
   }
 });

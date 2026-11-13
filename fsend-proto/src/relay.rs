@@ -44,8 +44,6 @@ pub enum ServerMessage {
         code: ErrorCode,
         message: String,
     },
-    #[serde(other)]
-    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,8 +57,6 @@ pub enum ErrorCode {
     PeerLeft,
     Busy,
     Protocol,
-    #[serde(other)]
-    Unknown,
 }
 
 #[cfg(test)]
@@ -112,23 +108,29 @@ mod tests {
     }
 
     #[test]
-    fn unknown_message_types_codes_and_fields_are_tolerated() {
-        let parse = |json| serde_json::from_str::<ServerMessage>(json).unwrap();
+    fn unknown_types_and_codes_fail_to_parse() {
+        for json in [
+            r#"{"type":"motd","text":"hi"}"#,
+            r#"{"type":"error","code":"teapot","message":""}"#,
+            r#"{"type":"create","version":1,"transports":[]}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ServerMessage>(json).is_err(),
+                "{json}"
+            );
+        }
+        assert!(serde_json::from_str::<ClientMessage>(r#"{"type":"created"}"#).is_err());
+    }
+
+    #[test]
+    fn unknown_fields_are_ignored() {
         assert_eq!(
-            parse(r#"{"type":"motd","text":"hi"}"#),
-            ServerMessage::Unknown
-        );
-        assert_eq!(
-            parse(r#"{"type":"paired","transport":"webrtc","extra":1}"#),
+            serde_json::from_str::<ServerMessage>(
+                r#"{"type":"paired","transport":"webrtc","extra":1}"#
+            )
+            .unwrap(),
             ServerMessage::Paired {
                 transport: Transport::Webrtc
-            }
-        );
-        assert_eq!(
-            parse(r#"{"type":"error","code":"teapot","message":""}"#),
-            ServerMessage::Error {
-                code: ErrorCode::Unknown,
-                message: String::new()
             }
         );
     }

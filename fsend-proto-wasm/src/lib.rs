@@ -2,6 +2,7 @@ use fsend_proto::{
     code::{Code, CodeError},
     pairing::{self, PairingError, Signal},
     peer::{self, ReceiverMessage, SenderMessage, frame, offer},
+    relay::ServerMessage,
 };
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -38,6 +39,12 @@ pub fn code_link(site: &str, code: &str) -> Result<String, JsError> {
 #[wasm_bindgen(js_name = newCode)]
 pub fn new_code(nameplate: &str) -> Option<String> {
     Code::with_random_password(nameplate).map(|code| code.to_string())
+}
+
+/// The JSON `ServerMessage` in a relay text frame; throws on an invalid one.
+#[wasm_bindgen(js_name = parseServerMessage)]
+pub fn parse_server_message(text: &str) -> Result<String, JsError> {
+    Ok(json(&serde_json::from_str::<ServerMessage>(text)?))
 }
 
 #[wasm_bindgen]
@@ -227,7 +234,7 @@ mod bindings {
         code::NAMEPLATE_LEN,
         pairing::{ConnectionInfo, Sealed},
         peer::{AcceptedFile, Cancel, Entry, ErrorReport, Hello, limits, offer::TopEntry},
-        relay::{ClientMessage, ErrorCode, ServerMessage, Transport, VERSION},
+        relay::{ClientMessage, ErrorCode, Transport, VERSION},
     };
     use ts_rs::{Config, TS};
 

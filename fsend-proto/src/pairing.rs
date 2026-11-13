@@ -37,8 +37,6 @@ pub enum Sealed {
     Connection {
         info: ConnectionInfo,
     },
-    #[serde(other)]
-    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,11 +159,14 @@ impl Channel {
     }
 
     pub fn seal(&mut self, message: &Sealed) -> Vec<u8> {
-        let plaintext = serde_json::to_vec(message).expect("sealed messages serialize");
+        self.seal_bytes(&serde_json::to_vec(message).expect("sealed messages serialize"))
+    }
+
+    fn seal_bytes(&mut self, plaintext: &[u8]) -> Vec<u8> {
         let ciphertext = self
             .seal
             .cipher
-            .encrypt(&self.seal.nonce(), plaintext.as_slice())
+            .encrypt(&self.seal.nonce(), plaintext)
             .expect("AES-GCM encrypts any message this size");
         self.seal.counter += 1;
         ciphertext
@@ -205,6 +206,15 @@ mod tests {
         Sealed::Confirm { app: "a".into() }
     }
 
+    fn connection() -> Sealed {
+        Sealed::Connection {
+            info: ConnectionInfo::Iroh {
+                node_id: "n".into(),
+                addrs: vec![],
+            },
+        }
+    }
+
     #[test]
     fn signals_round_trip() {
         for signal in [Signal::Pake(vec![1, 2, 3]), Signal::Sealed(vec![])] {
@@ -220,14 +230,14 @@ mod tests {
     fn sealed_messages_open_in_order_on_the_other_side() {
         let (mut sender, mut receiver) = channels("K7Q29XMV4P").unwrap();
         let first = sender.seal(&confirm());
-        let second = sender.seal(&Sealed::Unknown);
+        let second = sender.seal(&connection());
         assert_ne!(
             first,
             sender.seal(&confirm()),
             "every message gets a fresh nonce"
         );
         assert_eq!(receiver.open(&first), Ok(confirm()));
-        assert_eq!(receiver.open(&second), Ok(Sealed::Unknown));
+        assert_eq!(receiver.open(&second), Ok(connection()));
         // The directions use different keys.
         let echo = receiver.seal(&confirm());
         assert_eq!(sender.open(&echo), Ok(confirm()));
@@ -319,9 +329,14 @@ mod tests {
             },
             r#"{"type":"connection","info":{"type":"iroh","node_id":"n","addrs":["10.0.0.1:1234"]}}"#,
         );
-        assert_eq!(
-            serde_json::from_str::<Sealed>(r#"{"type":"files","x":1}"#).unwrap(),
-            Sealed::Unknown
-        );
+    }
+
+    #[test]
+    fn unknown_sealed_types_are_malformed() {
+        let mut sender = Channel::new(&[7; 32], Role::Sender);
+        let mut receiver = Channel::new(&[7; 32], Role::Receiver);
+        assert_eq!(receiver.open(&sender.seal(&confirm())), Ok(confirm()));
+        let sealed = sender.seal_bytes(br#"{"type":"files","x":1}"#);
+        assert_eq!(receiver.open(&sealed), Err(PairingError::Malformed));
     }
 }

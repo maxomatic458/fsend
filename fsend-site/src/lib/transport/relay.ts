@@ -5,6 +5,7 @@ import {
   RELAY_VERSION,
   Role,
   newCode,
+  parseServerMessage,
   type Channel,
   type ClientMessage,
   type ConnectionInfo,
@@ -16,7 +17,7 @@ import {
 const APP = "fsend-web";
 const TRANSPORTS: Transport[] = ["webrtc"];
 
-type Known = Extract<ServerMessage, { type: "created" | "paired" }>;
+type Reply = Exclude<ServerMessage, { type: "error" }>;
 
 /** A WebSocket to the relay; pair it first, then swap connection info. */
 export class Relay {
@@ -95,13 +96,11 @@ export class Relay {
   }
 
   async connection(): Promise<ConnectionInfo> {
-    for (;;) {
-      const message = this.paired().open(await this.signal());
-      if (message.type === "connection") return message.info;
-      if (message.type === "confirm") {
-        throw protocolError("repeated confirm message");
-      }
+    const message = this.paired().open(await this.signal());
+    if (message.type !== "connection") {
+      throw protocolError("repeated confirm message");
     }
+    return message.info;
   }
 
   close(): void {
@@ -117,14 +116,14 @@ export class Relay {
     this.ws.send(JSON.stringify(message));
   }
 
-  private async expect<T extends Known["type"]>(
+  private async expect<T extends Reply["type"]>(
     type: T,
-  ): Promise<Extract<Known, { type: T }>> {
+  ): Promise<Extract<Reply, { type: T }>> {
     const frame = await this.next();
     if (frame instanceof Uint8Array || frame.type !== type) {
       throw protocolError(`expected ${type}`);
     }
-    return frame as Extract<Known, { type: T }>;
+    return frame as Extract<Reply, { type: T }>;
   }
 
   private async signal(): Promise<Uint8Array> {
@@ -135,8 +134,8 @@ export class Relay {
     return frame;
   }
 
-  /** The next signal or known relay message; a relay error throws. */
-  private async next(): Promise<Uint8Array | Known> {
+  /** The next signal or relay message; a relay error throws. */
+  private async next(): Promise<Uint8Array | Reply> {
     for (;;) {
       const frame = this.frames.shift();
       if (frame instanceof Uint8Array) return frame;
@@ -149,10 +148,7 @@ export class Relay {
       if (message.type === "error") {
         throw new Error(describe(message.code, message.message));
       }
-      // Skips messages this version does not know.
-      if (message.type === "created" || message.type === "paired") {
-        return message;
-      }
+      return message;
     }
   }
 
@@ -164,9 +160,9 @@ export class Relay {
 
 function parse(frame: string): ServerMessage {
   try {
-    return JSON.parse(frame);
+    return parseServerMessage(frame);
   } catch {
-    throw protocolError("malformed relay message");
+    throw protocolError("invalid relay message");
   }
 }
 
@@ -188,7 +184,7 @@ function describe(code: ErrorCode, message: string): string {
       return "The other side left.";
     case "busy":
       return "The relay is busy. Try again in a moment.";
-    default:
+    case "protocol":
       return `Relay error: ${message}.`;
   }
 }

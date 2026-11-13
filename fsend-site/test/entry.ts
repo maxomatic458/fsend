@@ -19,6 +19,7 @@ export {
   Role,
   acceptFiles,
   checkAccept,
+  parseServerMessage,
   presentBytes,
   topEntries,
   validateOffer,

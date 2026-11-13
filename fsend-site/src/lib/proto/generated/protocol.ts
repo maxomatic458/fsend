@@ -19,13 +19,13 @@ export type ServerMessage = { "type": "created", nameplate: string,
 /**
  * Seconds until an unjoined session expires.
  */
-expires_in: number, } | { "type": "paired", transport: Transport, } | { "type": "error", code: ErrorCode, message: string, } | { "type": "unknown" };
+expires_in: number, } | { "type": "paired", transport: Transport, } | { "type": "error", code: ErrorCode, message: string, };
 
-export type ErrorCode = "version" | "not_found" | "expired" | "no_common_transport" | "peer_left" | "busy" | "protocol" | "unknown";
+export type ErrorCode = "version" | "not_found" | "expired" | "no_common_transport" | "peer_left" | "busy" | "protocol";
 
 export type Transport = "iroh" | "webrtc";
 
-export type Sealed = { "type": "confirm", app: string, } | { "type": "connection", info: ConnectionInfo, } | { "type": "unknown" };
+export type Sealed = { "type": "confirm", app: string, } | { "type": "connection", info: ConnectionInfo, };
 
 export type ConnectionInfo = { "type": "web_rtc", sdp: string, ice_candidates: Array<string>, } | { "type": "iroh", node_id: string, addrs: Array<string>, };
 

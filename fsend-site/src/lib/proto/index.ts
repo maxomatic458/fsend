@@ -7,6 +7,7 @@ import type {
   ReceiverMessage,
   Sealed,
   SenderMessage,
+  ServerMessage,
   TopEntry,
 } from "./generated/protocol";
 
@@ -31,6 +32,10 @@ export const codeLink = (site: string, code: string): string =>
 /** A fresh code for the nameplate the relay assigned, if it is valid. */
 export const newCode = (nameplate: string): string | undefined =>
   wasm.newCode(nameplate);
+
+/** A relay text frame; throws unless it is a valid `ServerMessage`. */
+export const parseServerMessage = (text: string): ServerMessage =>
+  JSON.parse(wasm.parseServerMessage(text));
 
 const PAIRING_ERRORS: Record<PairingError, string> = {
   wrong_code:

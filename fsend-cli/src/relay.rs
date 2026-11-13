@@ -63,7 +63,7 @@ impl RelayError {
                 ErrorCode::NoCommonTransport => {
                     "the two sides have no connection type in common. Update fsend on both sides.".into()
                 }
-                ErrorCode::Protocol | ErrorCode::Unknown => return None,
+                ErrorCode::Protocol => return None,
             },
             Self::WebSocket(_) | Self::Closed | Self::Pairing(_) | Self::Protocol(_) => {
                 return None;
@@ -167,17 +167,12 @@ impl Relay {
     }
 
     pub async fn connection(&mut self) -> Result<ConnectionInfo, RelayError> {
-        loop {
-            let Signal::Sealed(sealed) = recv_signal(&mut self.ws).await? else {
-                return Err(PairingError::UnexpectedSignal.into());
-            };
-            match self.channel.open(&sealed)? {
-                Sealed::Connection { info } => return Ok(info),
-                Sealed::Confirm { .. } => {
-                    return Err(RelayError::Protocol("repeated confirm message"));
-                }
-                Sealed::Unknown => {}
-            }
+        let Signal::Sealed(sealed) = recv_signal(&mut self.ws).await? else {
+            return Err(PairingError::UnexpectedSignal.into());
+        };
+        match self.channel.open(&sealed)? {
+            Sealed::Connection { info } => Ok(info),
+            Sealed::Confirm { .. } => Err(RelayError::Protocol("repeated confirm message")),
         }
     }
 }
@@ -215,9 +210,8 @@ async fn recv(ws: &mut WsStream, wait: Duration) -> Result<Frame, RelayError> {
                     Ok(ServerMessage::Error { code, message }) => {
                         return Err(RelayError::Relay { code, message });
                     }
-                    Ok(ServerMessage::Unknown) => {}
                     Ok(message) => return Ok(Frame::Message(message)),
-                    Err(_) => return Err(RelayError::Protocol("malformed relay message")),
+                    Err(_) => return Err(RelayError::Protocol("invalid relay message")),
                 },
                 Some(Ok(Message::Binary(data))) => {
                     let signal = Signal::decode(&data).ok_or(PairingError::UnexpectedSignal)?;
@@ -340,6 +334,24 @@ mod tests {
                 .contains("no session with this code"),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_relay_message_is_a_protocol_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = ws.next().await;
+            let _ = ws
+                .send(Message::text(r#"{"type":"motd","text":"hi"}"#))
+                .await;
+            let _ = ws.next().await;
+        });
+
+        let err = pair_as_sender(&url, |_| {}).await.err().unwrap();
+        assert!(matches!(err, RelayError::Protocol(_)), "{err}");
     }
 
     #[tokio::test]

@@ -368,7 +368,7 @@ fn describe(code: ErrorCode) -> &'static str {
         ErrorCode::NoCommonTransport => "the two sides share no transport",
         ErrorCode::PeerLeft => "the peer left",
         ErrorCode::Busy => "the relay is busy",
-        ErrorCode::Protocol | ErrorCode::Unknown => "unexpected message",
+        ErrorCode::Protocol => "unexpected message",
     }
 }
 
