@@ -13,9 +13,9 @@ use std::thread;
 use std::time::Instant;
 
 use fsend_cli::iroh::IrohTransfer;
-use fsend_cli::relay::ConnectionInfo;
 use fsend_cli::transfer::{ReceiveArgs, SendArgs, Transport, receive_files, send_files};
 use fsend_cli::webrtc::{WebRtcConfig, WebRtcTransfer};
+use fsend_proto::relay::ConnectionInfo;
 use iroh::Endpoint;
 use iroh::endpoint::presets;
 

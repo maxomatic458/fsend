@@ -9,8 +9,12 @@ use axum::{
 };
 use clap::Parser;
 use dashmap::DashMap;
+use fsend_proto::relay::{
+    ClientMessage, ConnectionInfo, CreateSessionAnswer, CreateSessionRequest, ErrorAnswer,
+    ExchangeAnswer, JoinSessionAnswer, JoinSessionRequest, PeerJoinedAnswer, Protocol,
+    ServerMessage,
+};
 use rand::RngExt;
-use serde::{Deserialize, Serialize};
 use std::{
     net::SocketAddr,
     sync::Arc,
@@ -19,89 +23,6 @@ use std::{
 use tokio::sync::oneshot;
 use tower_http::cors::CorsLayer;
 use tracing::info;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum Protocol {
-    WebRtc,
-    Iroh,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "type")]
-enum ConnectionInfo {
-    WebRtc {
-        sdp: String,
-        ice_candidates: Vec<String>,
-    },
-    Iroh {
-        node_id: String,
-        addrs: Vec<String>,
-    },
-}
-
-// Client -> Server
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CreateSessionRequest {
-    capabilities: Vec<Protocol>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct JoinSessionRequest {
-    code: String,
-    capabilities: Vec<Protocol>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ExchangeRequest {
-    connection_info: ConnectionInfo,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "type")]
-enum ClientMessage {
-    CreateSession(CreateSessionRequest),
-    JoinSession(JoinSessionRequest),
-    Exchange(ExchangeRequest),
-}
-
-// Server -> Client
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CreateSessionAnswer {
-    code: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct JoinSessionAnswer {
-    protocol: Protocol,
-}
-
-/// Sent to the sender when a peer joins their session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PeerJoinedAnswer {
-    protocol: Protocol,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ExchangeAnswer {
-    connection_info: ConnectionInfo,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ErrorAnswer {
-    message: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "type")]
-enum ServerMessage {
-    CreateSession(CreateSessionAnswer),
-    JoinSession(JoinSessionAnswer),
-    PeerJoined(PeerJoinedAnswer),
-    Exchange(ExchangeAnswer),
-    Error(ErrorAnswer),
-}
 
 fn negotiate_protocol(sender: &[Protocol], receiver: &[Protocol]) -> Option<Protocol> {
     if sender.contains(&Protocol::Iroh) && receiver.contains(&Protocol::Iroh) {

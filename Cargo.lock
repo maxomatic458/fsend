@@ -1439,6 +1439,7 @@ dependencies = [
  "color-eyre",
  "colored",
  "dialoguer",
+ "fsend-proto",
  "futures-util",
  "indicatif",
  "iroh",
@@ -1456,15 +1457,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "fsend-proto"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "fsend-relay"
 version = "0.1.0"
 dependencies = [
  "axum",
  "clap",
  "dashmap",
+ "fsend-proto",
  "futures",
  "rand 0.10.2",
- "serde",
  "serde_json",
  "tokio",
  "tower",

@@ -12,6 +12,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+fsend-proto.workspace = true
 async-compression = { version = "0.4.44", features = ["tokio", "gzip"] }
 async-trait = "0.1.92"
 bytes = "1.12"

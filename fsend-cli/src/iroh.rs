@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use iroh::endpoint::{Connection, ConnectionError, VarInt, presets};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr, Watcher};
 
-use crate::relay::ConnectionInfo;
 use crate::transfer::*;
+use fsend_proto::relay::ConnectionInfo;
 
 /// Resolving Home relay and direct address timeout.
 const ADDR_TIMEOUT: Duration = Duration::from_secs(15);

@@ -13,9 +13,10 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use fsend_cli::cli::{Args, Mode};
 use fsend_cli::iroh::IrohTransfer;
-use fsend_cli::relay::{ConnectionInfo, Protocol, RelayClient};
+use fsend_cli::relay::RelayClient;
 use fsend_cli::transfer::{self, FilesAvailable, ReceiveArgs, SendArgs, TransferError, Transport};
 use fsend_cli::webrtc::WebRtcTransfer;
+use fsend_proto::relay::{ConnectionInfo, Protocol};
 
 #[tokio::main]
 async fn main() -> ExitCode {
