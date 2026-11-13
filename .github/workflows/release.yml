@@ -143,6 +143,6 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          cd target/debian
+          cd ../target/debian
           deb=$(ls -- *_"$ARCH".deb)
           gh release upload "$TAG" "$deb" --clobber
