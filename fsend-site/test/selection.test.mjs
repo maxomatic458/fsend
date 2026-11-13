@@ -7,7 +7,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
  * A directory handle whose files resolve slowly, standing in for a real
- * File System Access walk: `buildFileTree` awaits `getFile()` once per file,
+ * File System Access walk: `buildOffer` awaits `getFile()` once per file,
  * so a big folder takes far more ticks than a plain File entry, which takes
  * none at all.
  */
@@ -36,7 +36,7 @@ function slowFolder(name, fileCount, delayMs) {
   };
 }
 
-/** A plain File entry — `buildFileTree` reads `.size` with no await at all. */
+/** A plain File entry — `buildOffer` reads `.size` with no await at all. */
 function fastFile(name, size) {
   return { kind: "file", name, file: { size } };
 }

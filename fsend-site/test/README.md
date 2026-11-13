@@ -34,15 +34,26 @@ to drift out of sync.
 
 - **Complete transfers (native FS):** single file, several files with a nested
   folder, picker-handle sources, a file past `MAX_BUFFERED_BYTES` (backpressure), an
-  empty file.
+  empty file, an empty folder, progress per entry; a selection that breaks the
+  offer rules is refused before pairing.
 - **Complete transfers (fallback):** single-file direct download, folder as a
   zip, multiple loose files as a zip. Same `runReceive`, driven by a download
   sink instead of a disk sink.
 - **Interrupted:** receiver's tab disappears mid-send, the same with a send
   buffer that never fills (which isolates the per-chunk disconnect check),
-  sender's tab disappears mid-receive, offer rejected, sender aborted.
+  sender's tab disappears mid-receive, offer rejected, a cancelled receive
+  reaches the sender as a cancel, sender aborted.
 - **Resume:** a cut-off download continues and ends byte-perfect, sending only
-  the remainder; resuming with nothing on disk transfers everything.
+  the remainder; complete files are skipped; resuming with nothing on disk
+  transfers everything.
+- **Peer protocol building blocks:** the wasm frame codec round-trips messages
+  split anywhere, compresses large ones, encodes and decodes only the messages
+  of the given side and rejects unknown or malformed messages and frames; the
+  offer rules, the accept and per-entry progress match the CLI. The rules
+  themselves are tested in `fsend-proto`, hostile peers in the CLI transport
+  suites.
+- **Protocol errors:** a sender that gets a sender-only, unknown or malformed
+  message fails with a protocol error, and the receiver learns why.
 - **Relay:** unknown and malformed codes surface errors, a wrong password fails
   on both sides, a share link works as the code.
 - **`watchDisconnect` unit tests:** graceful close, `failed` on either

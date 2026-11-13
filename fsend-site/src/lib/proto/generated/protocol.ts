@@ -3,6 +3,15 @@
 export const RELAY_VERSION = 1;
 export const CODE_LENGTH = 10;
 export const NAMEPLATE_LENGTH = 4;
+export const PEER_VERSION = 4;
+export const PEER_MIN_VERSION = 4;
+export const RECV_WINDOW = 16777216;
+export const MIN_RECV_WINDOW = 65536;
+export const ACK_STEP = 4194304;
+export const ACK_INTERVAL_MS = 1000;
+export const HELLO_TIMEOUT_MS = 30000;
+export const IDLE_TIMEOUT_MS = 60000;
+export const GOODBYE_TIMEOUT_MS = 5000;
 
 export type ClientMessage = { "type": "create", version: number, transports: Array<Transport>, } | { "type": "join", version: number, nameplate: string, transports: Array<Transport>, };
 
@@ -25,3 +34,25 @@ export type PairingError = "wrong_code" | "invalid_pake" | "tampered" | "malform
 export type ParsedCode = { code: string, } | { error: CodeError, message: string, };
 
 export type CodeError = { "type": "empty" } | { "type": "wrong_length", "value": number } | { "type": "invalid_char", "value": string };
+
+export type SenderMessage = { "type": "hello" } & Hello | { "type": "offer", entries: Array<Entry>, } | { "type": "cancel" } & Cancel | { "type": "error" } & ErrorReport;
+
+export type ReceiverMessage = { "type": "hello" } & Hello | { "type": "accept", files: Array<AcceptedFile>, } | { "type": "reject", reason?: string, } | { "type": "ack", bytes: number, } | { "type": "done" } | { "type": "cancel" } & Cancel | { "type": "error" } & ErrorReport;
+
+export type Hello = { version: number, min_version: number, features: Array<string>, 
+/**
+ * Receiver only: how many unacknowledged bytes it buffers.
+ */
+recv_window?: number, };
+
+export type Cancel = { reason?: string, };
+
+export type ErrorReport = { code: PeerErrorCode, message: string, };
+
+export type Entry = { "kind": "file", path: Array<string>, size: number, } | { "kind": "dir", path: Array<string>, };
+
+export type AcceptedFile = { id: number, offset: number, };
+
+export type PeerErrorCode = "version" | "protocol" | "invalid_offer" | "io" | "timeout" | "internal";
+
+export type TopEntry = { name: string, dir: boolean, size: number, };

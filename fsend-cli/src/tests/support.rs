@@ -1,9 +1,10 @@
-//! Transport testing suite.
-
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::Duration;
+
+use fsend_proto::peer::limits::RECV_WINDOW;
+use fsend_proto::peer::{VERSION, hello};
 
 use super::*;
 
@@ -62,14 +63,27 @@ pub fn snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
     out
 }
 
-pub fn no_progress(_: &[(String, u64, u64)]) {}
-pub fn no_wait() {}
-pub fn no_data(_: u64) {}
-pub fn decline(_: &[FilesAvailable]) -> Option<PathBuf> {
-    None
-}
-pub fn no_offer(_: &[FilesAvailable]) -> Option<PathBuf> {
+pub fn no_event(_: Event) {}
+pub fn no_offer(_: &[TopEntry]) -> Option<PathBuf> {
     panic!("must not get as far as the offer")
+}
+
+/// A `hello` for a peer that speaks exactly `version`.
+pub fn hello_for(version: u32, recv_window: Option<u64>) -> Hello {
+    Hello {
+        version,
+        min_version: version,
+        features: vec![],
+        recv_window,
+    }
+}
+
+/// A frame of `json`, valid or not.
+pub fn json_frame(json: &str) -> Vec<u8> {
+    let mut frame = (json.len() as u32 + 1).to_be_bytes().to_vec();
+    frame.push(0);
+    frame.extend_from_slice(json.as_bytes());
+    frame
 }
 
 /// Kills one side's connection from the outside.
@@ -94,16 +108,47 @@ pub struct RunOptions {
     pub abort_receiver_after: Option<u64>,
 }
 
+/// What one side reported through its events.
+#[derive(Debug, Default)]
+pub struct Tally {
+    /// `(name, bytes present, size)` per top-level entry once accepted.
+    pub initial: Option<Vec<(String, u64, u64)>>,
+    /// Bytes present per top-level entry by the end.
+    pub present: Vec<u64>,
+    /// Bytes moved this session.
+    pub moved: u64,
+    pub offered: bool,
+}
+
+impl Tally {
+    fn record(&mut self, event: Event) {
+        match event {
+            Event::Offered => self.offered = true,
+            Event::Started { entries, present } => {
+                self.initial = Some(
+                    entries
+                        .iter()
+                        .zip(present)
+                        .map(|(entry, present)| (entry.name.clone(), *present, entry.size))
+                        .collect(),
+                );
+                self.present = present.to_vec();
+            }
+            Event::Progress { entry, bytes } => {
+                self.present[entry] += bytes;
+                self.moved += bytes;
+            }
+        }
+    }
+}
+
 /// Everything observable about one send/receive run.
 pub struct Outcome {
     pub send: Result<(), TransferError>,
     pub recv: Result<(), TransferError>,
-    pub sender_initial: Option<Vec<(String, u64, u64)>>,
-    pub receiver_initial: Option<Vec<(String, u64, u64)>>,
-    pub offered: Option<Vec<FilesAvailable>>,
-    pub sent: u64,
-    pub received: u64,
-    pub waited: bool,
+    pub sender: Tally,
+    pub receiver: Tally,
+    pub offered: Option<Vec<TopEntry>>,
 }
 
 impl Outcome {
@@ -119,6 +164,11 @@ impl Outcome {
 
 /// Runs one transfer of `files` into `out` between the two peers.
 pub async fn run(peers: Peers, files: Vec<PathBuf>, out: &Path, opts: RunOptions) -> Outcome {
+    let outgoing = build_offer(&files).unwrap();
+    run_offer(peers, &outgoing, out, opts).await
+}
+
+pub async fn run_offer(peers: Peers, outgoing: &Outgoing, out: &Path, opts: RunOptions) -> Outcome {
     let Peers {
         mut sender,
         mut receiver,
@@ -126,77 +176,148 @@ pub async fn run(peers: Peers, files: Vec<PathBuf>, out: &Path, opts: RunOptions
         abort_receiver,
     } = peers;
 
-    let mut sender_initial = None;
-    let mut receiver_initial = None;
+    let mut sending = Tally::default();
+    let mut receiving = Tally::default();
     let mut offered = None;
-    let mut sent = 0u64;
-    let mut received = 0u64;
-    let mut waited = false;
-    let mut sender_aborted = false;
-    let mut receiver_aborted = false;
     let out_dir = out.to_path_buf();
 
-    let mut on_sender_initial = |p: &[(String, u64, u64)]| sender_initial = Some(p.to_vec());
-    let mut on_waiting = || waited = true;
-    let mut on_write = |n: u64| {
-        sent += n;
-        if let Some(limit) = opts.abort_sender_after
-            && sent >= limit
-            && !sender_aborted
-        {
+    let (mut sender_aborted, mut receiver_aborted) = (false, false);
+
+    let mut on_send = |event: Event| {
+        sending.record(event);
+        if !sender_aborted && opts.abort_sender_after.is_some_and(|n| sending.moved >= n) {
             sender_aborted = true;
             abort_sender();
         }
     };
-    let mut on_receiver_initial = |p: &[(String, u64, u64)]| receiver_initial = Some(p.to_vec());
-    let mut on_offer = |files: &[FilesAvailable]| {
-        offered = Some(files.to_vec());
+    let mut on_offer = |entries: &[TopEntry]| {
+        offered = Some(entries.to_vec());
         (!opts.decline).then(|| out_dir.clone())
     };
-    let mut on_read = |n: u64| {
-        received += n;
-        if let Some(limit) = opts.abort_receiver_after
-            && received >= limit
-            && !receiver_aborted
+    let mut on_receive = |event: Event| {
+        receiving.record(event);
+        if !receiver_aborted
+            && opts
+                .abort_receiver_after
+                .is_some_and(|n| receiving.moved >= n)
         {
             receiver_aborted = true;
             abort_receiver();
         }
     };
 
-    let send = send_files(
-        sender.as_mut(),
-        SendArgs { files },
-        &mut on_sender_initial,
-        &mut on_waiting,
-        &mut on_write,
-    );
+    let send = send_files(sender.as_mut(), outgoing, &mut on_send);
     let recv = receive_files(
         receiver.as_mut(),
         ReceiveArgs {
             resume: opts.resume,
         },
-        &mut on_receiver_initial,
         &mut on_offer,
-        &mut on_read,
+        &mut on_receive,
     );
-    let (send, recv) = tokio::time::timeout(std::time::Duration::from_secs(120), async {
-        tokio::join!(send, recv)
-    })
-    .await
-    .expect("the transfer hung");
+    let (send, recv) =
+        tokio::time::timeout(Duration::from_secs(120), async { tokio::join!(send, recv) })
+            .await
+            .expect("the transfer hung");
 
     Outcome {
         send,
         recv,
-        sender_initial,
-        receiver_initial,
+        sender: sending,
+        receiver: receiving,
         offered,
-        sent,
-        received,
-        waited,
     }
 }
+
+/// What the peer says on `control` until it hangs up or says its last word.
+async fn listen<Out: Message + Debug, In: PeerMessage>(
+    control: &mut Control<Out, In>,
+    mut got: Vec<In>,
+) -> Vec<In> {
+    while let Ok(Ok(message)) = tokio::time::timeout(Duration::from_secs(10), control.recv()).await
+    {
+        let last = message.is_final();
+        got.push(message);
+        if last {
+            break;
+        }
+    }
+    got
+}
+
+/// Plays a receiver that answers the sender's hello with `raw` bytes; returns what the sender said.
+async fn fake_receiver(receiver: &mut Box<dyn Transport>, raw: &[u8]) -> Vec<SenderMessage> {
+    let mut control = ReceiverControl::new(receiver.control().await.unwrap());
+    let hello = control.recv().await.unwrap();
+    control.send_frame(raw).await.unwrap();
+    let got = listen(&mut control, vec![hello]).await;
+    drop(control);
+    receiver.close(false).await;
+    got
+}
+
+/// Plays a sender that opens with `raw` bytes on the control stream; returns what the receiver said.
+async fn fake_sender(sender: &mut Box<dyn Transport>, raw: &[u8]) -> Vec<ReceiverMessage> {
+    let mut control = SenderControl::new(sender.control().await.unwrap());
+    control.send_frame(raw).await.unwrap();
+    let got = listen(&mut control, vec![]).await;
+    drop(control);
+    sender.close(false).await;
+    got
+}
+
+/// Frames of `messages`, back to back.
+fn frames(messages: &[impl Message]) -> Vec<u8> {
+    messages
+        .iter()
+        .flat_map(|message| frame::encode(message).unwrap())
+        .collect()
+}
+
+/// The tests every transport must pass, for a module with a `pair` [`PairFn`].
+macro_rules! transport_suite {
+    () => {
+        $crate::transfer::test_support::transport_suite!(
+            sends_a_single_file,
+            sends_an_empty_file,
+            sends_a_file_larger_than_the_buffers,
+            sends_a_directory_tree,
+            sends_several_entries_at_once,
+            sends_the_current_directory,
+            receiver_can_decline,
+            resumes_a_partial_file,
+            resumes_a_partial_directory,
+            resume_skips_complete_files,
+            resume_starts_over_when_the_local_file_is_larger,
+            overwrite_ignores_partial_files,
+            overwrite_truncates_a_larger_stale_file,
+            interrupted_by_the_receiver_then_resumed,
+            interrupted_by_the_sender_then_resumed,
+            a_file_that_vanishes_fails_both_sides,
+            receiver_rejects_another_protocol_version,
+            sender_stops_when_the_receiver_wants_another_version,
+            a_receiver_without_a_usable_window_is_rejected,
+            unexpected_messages_are_errors,
+            unknown_and_wrong_direction_messages_are_errors,
+            malformed_frames_are_errors,
+            an_invalid_offer_is_rejected,
+            an_invalid_accept_is_rejected,
+            an_ack_beyond_the_data_is_rejected,
+            a_cancel_from_the_peer_ends_the_transfer,
+            messages_survive_the_wire,
+            a_closed_peer_fails_the_control_stream,
+        );
+    };
+    ($($name:ident),* $(,)?) => {
+        $(
+            #[tokio::test]
+            async fn $name() {
+                $crate::transfer::test_support::suite::$name(pair).await
+            }
+        )*
+    };
+}
+pub(crate) use transport_suite;
 
 pub mod suite {
     use super::*;
@@ -219,8 +340,15 @@ pub mod suite {
         }
     }
 
-    fn progress(name: &str, skip: u64, size: u64) -> Vec<(String, u64, u64)> {
-        vec![(name.to_string(), skip, size)]
+    fn progress(name: &str, present: u64, size: u64) -> Vec<(String, u64, u64)> {
+        vec![(name.to_string(), present, size)]
+    }
+
+    fn resume() -> RunOptions {
+        RunOptions {
+            resume: true,
+            ..Default::default()
+        }
     }
 
     pub async fn sends_a_single_file(pair: PairFn) {
@@ -238,21 +366,25 @@ pub mod suite {
 
         o.unwrap();
         assert_eq!(std::fs::read(f.out.join("photo.jpg")).unwrap(), data);
-        assert_eq!(o.sender_initial.unwrap(), progress("photo.jpg", 0, 100_000));
+        assert_eq!(o.sender.initial.unwrap(), progress("photo.jpg", 0, 100_000));
         assert_eq!(
-            o.receiver_initial.unwrap(),
+            o.receiver.initial.unwrap(),
             progress("photo.jpg", 0, 100_000)
         );
         assert_eq!(
             o.offered.unwrap(),
-            vec![FilesAvailable::File {
+            vec![TopEntry {
                 name: "photo.jpg".into(),
+                dir: false,
                 size: 100_000
             }]
         );
-        assert_eq!(o.sent, 100_000);
-        assert_eq!(o.received, 100_000);
-        assert!(o.waited, "the sender must report waiting for the accept");
+        assert_eq!(o.sender.moved, 100_000);
+        assert_eq!(o.receiver.moved, 100_000);
+        assert!(
+            o.sender.offered,
+            "the sender must report waiting for the accept"
+        );
     }
 
     pub async fn sends_an_empty_file(pair: PairFn) {
@@ -269,14 +401,14 @@ pub mod suite {
 
         o.unwrap();
         assert_eq!(std::fs::read(f.out.join("empty")).unwrap(), b"");
-        assert_eq!(o.sent, 0);
-        assert_eq!(o.received, 0);
+        assert_eq!(o.sender.moved, 0);
+        assert_eq!(o.receiver.moved, 0);
     }
 
     pub async fn sends_a_file_larger_than_the_buffers(pair: PairFn) {
         let f = fixture();
-        // Not a multiple of any buffer or chunk size in play.
-        let data = bytes(1024 * 1024 + 17, 5);
+        // Not a multiple of any buffer or chunk size, and past several acks.
+        let data = bytes(20 * 1024 * 1024 + 17, 5);
         write(&f.src.join("big.bin"), &data);
 
         let o = run(
@@ -289,8 +421,8 @@ pub mod suite {
 
         o.unwrap();
         assert_eq!(std::fs::read(f.out.join("big.bin")).unwrap(), data);
-        assert_eq!(o.sent, data.len() as u64);
-        assert_eq!(o.received, data.len() as u64);
+        assert_eq!(o.sender.moved, data.len() as u64);
+        assert_eq!(o.receiver.moved, data.len() as u64);
     }
 
     pub async fn sends_a_directory_tree(pair: PairFn) {
@@ -301,9 +433,9 @@ pub mod suite {
 
         o.unwrap();
         assert_eq!(snapshot(&f.out), snapshot(&f.src));
-        assert_eq!(o.sender_initial.unwrap(), progress("album", 0, 80_003));
-        assert_eq!(o.sent, 80_003);
-        assert_eq!(o.received, 80_003);
+        assert_eq!(o.sender.initial.unwrap(), progress("album", 0, 80_003));
+        assert_eq!(o.sender.moved, 80_003);
+        assert_eq!(o.receiver.moved, 80_003);
     }
 
     pub async fn sends_several_entries_at_once(pair: PairFn) {
@@ -323,22 +455,24 @@ pub mod suite {
         o.unwrap();
         assert_eq!(snapshot(&f.out), snapshot(&f.src));
         assert_eq!(
-            o.sender_initial.unwrap(),
+            o.sender.initial.unwrap(),
             vec![
                 ("first.txt".to_string(), 0, 500),
                 ("album".to_string(), 0, 80_003),
                 ("last.txt".to_string(), 0, 0),
             ]
         );
-        assert_eq!(o.sent, 80_503);
+        // Progress lands on the entry it belongs to.
+        assert_eq!(o.sender.present, [500, 80_003, 0]);
+        assert_eq!(o.receiver.present, [500, 80_003, 0]);
+        assert_eq!(o.sender.moved, 80_503);
     }
 
     pub async fn sends_the_current_directory(pair: PairFn) {
         let f = fixture();
         let album = sample_tree(&f.src);
 
-        // `fsend send .` hands over a path without a file name of its
-        // own.
+        // `fsend send .` hands over a path without a file name of its own.
         let o = run(
             pair().await,
             vec![album.join("nested/..")],
@@ -349,7 +483,7 @@ pub mod suite {
 
         o.unwrap();
         assert_eq!(snapshot(&f.out), snapshot(&f.src));
-        assert_eq!(o.sender_initial.unwrap(), progress("album", 0, 80_003));
+        assert_eq!(o.sender.initial.unwrap(), progress("album", 0, 80_003));
     }
 
     pub async fn receiver_can_decline(pair: PairFn) {
@@ -373,13 +507,13 @@ pub mod suite {
             o.recv
         );
         assert!(
-            matches!(o.send, Err(TransferError::PeerDeclined)),
+            matches!(o.send, Err(TransferError::PeerDeclined(None))),
             "{:?}",
             o.send
         );
         assert!(o.offered.is_some(), "the receiver saw the offer");
-        assert!(o.sender_initial.is_none() && o.receiver_initial.is_none());
-        assert_eq!(o.sent, 0);
+        assert!(o.sender.initial.is_none() && o.receiver.initial.is_none());
+        assert_eq!(o.sender.moved, 0);
         assert!(!f.out.join("secret.txt").exists());
     }
 
@@ -389,29 +523,20 @@ pub mod suite {
         write(&f.src.join("big.bin"), &data);
         write(&f.out.join("big.bin"), &data[..80_000]);
 
-        let o = run(
-            pair().await,
-            vec![f.src.join("big.bin")],
-            &f.out,
-            RunOptions {
-                resume: true,
-                ..Default::default()
-            },
-        )
-        .await;
+        let o = run(pair().await, vec![f.src.join("big.bin")], &f.out, resume()).await;
 
         o.unwrap();
         assert_eq!(std::fs::read(f.out.join("big.bin")).unwrap(), data);
         assert_eq!(
-            o.sender_initial.unwrap(),
+            o.sender.initial.unwrap(),
             progress("big.bin", 80_000, 200_000)
         );
         assert_eq!(
-            o.receiver_initial.unwrap(),
+            o.receiver.initial.unwrap(),
             progress("big.bin", 80_000, 200_000)
         );
-        assert_eq!(o.sent, 120_000);
-        assert_eq!(o.received, 120_000);
+        assert_eq!(o.sender.moved, 120_000);
+        assert_eq!(o.receiver.moved, 120_000);
     }
 
     pub async fn resumes_a_partial_directory(pair: PairFn) {
@@ -421,22 +546,13 @@ pub mod suite {
         write(&f.out.join("album/a.txt"), &bytes(10_000, 1)[..4_000]);
         write(&f.out.join("album/nested/b.txt"), &bytes(70_000, 2));
 
-        let o = run(
-            pair().await,
-            vec![album],
-            &f.out,
-            RunOptions {
-                resume: true,
-                ..Default::default()
-            },
-        )
-        .await;
+        let o = run(pair().await, vec![album], &f.out, resume()).await;
 
         o.unwrap();
         assert_eq!(snapshot(&f.out), snapshot(&f.src));
-        assert_eq!(o.sender_initial.unwrap(), progress("album", 74_000, 80_003));
-        assert_eq!(o.sent, 6_003);
-        assert_eq!(o.received, 6_003);
+        assert_eq!(o.sender.initial.unwrap(), progress("album", 74_000, 80_003));
+        assert_eq!(o.sender.moved, 6_003);
+        assert_eq!(o.receiver.moved, 6_003);
     }
 
     pub async fn resume_skips_complete_files(pair: PairFn) {
@@ -445,25 +561,16 @@ pub mod suite {
         write(&f.src.join("done.bin"), &data);
         write(&f.out.join("done.bin"), &data);
 
-        let o = run(
-            pair().await,
-            vec![f.src.join("done.bin")],
-            &f.out,
-            RunOptions {
-                resume: true,
-                ..Default::default()
-            },
-        )
-        .await;
+        let o = run(pair().await, vec![f.src.join("done.bin")], &f.out, resume()).await;
 
         o.unwrap();
         assert_eq!(std::fs::read(f.out.join("done.bin")).unwrap(), data);
         assert_eq!(
-            o.sender_initial.unwrap(),
+            o.sender.initial.unwrap(),
             progress("done.bin", 50_000, 50_000)
         );
-        assert_eq!(o.sent, 0);
-        assert_eq!(o.received, 0);
+        assert_eq!(o.sender.moved, 0);
+        assert_eq!(o.receiver.moved, 0);
     }
 
     pub async fn resume_starts_over_when_the_local_file_is_larger(pair: PairFn) {
@@ -472,21 +579,12 @@ pub mod suite {
         write(&f.src.join("f.bin"), &data);
         write(&f.out.join("f.bin"), &bytes(300, 9));
 
-        let o = run(
-            pair().await,
-            vec![f.src.join("f.bin")],
-            &f.out,
-            RunOptions {
-                resume: true,
-                ..Default::default()
-            },
-        )
-        .await;
+        let o = run(pair().await, vec![f.src.join("f.bin")], &f.out, resume()).await;
 
         o.unwrap();
         assert_eq!(std::fs::read(f.out.join("f.bin")).unwrap(), data);
-        assert_eq!(o.sender_initial.unwrap(), progress("f.bin", 0, 200));
-        assert_eq!(o.sent, 200);
+        assert_eq!(o.sender.initial.unwrap(), progress("f.bin", 0, 200));
+        assert_eq!(o.sender.moved, 200);
     }
 
     pub async fn overwrite_ignores_partial_files(pair: PairFn) {
@@ -499,17 +597,14 @@ pub mod suite {
             pair().await,
             vec![f.src.join("big.bin")],
             &f.out,
-            RunOptions {
-                resume: false,
-                ..Default::default()
-            },
+            RunOptions::default(),
         )
         .await;
 
         o.unwrap();
         assert_eq!(std::fs::read(f.out.join("big.bin")).unwrap(), data);
-        assert_eq!(o.sender_initial.unwrap(), progress("big.bin", 0, 200_000));
-        assert_eq!(o.sent, 200_000);
+        assert_eq!(o.sender.initial.unwrap(), progress("big.bin", 0, 200_000));
+        assert_eq!(o.sender.moved, 200_000);
     }
 
     pub async fn overwrite_truncates_a_larger_stale_file(pair: PairFn) {
@@ -559,7 +654,7 @@ pub mod suite {
             (INTERRUPT_AFTER..data.len() as u64).contains(&partial),
             "partial file of {partial} bytes"
         );
-        assert_eq!(partial, o.received);
+        assert_eq!(partial, o.receiver.moved);
         assert_eq!(
             std::fs::read(f.out.join("movie.bin")).unwrap(),
             &data[..partial as usize],
@@ -571,19 +666,16 @@ pub mod suite {
             pair().await,
             vec![f.src.join("movie.bin")],
             &f.out,
-            RunOptions {
-                resume: true,
-                ..Default::default()
-            },
+            resume(),
         )
         .await;
 
         o.unwrap();
         assert_eq!(
-            o.sender_initial.unwrap(),
+            o.sender.initial.unwrap(),
             progress("movie.bin", partial, data.len() as u64)
         );
-        assert_eq!(o.sent, data.len() as u64 - partial);
+        assert_eq!(o.sender.moved, data.len() as u64 - partial);
         assert_eq!(std::fs::read(f.out.join("movie.bin")).unwrap(), data);
     }
 
@@ -616,7 +708,7 @@ pub mod suite {
             partial < data.len() as u64,
             "partial file of {partial} bytes"
         );
-        assert_eq!(partial, o.received);
+        assert_eq!(partial, o.receiver.moved);
         assert_eq!(
             std::fs::read(f.out.join("movie.bin")).unwrap_or_default(),
             &data[..partial as usize]
@@ -626,40 +718,39 @@ pub mod suite {
             pair().await,
             vec![f.src.join("movie.bin")],
             &f.out,
-            RunOptions {
-                resume: true,
-                ..Default::default()
-            },
+            resume(),
         )
         .await;
 
         o.unwrap();
         assert_eq!(
-            o.sender_initial.unwrap(),
+            o.sender.initial.unwrap(),
             progress("movie.bin", partial, data.len() as u64)
         );
-        assert_eq!(o.sent, data.len() as u64 - partial);
+        assert_eq!(o.sender.moved, data.len() as u64 - partial);
         assert_eq!(std::fs::read(f.out.join("movie.bin")).unwrap(), data);
     }
 
-    pub async fn a_missing_file_fails_the_transfer(pair: PairFn) {
+    pub async fn a_file_that_vanishes_fails_both_sides(pair: PairFn) {
         let f = fixture();
+        write(&f.src.join("gone.txt"), &bytes(100, 1));
+        let outgoing = build_offer(&[f.src.join("gone.txt")]).unwrap();
+        std::fs::remove_file(f.src.join("gone.txt")).unwrap();
 
-        let o = run(
-            pair().await,
-            vec![f.src.join("nope.txt")],
-            &f.out,
-            RunOptions::default(),
-        )
-        .await;
+        let o = run_offer(pair().await, &outgoing, &f.out, RunOptions::default()).await;
 
+        assert!(matches!(o.send, Err(TransferError::Io(_))), "{:?}", o.send);
         assert!(
-            matches!(&o.send, Err(TransferError::FileNotFound(p)) if p.ends_with("nope.txt")),
-            "{:?}",
-            o.send
+            matches!(
+                &o.recv,
+                Err(TransferError::Peer {
+                    code: ErrorCode::Io,
+                    ..
+                })
+            ),
+            "the receiver learns why: {:?}",
+            o.recv
         );
-        assert!(o.recv.is_err(), "the receiver must not wait forever");
-        assert!(o.offered.is_none());
     }
 
     pub async fn receiver_rejects_another_protocol_version(pair: PairFn) {
@@ -669,232 +760,270 @@ pub mod suite {
             ..
         } = pair().await;
 
-        let peer = async {
-            let mut control = frame(sender.control().await.unwrap());
-            send_packet(
-                &mut control,
-                &SenderToReceiver::ConnRequest {
-                    version: "9.9.9".into(),
-                },
-            )
-            .await
-            .unwrap();
-            let reply: ReceiverToSender = recv_packet(&mut control).await.unwrap();
-            drop(control);
-            sender.close(false).await;
-            reply
-        };
-        let (mut progress, mut offer, mut data) = (no_progress, no_offer, no_data);
+        let raw = frames(&[SenderMessage::Hello(hello_for(9, None))]);
+        let peer = fake_sender(&mut sender, &raw);
+        let (mut offer, mut event) = (no_offer, no_event);
         let receive = receive_files(
             receiver.as_mut(),
             ReceiveArgs { resume: false },
-            &mut progress,
             &mut offer,
-            &mut data,
+            &mut event,
         );
 
-        let (reply, result) = tokio::join!(peer, receive);
-        assert_eq!(
-            reply,
-            ReceiverToSender::WrongVersion {
-                expected: PROTO_VERSION.into()
-            }
-        );
+        let (got, result) = tokio::join!(peer, receive);
+        assert_eq!(got[0], ReceiverMessage::Hello(hello(Some(RECV_WINDOW))));
+        assert!(is_error(&got[1], ErrorCode::Version), "{got:?}");
         assert!(
-            matches!(&result, Err(TransferError::WrongVersion(expected, got)) if expected == PROTO_VERSION && got == "9.9.9"),
+            matches!(
+                &result,
+                Err(TransferError::Version {
+                    version: 9,
+                    min_version: 9
+                })
+            ),
             "{result:?}"
         );
+    }
+
+    /// A sender of `a.txt` against a receiver that answers with `raw`.
+    async fn hostile_receiver(
+        pair: PairFn,
+        raw: &[u8],
+    ) -> (Vec<SenderMessage>, Result<(), TransferError>) {
+        let f = fixture();
+        write(&f.src.join("a.txt"), b"hello");
+        let Peers {
+            mut sender,
+            mut receiver,
+            ..
+        } = pair().await;
+        let outgoing = build_offer(&[f.src.join("a.txt")]).unwrap();
+        let mut event = no_event;
+        let send = send_files(sender.as_mut(), &outgoing, &mut event);
+        tokio::join!(fake_receiver(&mut receiver, raw), send)
+    }
+
+    /// A receiver against a sender that opens with `raw` on the control stream.
+    async fn hostile_sender(
+        pair: PairFn,
+        raw: &[u8],
+    ) -> (Vec<ReceiverMessage>, Result<(), TransferError>) {
+        let Peers {
+            mut sender,
+            mut receiver,
+            ..
+        } = pair().await;
+        let (mut offer, mut event) = (no_offer, no_event);
+        let receive = receive_files(
+            receiver.as_mut(),
+            ReceiveArgs { resume: false },
+            &mut offer,
+            &mut event,
+        );
+        tokio::join!(fake_sender(&mut sender, raw), receive)
+    }
+
+    /// Whether `message` is an `error` with the `expected` code.
+    fn is_error(message: &(impl PeerMessage + Clone), expected: ErrorCode) -> bool {
+        matches!(message.clone().unexpected(), TransferError::Peer { code, .. } if code == expected)
+    }
+
+    fn ok_hello() -> Hello {
+        hello_for(VERSION, Some(RECV_WINDOW))
+    }
+
+    /// The receiver's frames for a `hello` and then `messages`.
+    fn receiver_frames(messages: &[ReceiverMessage]) -> Vec<u8> {
+        [
+            frames(&[ReceiverMessage::Hello(ok_hello())]),
+            frames(messages),
+        ]
+        .concat()
     }
 
     pub async fn sender_stops_when_the_receiver_wants_another_version(pair: PairFn) {
-        let Peers {
-            mut sender,
-            mut receiver,
-            ..
-        } = pair().await;
-
-        let peer = async {
-            let mut control = frame(receiver.control().await.unwrap());
-            let request: SenderToReceiver = recv_packet(&mut control).await.unwrap();
-            assert_eq!(
-                request,
-                SenderToReceiver::ConnRequest {
-                    version: PROTO_VERSION.into()
-                }
-            );
-            send_packet(
-                &mut control,
-                &ReceiverToSender::WrongVersion {
-                    expected: "9.9.9".into(),
-                },
-            )
-            .await
-            .unwrap();
-            // Give the packet time to arrive before hanging up.
-            let _ = tokio::time::timeout(Duration::from_secs(5), receiver.closed()).await;
-            drop(control);
-            receiver.close(false).await;
-        };
-        let (mut progress, mut waiting, mut data) = (no_progress, no_wait, no_data);
-        let send = send_files(
-            sender.as_mut(),
-            SendArgs {
-                files: vec!["unused".into()],
-            },
-            &mut progress,
-            &mut waiting,
-            &mut data,
-        );
-
-        let ((), result) = tokio::join!(peer, send);
+        let raw = frames(&[ReceiverMessage::Hello(hello_for(9, Some(RECV_WINDOW)))]);
+        let (got, result) = hostile_receiver(pair, &raw).await;
+        assert_eq!(got[0], SenderMessage::Hello(hello(None)));
+        assert!(is_error(&got[1], ErrorCode::Version), "{got:?}");
         assert!(
-            matches!(&result, Err(TransferError::WrongVersion(expected, got)) if expected == "9.9.9" && got == PROTO_VERSION),
+            matches!(&result, Err(TransferError::Version { version: 9, .. })),
             "{result:?}"
         );
     }
 
-    pub async fn unexpected_packets_are_errors(pair: PairFn) {
-        // A sender that skips the handshake.
-        let Peers {
-            mut sender,
-            mut receiver,
-            ..
-        } = pair().await;
-        let peer = async {
-            let mut control = frame(sender.control().await.unwrap());
-            send_packet(&mut control, &SenderToReceiver::FileInfo { files: vec![] })
-                .await
-                .unwrap();
-            let _ = tokio::time::timeout(Duration::from_secs(5), sender.closed()).await;
-            drop(control);
-            sender.close(false).await;
-        };
-        let (mut progress, mut offer, mut data) = (no_progress, decline, no_data);
-        let receive = receive_files(
-            receiver.as_mut(),
-            ReceiveArgs { resume: false },
-            &mut progress,
-            &mut offer,
-            &mut data,
-        );
-        let ((), result) = tokio::join!(peer, receive);
+    pub async fn a_receiver_without_a_usable_window_is_rejected(pair: PairFn) {
+        let raw = frames(&[ReceiverMessage::Hello(hello_for(VERSION, Some(1024)))]);
+        let (got, result) = hostile_receiver(pair, &raw).await;
+        assert!(is_error(&got[1], ErrorCode::Protocol), "{got:?}");
         assert!(
-            matches!(result, Err(TransferError::UnexpectedPacket)),
-            "{result:?}"
-        );
-
-        // A receiver that answers the handshake with a decline.
-        let Peers {
-            mut sender,
-            mut receiver,
-            ..
-        } = pair().await;
-        let peer = async {
-            let mut control = frame(receiver.control().await.unwrap());
-            let _: SenderToReceiver = recv_packet(&mut control).await.unwrap();
-            send_packet(&mut control, &ReceiverToSender::RejectFiles)
-                .await
-                .unwrap();
-            let _ = tokio::time::timeout(Duration::from_secs(5), receiver.closed()).await;
-            drop(control);
-            receiver.close(false).await;
-        };
-        let (mut progress, mut waiting, mut data) = (no_progress, no_wait, no_data);
-        let send = send_files(
-            sender.as_mut(),
-            SendArgs { files: vec![] },
-            &mut progress,
-            &mut waiting,
-            &mut data,
-        );
-        let ((), result) = tokio::join!(peer, send);
-        assert!(
-            matches!(result, Err(TransferError::UnexpectedPacket)),
+            matches!(result, Err(TransferError::Protocol(_))),
             "{result:?}"
         );
     }
 
-    pub async fn a_skip_list_of_the_wrong_length_is_rejected(pair: PairFn) {
-        let f = fixture();
-        write(&f.src.join("a.txt"), b"hello");
-
-        let Peers {
-            mut sender,
-            mut receiver,
-            ..
-        } = pair().await;
-        let peer = async {
-            let mut control = frame(receiver.control().await.unwrap());
-            let _: SenderToReceiver = recv_packet(&mut control).await.unwrap();
-            send_packet(&mut control, &ReceiverToSender::Ok)
-                .await
-                .unwrap();
-            let _: SenderToReceiver = recv_packet(&mut control).await.unwrap();
-            send_packet(
-                &mut control,
-                &ReceiverToSender::AcceptFilesSkip {
-                    files: vec![None, None],
-                },
-            )
-            .await
-            .unwrap();
-            let _ = tokio::time::timeout(Duration::from_secs(5), receiver.closed()).await;
-            drop(control);
-            receiver.close(false).await;
-        };
-        let (mut progress, mut waiting, mut data) = (no_progress, no_wait, no_data);
-        let send = send_files(
-            sender.as_mut(),
-            SendArgs {
-                files: vec![f.src.join("a.txt")],
-            },
-            &mut progress,
-            &mut waiting,
-            &mut data,
-        );
-        let ((), result) = tokio::join!(peer, send);
+    pub async fn unexpected_messages_are_errors(pair: PairFn) {
+        // A sender that skips hello.
+        let (got, result) = hostile_sender(pair, &frames(&[an_offer()])).await;
+        assert!(is_error(&got[1], ErrorCode::Protocol), "{got:?}");
         assert!(
-            matches!(result, Err(TransferError::UnexpectedPacket)),
+            matches!(result, Err(TransferError::Protocol(_))),
+            "{result:?}"
+        );
+
+        // A receiver that answers hello with done.
+        let (got, result) = hostile_receiver(pair, &frames(&[ReceiverMessage::Done])).await;
+        assert!(is_error(&got[1], ErrorCode::Protocol), "{got:?}");
+        assert!(
+            matches!(result, Err(TransferError::Protocol(_))),
             "{result:?}"
         );
     }
 
-    pub async fn packets_survive_the_wire(pair: PairFn) {
+    fn an_offer() -> SenderMessage {
+        SenderMessage::Offer {
+            entries: vec![Entry::File {
+                path: vec!["a".into()],
+                size: 1,
+            }],
+        }
+    }
+
+    /// The sender gets `from_receiver` after the receiver's hello, the receiver
+    /// `from_sender` after the sender's; both must fail with a protocol error.
+    async fn both_fail_with_a_protocol_error(
+        pair: PairFn,
+        from_receiver: &[u8],
+        from_sender: &[u8],
+    ) {
+        let raw = [receiver_frames(&[]), from_receiver.to_vec()].concat();
+        let (got, result) = hostile_receiver(pair, &raw).await;
+        // After its hello and offer.
+        assert!(is_error(&got[2], ErrorCode::Protocol), "{got:?}");
+        assert!(
+            matches!(result, Err(TransferError::Protocol(_))),
+            "{result:?}"
+        );
+
+        let raw = [
+            frames(&[SenderMessage::Hello(ok_hello())]),
+            from_sender.to_vec(),
+        ]
+        .concat();
+        let (got, result) = hostile_sender(pair, &raw).await;
+        assert!(is_error(&got[1], ErrorCode::Protocol), "{got:?}");
+        assert!(
+            matches!(result, Err(TransferError::Protocol(_))),
+            "{result:?}"
+        );
+    }
+
+    pub async fn unknown_and_wrong_direction_messages_are_errors(pair: PairFn) {
+        // Each side sends the other's message.
+        let accept = ReceiverMessage::Accept { files: vec![] };
+        both_fail_with_a_protocol_error(pair, &frames(&[an_offer()]), &frames(&[accept])).await;
+        let unknown = json_frame(r#"{"type":"resume","bytes":1}"#);
+        both_fail_with_a_protocol_error(pair, &unknown, &unknown).await;
+    }
+
+    pub async fn malformed_frames_are_errors(pair: PairFn) {
+        let (got, result) = hostile_sender(pair, &[0, 0, 0, 0]).await;
+        assert!(is_error(&got[1], ErrorCode::Protocol), "{got:?}");
+        assert!(
+            matches!(result, Err(TransferError::Protocol(_))),
+            "{result:?}"
+        );
+
+        // Messages without their fields.
+        both_fail_with_a_protocol_error(
+            pair,
+            &json_frame(r#"{"type":"accept"}"#),
+            &json_frame(r#"{"type":"offer"}"#),
+        )
+        .await;
+    }
+
+    pub async fn an_invalid_offer_is_rejected(pair: PairFn) {
+        let offer = SenderMessage::Offer {
+            entries: vec![Entry::File {
+                path: vec!["..".into()],
+                size: 1,
+            }],
+        };
+        let raw = frames(&[SenderMessage::Hello(ok_hello()), offer]);
+        let (got, result) = hostile_sender(pair, &raw).await;
+        assert!(is_error(&got[1], ErrorCode::InvalidOffer), "{got:?}");
+        assert!(
+            matches!(result, Err(TransferError::InvalidOffer(_))),
+            "{result:?}"
+        );
+    }
+
+    pub async fn an_invalid_accept_is_rejected(pair: PairFn) {
+        let accept = ReceiverMessage::Accept {
+            files: vec![AcceptedFile { id: 7, offset: 0 }],
+        };
+        let (got, result) = hostile_receiver(pair, &receiver_frames(&[accept])).await;
+        assert!(matches!(&got[1], SenderMessage::Offer { .. }), "{got:?}");
+        assert!(is_error(&got[2], ErrorCode::Protocol), "{got:?}");
+        assert!(
+            matches!(result, Err(TransferError::Protocol(_))),
+            "{result:?}"
+        );
+    }
+
+    pub async fn an_ack_beyond_the_data_is_rejected(pair: PairFn) {
+        let accept = ReceiverMessage::Accept {
+            files: vec![AcceptedFile { id: 0, offset: 0 }],
+        };
+        let ack = ReceiverMessage::Ack { bytes: 1000 };
+        let (got, result) = hostile_receiver(pair, &receiver_frames(&[accept, ack])).await;
+        assert!(is_error(&got[2], ErrorCode::Protocol), "{got:?}");
+        assert!(
+            matches!(result, Err(TransferError::Protocol(_))),
+            "{result:?}"
+        );
+    }
+
+    pub async fn a_cancel_from_the_peer_ends_the_transfer(pair: PairFn) {
+        let cancel = ReceiverMessage::Cancel(Cancel {
+            reason: Some("changed my mind".into()),
+        });
+        let (got, result) = hostile_receiver(pair, &receiver_frames(&[cancel])).await;
+        // Closing may cut off the offer; nothing else follows a cancel.
+        assert!(got.len() <= 2, "{got:?}");
+        assert!(
+            matches!(&result, Err(TransferError::PeerCancelled(Some(r))) if r == "changed my mind"),
+            "{result:?}"
+        );
+    }
+
+    pub async fn messages_survive_the_wire(pair: PairFn) {
         let Peers {
             mut sender,
             mut receiver,
             ..
         } = pair().await;
-        let big = SenderToReceiver::FileInfo {
-            files: (0..5000)
-                .map(|i| FilesAvailable::File {
-                    name: format!("file-{i}.bin"),
+        let big = SenderMessage::Offer {
+            entries: (0..5000)
+                .map(|i| Entry::File {
+                    path: vec![format!("file-{i}.bin")],
                     size: i,
                 })
                 .collect(),
         };
 
         // The receiver's stream only exists once the sender has written.
-        let mut a = frame(sender.control().await.unwrap());
-        let (sent, (mut b, received)) = tokio::join!(send_packet(&mut a, &big), async {
-            let mut b = frame(receiver.control().await.unwrap());
-            let received = recv_packet::<SenderToReceiver>(&mut b).await;
-            (b, received)
+        let mut a = SenderControl::new(sender.control().await.unwrap());
+        let (sent, mut b) = tokio::join!(a.send(&big), async {
+            ReceiverControl::new(receiver.control().await.unwrap())
         });
         sent.unwrap();
-        assert_eq!(received.unwrap(), big);
+        assert_eq!(b.recv().await.unwrap(), big);
 
         // The other direction on the same stream.
-        send_packet(&mut b, &ReceiverToSender::Ok).await.unwrap();
-        let got: ReceiverToSender = recv_packet(&mut a).await.unwrap();
-        assert_eq!(got, ReceiverToSender::Ok);
-
-        // The wrong packet type does not decode.
-        send_packet(&mut b, &ReceiverToSender::RejectFiles)
-            .await
-            .unwrap();
-        let got = recv_packet::<SenderToReceiver>(&mut a).await;
-        assert!(matches!(got, Err(TransferError::Json(_))), "{got:?}");
+        b.send(&ReceiverMessage::Done).await.unwrap();
+        assert_eq!(a.recv().await.unwrap(), ReceiverMessage::Done);
 
         drop((a, b));
         sender.close(true).await;
@@ -911,7 +1040,7 @@ pub mod suite {
 
         let result = match receiver.control().await {
             Err(e) => Err(e),
-            Ok(stream) => recv_packet::<SenderToReceiver>(&mut frame(stream)).await,
+            Ok(stream) => ReceiverControl::new(stream).recv().await,
         };
         assert!(result.is_err(), "{result:?}");
         receiver.close(false).await;

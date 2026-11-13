@@ -11,10 +11,17 @@ import {
   makeRecorder,
   bytes,
   waitFor,
+  jsonFrame,
 } from "./harness/index.mjs";
 
-const { runSend, runReceive, createDiskSink, createDownloadSink } =
-  await import("./.build/app.mjs");
+const {
+  runSend,
+  runReceive,
+  createDiskSink,
+  createDownloadSink,
+  encodeFrame,
+  Role,
+} = await import("./.build/app.mjs");
 
 let peerConnections;
 
@@ -123,6 +130,37 @@ describe("complete transfers (File System Access API)", () => {
     const spec = { "empty.txt": bytes(0) };
     const { dirHandle } = await transfer(spec);
     assert.deepEqual(Object.keys(dirHandle.snapshot()), ["empty.txt"]);
+  });
+
+  test("an empty folder is created", async () => {
+    const spec = { project: { "a.txt": bytes(10, 1), empty: {} } };
+    const { dirHandle, recv } = await transfer(spec, { mode: "handle" });
+    assert.equal(recv.error, null);
+    const project = await dirHandle.getDirectoryHandle("project");
+    assert.equal((await project.getDirectoryHandle("empty")).kind, "directory");
+  });
+
+  test("progress lands on the entry it belongs to", async () => {
+    const spec = {
+      "a.bin": bytes(40_000, 16),
+      dir: { "b.bin": bytes(30_000, 17), "c.bin": bytes(20_000, 18) },
+    };
+    const { send, recv } = await transfer(spec);
+    assert.deepEqual(send.present, [40_000, 50_000]);
+    assert.deepEqual(recv.present, [40_000, 50_000]);
+  });
+
+  test("a selection that breaks the offer rules is refused before pairing", async () => {
+    const send = makeRecorder();
+    await runSend(
+      makeEntries({ "a.txt": bytes(1) }).concat(
+        makeEntries({ "a.txt": bytes(2) }),
+      ),
+      send.emit,
+      new AbortController().signal,
+    );
+    assert.match(send.record.error ?? "", /offered twice/);
+    assert.equal(send.record.code, null, "no code is handed out");
   });
 });
 
@@ -337,6 +375,36 @@ describe("interrupted transfers", () => {
     assert.match(recv.record.error ?? "", /reject/i);
   });
 
+  test("cancelling a receive tells the sender", async () => {
+    const spec = { "big.bin": bytes(3_000_000, 102) };
+    const send = makeRecorder();
+    const recv = makeRecorder();
+    const controller = new AbortController();
+
+    const senderDone = runSend(
+      makeEntries(spec),
+      send.emit,
+      new AbortController().signal,
+    );
+    const code = await waitFor(() => send.record.code, { label: "share code" });
+    const receiverDone = runReceive(
+      code,
+      createDiskSink(new MemoryDirectoryHandle()),
+      false,
+      recv.emit,
+      controller.signal,
+    );
+    await waitFor(() => recv.record.progress > 100_000, {
+      label: "transfer under way",
+    });
+    controller.abort();
+    await Promise.all([senderDone, receiverDone]);
+
+    assert.equal(recv.record.error, null, "a deliberate abort is no error");
+    assert.match(send.record.error ?? "", /cancelled/);
+    assert.equal(send.record.complete, false);
+  });
+
   test("aborting the sender reports no error to the user", async () => {
     const spec = { "big.bin": bytes(2_000_000, 101) };
     const send = makeRecorder();
@@ -355,6 +423,51 @@ describe("interrupted transfers", () => {
     );
     assert.equal(send.record.complete, false);
   });
+});
+
+describe("protocol errors", () => {
+  const offer = {
+    type: "offer",
+    entries: [{ kind: "file", path: ["a"], size: 1 }],
+  };
+  for (const [name, frame] of [
+    ["a message only the sender sends", () => encodeFrame(offer, Role.Sender)],
+    ["an unknown message", () => jsonFrame('{"type":"resume"}')],
+    ["a malformed message", () => jsonFrame('{"type":"accept"}')],
+  ]) {
+    test(`${name} from the receiver fails the sender`, async () => {
+      const send = makeRecorder();
+      const recv = makeRecorder({
+        onOffered: (e) => {
+          // Ahead of the receiver's accept.
+          peerConnections[1]._channels.get("control").send(frame());
+          e.accept();
+        },
+      });
+
+      const senderDone = runSend(
+        makeEntries({ "a.bin": bytes(500, 5) }),
+        send.emit,
+        new AbortController().signal,
+      );
+      const code = await waitFor(() => send.record.code, {
+        label: "share code",
+      });
+      const receiverDone = runReceive(
+        code,
+        createDiskSink(new MemoryDirectoryHandle()),
+        false,
+        recv.emit,
+        new AbortController().signal,
+      );
+      await Promise.all([senderDone, receiverDone]);
+
+      assert.match(send.record.error ?? "", /^Protocol error/);
+      assert.equal(send.record.complete, false);
+      // The receiver learns why.
+      assert.match(recv.record.error ?? "", /^The other side failed/);
+    });
+  }
 });
 
 describe("resuming an interrupted download", () => {
@@ -427,6 +540,26 @@ describe("resuming an interrupted download", () => {
       send2.record.progress < payload.length,
       `resume should skip the ${partial.length} bytes already on disk, ` +
         `but sent ${send2.record.progress} of ${payload.length}`,
+    );
+  });
+
+  test("complete files are skipped on resume", async () => {
+    const spec = { "done.bin": bytes(5000, 161), "new.bin": bytes(300, 162) };
+    const dirHandle = new MemoryDirectoryHandle();
+    const done = await dirHandle.getFileHandle("done.bin", { create: true });
+    done.bytes = spec["done.bin"];
+
+    const { send, recv } = await transfer(spec, {
+      resume: true,
+      dir: dirHandle,
+    });
+    assert.equal(send.error, null);
+    assert.equal(recv.error, null);
+    assertFiles(dirHandle.snapshot(), expectedSnapshot(spec));
+    assert.equal(send.progress, 300, "only the new file crosses the wire");
+    assert.deepEqual(
+      recv.entries.map((entry) => entry.skipBytes),
+      [5000, 0],
     );
   });
 

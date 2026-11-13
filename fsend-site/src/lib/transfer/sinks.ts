@@ -1,4 +1,4 @@
-import type { FilesAvailable, FilesToSkip } from "../types";
+import type { TopEntry } from "../proto";
 
 /// Long enough for the browser to have started reading the blob.
 const REVOKE_DELAY_MS = 60_000;
@@ -7,16 +7,17 @@ const REVOKE_DELAY_MS = 60_000;
 export interface TransferSink {
   /// can the transfer be resumed
   readonly canResume: boolean;
-  // Which files to fully/partially skip, or null if none.
-  existing(offered: FilesAvailable[]): Promise<(FilesToSkip | null)[]>;
-  // open a file with a optional offset.
-  open(path: string, skipBytes: number): Promise<void>;
+  /// The size of the file already at `path`, null if there is none.
+  probe(path: string[]): Promise<number | null>;
+  createDir(path: string[]): Promise<void>;
+  /// Opens a file to write from `offset` on.
+  open(path: string[], offset: number): Promise<void>;
   write(chunk: Uint8Array): Promise<void>;
   closeFile(): Promise<void>;
   // Finish the transfer, by either flushing writes and closing files or by
   // zipping and downloading the in-memory buffers.
   finish(
-    offered: FilesAvailable[],
+    entries: TopEntry[],
     onProgress?: (percent: number) => void,
   ): Promise<void>;
   abandon(): Promise<void>;
@@ -28,28 +29,39 @@ export function createDiskSink(
 ): TransferSink {
   let writable: FileSystemWritableFileStream | null = null;
 
+  const dirOf = async (path: string[], create: boolean) => {
+    let dir = dirHandle;
+    for (const name of path) {
+      dir = await dir.getDirectoryHandle(name, { create });
+    }
+    return dir;
+  };
+
   return {
     canResume: true,
 
-    async existing(offered) {
-      const result: (FilesToSkip | null)[] = [];
-      for (const entry of offered) {
-        result.push(await existingFor(dirHandle, entry));
+    async probe(path) {
+      try {
+        const dir = await dirOf(path.slice(0, -1), false);
+        const handle = await dir.getFileHandle(path[path.length - 1]);
+        return (await handle.getFile()).size;
+      } catch {
+        // Not there yet.
+        return null;
       }
-      return result;
     },
 
-    async open(path, skipBytes) {
-      const parts = path.split("/");
-      let dir = dirHandle;
-      for (let i = 0; i < parts.length - 1; i++) {
-        dir = await dir.getDirectoryHandle(parts[i], { create: true });
-      }
-      const file = await dir.getFileHandle(parts[parts.length - 1], {
+    async createDir(path) {
+      await dirOf(path, true);
+    },
+
+    async open(path, offset) {
+      const dir = await dirOf(path.slice(0, -1), true);
+      const file = await dir.getFileHandle(path[path.length - 1], {
         create: true,
       });
-      writable = await file.createWritable({ keepExistingData: skipBytes > 0 });
-      if (skipBytes > 0) await writable.seek(skipBytes);
+      writable = await file.createWritable({ keepExistingData: offset > 0 });
+      if (offset > 0) await writable.seek(offset);
     },
 
     async write(chunk) {
@@ -74,56 +86,28 @@ export function createDiskSink(
   };
 }
 
-async function existingFor(
-  dir: FileSystemDirectoryHandle,
-  offered: FilesAvailable,
-): Promise<FilesToSkip | null> {
-  if (offered.type === "File") {
-    try {
-      const handle = await dir.getFileHandle(offered.name);
-      const file = await handle.getFile();
-      if (file.size > 0) {
-        return { type: "File", name: offered.name, skip: file.size };
-      }
-    } catch {
-      // Not there yet — nothing to skip.
-    }
-    return null;
-  }
-
-  try {
-    const sub = await dir.getDirectoryHandle(offered.name);
-    const files: FilesToSkip[] = [];
-    for (const child of offered.files) {
-      const skip = await existingFor(sub, child);
-      if (skip) files.push(skip);
-    }
-    return files.length > 0 ? { type: "Dir", name: offered.name, files } : null;
-  } catch {
-    return null;
-  }
-}
-
 /// Download to memory
 export function createDownloadSink(): TransferSink {
   const buffers = new Map<string, Uint8Array[]>();
+  const dirs: string[] = [];
   let current: Uint8Array[] | null = null;
-  let order: string[] = [];
 
   return {
     canResume: false,
 
-    async existing(offered) {
+    async probe() {
       // Nothing is kept between attempts, so there is never anything to skip.
-      return offered.map(() => null);
+      return null;
+    },
+
+    async createDir(path) {
+      dirs.push(path.join("/"));
     },
 
     async open(path) {
-      current = buffers.get(path) ?? [];
-      if (!buffers.has(path)) {
-        buffers.set(path, current);
-        order.push(path);
-      }
+      const key = path.join("/");
+      current = buffers.get(key) ?? [];
+      buffers.set(key, current);
     },
 
     async write(chunk) {
@@ -134,23 +118,16 @@ export function createDownloadSink(): TransferSink {
       current = null;
     },
 
-    async finish(offered, onProgress) {
-      const single =
-        order.length === 1 &&
-        offered.length === 1 &&
-        offered[0].type === "File";
-
-      if (single) {
-        const path = order[0];
-        triggerDownload(
-          new Blob(buffers.get(path)! as BlobPart[]),
-          path.split("/").pop()!,
-        );
+    async finish(entries, onProgress) {
+      if (entries.length === 1 && !entries[0].dir && buffers.size === 1) {
+        const [[path, chunks]] = buffers;
+        triggerDownload(new Blob(chunks as BlobPart[]), path);
         return;
       }
 
       const JSZip = (await import("jszip")).default;
       const zip = new JSZip();
+      for (const dir of dirs) zip.folder(dir);
       for (const [path, chunks] of buffers) {
         zip.file(path, new Blob(chunks as BlobPart[]));
       }
@@ -158,14 +135,14 @@ export function createDownloadSink(): TransferSink {
         onProgress?.(meta.percent),
       );
       const name =
-        offered.length === 1 ? `${offered[0].name}.zip` : "fsend-files.zip";
+        entries.length === 1 ? `${entries[0].name}.zip` : "fsend-files.zip";
       triggerDownload(blob, name);
     },
 
     async abandon() {
       // A partial in-memory transfer is worthless — nothing can resume it.
       buffers.clear();
-      order = [];
+      dirs.length = 0;
       current = null;
     },
   };

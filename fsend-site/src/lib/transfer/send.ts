@@ -1,132 +1,142 @@
-import {
-  PROTO_VERSION,
-  DATA_CHUNK_BYTES,
-  MAX_BUFFERED_BYTES,
-} from "../../config";
-import { openSenderSession } from "../transport/session";
+import { DATA_CHUNK_BYTES, MAX_BUFFERED_BYTES } from "../../config";
+import { openSenderSession, type Link } from "../transport/session";
 import { getConnectionType } from "../transport/webrtc";
+import { buildOffer, entrySize, type Outgoing } from "../files/tree";
 import {
-  buildFileTree,
-  flattenTree,
-  applySkip,
-  treeSizeBytes,
-  treeSkipBytes,
-} from "../files/tree";
-import { collectFiles } from "../files/source";
+  IDLE_TIMEOUT_MS,
+  MIN_RECV_WINDOW,
+  checkAccept,
+  encodeOffer,
+  loadProto,
+  presentBytes,
+  topEntries,
+  type ReceiverMessage,
+} from "../proto";
+import {
+  Peer,
+  TransferFailure,
+  type SenderPeer,
+  messageOf,
+  protocolError,
+  transferring,
+  unexpected,
+} from "./peer";
 import type { TransferListener } from "./events";
-import type {
-  SelectedEntry,
-  FileSendRecvTree,
-  SenderToReceiver,
-} from "../types";
+import type { SelectedEntry } from "../types";
+
+const RECEIVER_IDLE = "the receiver stopped responding";
 
 export async function runSend(
   entries: SelectedEntry[],
   emit: TransferListener,
   abort: AbortSignal,
 ): Promise<void> {
-  let session: Awaited<ReturnType<typeof openSenderSession>> = null;
+  let link: Link | null = null;
 
   try {
-    const fileTree = await buildFileTree(entries);
-    const files = await collectFiles(entries);
+    const outgoing = await buildOffer(entries);
+    await loadProto();
+    let offer: Uint8Array;
+    try {
+      offer = encodeOffer(outgoing.entries);
+    } catch (err) {
+      throw new Error(`Cannot send these files: ${messageOf(err)}`);
+    }
 
-    session = await openSenderSession(abort, {
+    link = await openSenderSession(abort, {
       onCode: (code, expiresInSecs) =>
         emit({ type: "code", code, expiresInSecs }),
       onWaitingPeer: () => emit({ type: "waitingPeer" }),
       onHandshaking: () => emit({ type: "handshaking" }),
     });
-    if (!session) return;
-    const { control, dataChannel, peer, disconnected } = session;
+    if (!link) return;
+    const { dataChannel } = link;
 
     // cosmetic: fetched in the background, ignored if it fails.
-    getConnectionType(session.pc)
+    getConnectionType(link.pc)
       .then((kind) => emit({ type: "connectionType", kind }))
       .catch(() => {});
 
-    // handshake
-    await control.send({
-      type: "ConnRequest",
-      version: PROTO_VERSION,
-    } as SenderToReceiver);
-
-    const version = await control.next();
-    if (version.type === "WrongVersion") {
-      throw new Error(`Version mismatch: peer expects ${version.expected}`);
-    }
-    if (version.type !== "Ok") {
-      throw new Error("Unexpected response to version handshake");
-    }
-
-    // offer files
-    await control.send({
-      type: "FileInfo",
-      files: fileTree,
-    } as SenderToReceiver);
-    emit({ type: "waitingAccept" });
-
-    const answer = await control.next();
-    if (answer.type === "RejectFiles") {
-      throw new Error("Receiver rejected the files");
-    }
-    if (answer.type !== "AcceptFilesSkip") {
-      throw new Error("Unexpected response");
-    }
-
-    // data
-    const trees: FileSendRecvTree[] = [];
-    for (let i = 0; i < fileTree.length; i++) {
-      const tree = applySkip(fileTree[i], answer.files[i] ?? null);
-      if (tree) trees.push(tree);
-    }
-
-    const flat = flattenTree(trees);
-    emit({
-      type: "transferring",
-      entries: trees.map((t) => ({
-        name: t.name,
-        sizeBytes: treeSizeBytes(t),
-        skipBytes: treeSkipBytes(t),
-        isDir: t.type === "Dir",
-      })),
-    });
-
-    dataChannel.bufferedAmountLowThreshold = MAX_BUFFERED_BYTES / 2;
-
-    for (const { path, skipBytes, sizeBytes } of flat) {
-      const file = files.get(path);
-      if (!file) throw new Error(`File not found: ${path}`);
-
-      let sentBytes = skipBytes;
-      while (sentBytes < sizeBytes) {
-        if (abort.aborted) return;
-        if (peer.isDown()) throw new Error("Peer disconnected");
-
-        if (dataChannel.bufferedAmount > MAX_BUFFERED_BYTES) {
-          await Promise.race([
-            new Promise<void>((resolve) => {
-              dataChannel.onbufferedamountlow = () => resolve();
-            }),
-            disconnected,
-          ]);
-        }
-
-        const endBytes = Math.min(sentBytes + DATA_CHUNK_BYTES, sizeBytes);
-        dataChannel.send(await file.slice(sentBytes, endBytes).arrayBuffer());
-        emit({ type: "progress", bytes: endBytes - sentBytes });
-        sentBytes = endBytes;
-      }
-    }
-
-    // The receiver closes once it has consumed everything.
-    await disconnected.catch(() => {});
+    const peer = Peer.sender(link, abort);
+    await peer.explained(() => send(peer, dataChannel, outgoing, offer, emit));
     emit({ type: "complete" });
-  } catch (err: any) {
-    if (!abort.aborted) {
-      emit({ type: "error", message: err?.message ?? String(err) });
-    }
+  } catch (err) {
+    if (!abort.aborted) emit({ type: "error", message: messageOf(err) });
   } finally {
-    session?.close();
+    link?.close();
+  }
+}
+
+async function send(
+  peer: SenderPeer,
+  channel: RTCDataChannel,
+  { entries, files: sources }: Outgoing,
+  offer: Uint8Array,
+  emit: TransferListener,
+): Promise<void> {
+  const window = await peer.hello("the receiver did not say hello in time");
+  if (window === undefined || window < MIN_RECV_WINDOW) {
+    throw protocolError("the receiver announced no usable window");
+  }
+
+  peer.sendFrame(offer);
+  emit({ type: "waitingAccept" });
+  const answer = await peer.next();
+  if (answer.type === "reject") {
+    throw new TransferFailure("The receiver rejected the files");
+  }
+  if (answer.type !== "accept") throw unexpected(answer);
+  const { files } = answer;
+  try {
+    checkAccept(entries, files);
+  } catch (err) {
+    throw protocolError(messageOf(err));
+  }
+  const [tops, topOf] = topEntries(entries);
+  emit(transferring(tops, presentBytes(entries, files)));
+
+  let sent = 0;
+  let acked = 0;
+  const ack = (message: ReceiverMessage) => {
+    if (message.type !== "ack") throw unexpected(message);
+    if (message.bytes < acked || message.bytes > sent) {
+      throw protocolError("an ack outside the bytes sent");
+    }
+    acked = message.bytes;
+  };
+
+  channel.bufferedAmountLowThreshold = MAX_BUFFERED_BYTES / 2;
+  for (const { id, offset } of files) {
+    const source = sources[id]!;
+    const size = entrySize(entries[id]);
+    for (let position = offset; position < size;) {
+      // Also notices a peer that is gone.
+      for (let m = peer.poll(); m; m = peer.poll()) ack(m);
+      while (sent - acked >= window) {
+        ack(await peer.next(IDLE_TIMEOUT_MS, RECEIVER_IDLE));
+      }
+      if (channel.bufferedAmount > MAX_BUFFERED_BYTES) {
+        await Promise.race([
+          new Promise((resolve) => (channel.onbufferedamountlow = resolve)),
+          peer.stopped,
+        ]);
+      }
+
+      const n = Math.min(
+        DATA_CHUNK_BYTES,
+        size - position,
+        window - (sent - acked),
+      );
+      channel.send(await source.slice(position, position + n).arrayBuffer());
+      position += n;
+      sent += n;
+      emit({ type: "progress", entry: topOf[id], bytes: n });
+    }
+  }
+
+  for (;;) {
+    const message = await peer.next(IDLE_TIMEOUT_MS, RECEIVER_IDLE);
+    if (message.type === "done") return;
+    ack(message);
   }
 }

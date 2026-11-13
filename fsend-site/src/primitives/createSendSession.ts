@@ -1,7 +1,6 @@
 import { createMemo, createSignal } from "solid-js";
 import { runSend } from "../lib/transfer/send";
-import { collectFiles } from "../lib/files/source";
-import { buildFileTree, entrySizeBytes } from "../lib/files/tree";
+import { buildOffer, offerSizeBytes } from "../lib/files/tree";
 import { createTransferRun, stepOf } from "./createTransferRun";
 import type { SelectedEntry } from "../lib/types";
 
@@ -37,8 +36,7 @@ export function createSendSession() {
 
   // Measure a single item and update its size in the list.
   const measure = async (item: SelectedItem) => {
-    const [tree] = await buildFileTree([item.entry]);
-    const sizeBytes = tree ? entrySizeBytes(tree) : 0;
+    const sizeBytes = offerSizeBytes((await buildOffer([item.entry])).entries);
     setItems((current) =>
       current.includes(item)
         ? current.map((each) => (each === item ? { ...each, sizeBytes } : each))
@@ -85,7 +83,7 @@ export function createSendSession() {
             setState("transferring");
             break;
           case "progress":
-            run.tracker.recordBytes(event.bytes);
+            run.tracker.recordBytes(event.entry, event.bytes);
             break;
           case "connectionType":
             run.setConnection(event.kind);
@@ -132,7 +130,5 @@ export function createSendSession() {
       reset();
     },
     reset,
-    /// Also collects the files, so a caller can verify a selection is readable.
-    collect: () => collectFiles(entries()),
   };
 }

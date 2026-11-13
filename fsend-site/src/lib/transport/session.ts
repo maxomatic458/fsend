@@ -7,13 +7,11 @@ import {
   watchDisconnect,
   type DisconnectWatcher,
 } from "./webrtc";
-import { createControlChannel, type ControlChannel } from "./control";
 import { loadProto, parseCode, type ConnectionInfo } from "../proto";
-import type { SenderToReceiver, ReceiverToSender } from "../types";
 
-/// Live peer to peer session
-export interface Session<In, Out> {
-  control: ControlChannel<In, Out>;
+/// Live peer to peer connection
+export interface Link {
+  controlChannel: RTCDataChannel;
   dataChannel: RTCDataChannel;
   pc: RTCPeerConnection;
   peer: DisconnectWatcher;
@@ -21,9 +19,6 @@ export interface Session<In, Out> {
   disconnected: Promise<never>;
   close(): void;
 }
-
-export type SenderSession = Session<ReceiverToSender, SenderToReceiver>;
-export type ReceiverSession = Session<SenderToReceiver, ReceiverToSender>;
 
 function webRtcInfo(sdp: string): ConnectionInfo {
   return { type: "web_rtc", sdp, ice_candidates: [] };
@@ -36,14 +31,14 @@ function sdpOf(info: ConnectionInfo): string {
   return info.sdp;
 }
 
-function assemble<In, Out>(
+function assemble(
   pc: RTCPeerConnection,
   controlChannel: RTCDataChannel,
   dataChannel: RTCDataChannel,
-): Session<In, Out> {
+): Link {
   const peer = watchDisconnect(pc, [controlChannel, dataChannel]);
   return {
-    control: createControlChannel<In, Out>(controlChannel, peer.promise),
+    controlChannel,
     dataChannel,
     pc,
     peer,
@@ -64,7 +59,7 @@ export interface SenderSessionHooks {
 export async function openSenderSession(
   abort: AbortSignal,
   hooks: SenderSessionHooks,
-): Promise<SenderSession | null> {
+): Promise<Link | null> {
   await loadProto();
   const relay = await Relay.connect(abort);
   try {
@@ -76,11 +71,14 @@ export async function openSenderSession(
 
     const { connection, offerSdp } = await createOfferer();
     const { pc, controlChannel, dataChannel } = connection;
-    abort.addEventListener("abort", () => pc.close());
+    const closeOnAbort = () => pc.close();
+    abort.addEventListener("abort", closeOnAbort);
 
     relay.sendConnection(webRtcInfo(offerSdp));
     await applyAnswer(pc, sdpOf(await relay.connection()));
     await waitConnected(pc, [controlChannel, dataChannel]);
+    // Once connected, the transfer tells the peer it was cancelled.
+    abort.removeEventListener("abort", closeOnAbort);
     if (abort.aborted) {
       pc.close();
       return null;
@@ -96,7 +94,7 @@ export async function openReceiverSession(
   code: string,
   abort: AbortSignal,
   hooks: { onHandshaking(): void },
-): Promise<ReceiverSession | null> {
+): Promise<Link | null> {
   await loadProto();
   const parsed = parseCode(code);
   if ("error" in parsed) throw new Error(`Invalid code: ${parsed.message}`);
@@ -107,12 +105,15 @@ export async function openReceiverSession(
 
     const answerer = await createAnswerer(sdpOf(await relay.connection()));
     const pc = answerer.pc;
-    abort.addEventListener("abort", () => pc.close());
+    const closeOnAbort = () => pc.close();
+    abort.addEventListener("abort", closeOnAbort);
 
     relay.sendConnection(webRtcInfo(answerer.answerSdp));
 
     const { controlChannel, dataChannel } = await answerer.channelsReady;
     await waitConnected(pc, [controlChannel, dataChannel]);
+    // Once connected, the transfer tells the peer it was cancelled.
+    abort.removeEventListener("abort", closeOnAbort);
     if (abort.aborted) {
       pc.close();
       return null;

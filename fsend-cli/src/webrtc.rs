@@ -2,6 +2,7 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Notify, mpsc, watch};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::io::StreamReader;
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelState};
 use webrtc::peer_connection::{
@@ -20,6 +21,7 @@ use webrtc::peer_connection::{
 use webrtc::runtime::TokioRuntime;
 
 use crate::transfer::*;
+use fsend_proto::peer::limits::RECV_WINDOW;
 
 pub const DEFAULT_STUN_SERVERS: &[&str] = &[
     "stun:stun.l.google.com:19302",
@@ -31,6 +33,8 @@ pub const MAX_MESSAGE_BYTES: usize = 16384;
 
 /// Per-channel send buffer.
 const MAX_BUFFERED_BYTES: usize = 1024 * 1024;
+/// Received bytes a channel queues; the peer protocol's window keeps a well-behaved peer below it.
+const MAX_QUEUED_BYTES: usize = 2 * RECV_WINDOW as usize;
 const ICE_GATHERING_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
@@ -96,7 +100,9 @@ struct DcStream {
     dc: Arc<dyn DataChannel>,
     link: Link,
     opened: Arc<Notify>,
-    reader: StreamReader<ReceiverStream<io::Result<Bytes>>, Bytes>,
+    reader: StreamReader<UnboundedReceiverStream<io::Result<Bytes>>, Bytes>,
+    /// Bytes received but not read yet.
+    queued: Arc<AtomicUsize>,
     /// The send in progress.
     inflight: Option<Pin<Box<dyn Future<Output = io::Result<()>> + Send>>>,
 }
@@ -108,11 +114,14 @@ impl DcStream {
         link_tx: Arc<watch::Sender<LinkState>>,
         link: Link,
     ) -> Self {
-        let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(256);
+        // The poller must never wait on the reader: a blocked poller stalls the channel for good.
+        let (tx, rx) = mpsc::unbounded_channel::<io::Result<Bytes>>();
         let opened = Arc::new(Notify::new());
+        let queued = Arc::new(AtomicUsize::new(0));
 
         let poller = dc.clone();
         let opened_tx = opened.clone();
+        let queued_tx = queued.clone();
         let mut link_rx = link.clone();
         tokio::spawn(async move {
             let label = poller.label().await.unwrap_or_default();
@@ -126,7 +135,12 @@ impl DcStream {
                 match event {
                     Some(DataChannelEvent::OnOpen) => opened_tx.notify_one(),
                     Some(DataChannelEvent::OnMessage(msg)) => {
-                        if tx.send(Ok(msg.data.freeze())).await.is_err() {
+                        let len = msg.data.len();
+                        if queued_tx.fetch_add(len, Ordering::Relaxed) + len > MAX_QUEUED_BYTES {
+                            mark_closed(&link_tx, format!("{label} channel overrun by the peer"));
+                            break;
+                        }
+                        if tx.send(Ok(msg.data.freeze())).is_err() {
                             return;
                         }
                     }
@@ -144,14 +158,15 @@ impl DcStream {
                     }
                 }
             }
-            let _ = tx.send(Err(lost(closed(&mut link_rx).await))).await;
+            let _ = tx.send(Err(lost(closed(&mut link_rx).await)));
         });
 
         Self {
             dc,
             link,
             opened,
-            reader: StreamReader::new(ReceiverStream::new(rx)),
+            reader: StreamReader::new(UnboundedReceiverStream::new(rx)),
+            queued,
             inflight: None,
         }
     }
@@ -174,7 +189,11 @@ impl AsyncRead for DcStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.reader).poll_read(cx, buf)
+        let before = buf.filled().len();
+        std::task::ready!(Pin::new(&mut self.reader).poll_read(cx, buf))?;
+        let read = buf.filled().len() - before;
+        self.queued.fetch_sub(read, Ordering::Relaxed);
+        Poll::Ready(Ok(()))
     }
 }
 

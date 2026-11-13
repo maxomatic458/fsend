@@ -3,7 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::pin::Pin;
 
 use super::*;
-use crate::transfer::test_support::{Peers, suite};
+use crate::transfer::test_support::{Peers, transport_suite};
 
 async fn local_endpoint() -> Endpoint {
     IrohTransfer::bind(presets::Minimal).await.unwrap()
@@ -57,95 +57,8 @@ fn pair() -> Pin<Box<dyn Future<Output = Peers> + Send>> {
     })
 }
 
-// The behaviour every transport must have, shared with the WebRTC tests.
-#[tokio::test]
-async fn sends_a_single_file() {
-    suite::sends_a_single_file(pair).await
-}
-#[tokio::test]
-async fn sends_an_empty_file() {
-    suite::sends_an_empty_file(pair).await
-}
-#[tokio::test]
-async fn sends_a_file_larger_than_the_buffers() {
-    suite::sends_a_file_larger_than_the_buffers(pair).await
-}
-#[tokio::test]
-async fn sends_a_directory_tree() {
-    suite::sends_a_directory_tree(pair).await
-}
-#[tokio::test]
-async fn sends_several_entries_at_once() {
-    suite::sends_several_entries_at_once(pair).await
-}
-#[tokio::test]
-async fn sends_the_current_directory() {
-    suite::sends_the_current_directory(pair).await
-}
-#[tokio::test]
-async fn receiver_can_decline() {
-    suite::receiver_can_decline(pair).await
-}
-#[tokio::test]
-async fn resumes_a_partial_file() {
-    suite::resumes_a_partial_file(pair).await
-}
-#[tokio::test]
-async fn resumes_a_partial_directory() {
-    suite::resumes_a_partial_directory(pair).await
-}
-#[tokio::test]
-async fn resume_skips_complete_files() {
-    suite::resume_skips_complete_files(pair).await
-}
-#[tokio::test]
-async fn resume_starts_over_when_the_local_file_is_larger() {
-    suite::resume_starts_over_when_the_local_file_is_larger(pair).await
-}
-#[tokio::test]
-async fn overwrite_ignores_partial_files() {
-    suite::overwrite_ignores_partial_files(pair).await
-}
-#[tokio::test]
-async fn overwrite_truncates_a_larger_stale_file() {
-    suite::overwrite_truncates_a_larger_stale_file(pair).await
-}
-#[tokio::test]
-async fn interrupted_by_the_receiver_then_resumed() {
-    suite::interrupted_by_the_receiver_then_resumed(pair).await
-}
-#[tokio::test]
-async fn interrupted_by_the_sender_then_resumed() {
-    suite::interrupted_by_the_sender_then_resumed(pair).await
-}
-#[tokio::test]
-async fn a_missing_file_fails_the_transfer() {
-    suite::a_missing_file_fails_the_transfer(pair).await
-}
-#[tokio::test]
-async fn receiver_rejects_another_protocol_version() {
-    suite::receiver_rejects_another_protocol_version(pair).await
-}
-#[tokio::test]
-async fn sender_stops_when_the_receiver_wants_another_version() {
-    suite::sender_stops_when_the_receiver_wants_another_version(pair).await
-}
-#[tokio::test]
-async fn unexpected_packets_are_errors() {
-    suite::unexpected_packets_are_errors(pair).await
-}
-#[tokio::test]
-async fn a_skip_list_of_the_wrong_length_is_rejected() {
-    suite::a_skip_list_of_the_wrong_length_is_rejected(pair).await
-}
-#[tokio::test]
-async fn packets_survive_the_wire() {
-    suite::packets_survive_the_wire(pair).await
-}
-#[tokio::test]
-async fn a_closed_peer_fails_the_control_stream() {
-    suite::a_closed_peer_fails_the_control_stream(pair).await
-}
+// The behaviour every transport must have.
+transport_suite!();
 
 // iroh specifics.
 

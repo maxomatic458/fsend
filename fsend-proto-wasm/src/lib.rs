@@ -1,6 +1,7 @@
 use fsend_proto::{
     code::{Code, CodeError},
     pairing::{self, PairingError, Signal},
+    peer::{self, ReceiverMessage, SenderMessage, frame, offer},
 };
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -40,6 +41,7 @@ pub fn new_code(nameplate: &str) -> Option<String> {
 }
 
 #[wasm_bindgen]
+#[derive(Clone, Copy)]
 pub enum Role {
     Sender,
     Receiver,
@@ -110,6 +112,113 @@ impl Channel {
     }
 }
 
+/// JSON text of a value that always serializes.
+fn json(value: &impl Serialize) -> String {
+    serde_json::to_string(value).expect("protocol values serialize")
+}
+
+/// One control frame of `message`, a JSON `SenderMessage` or `ReceiverMessage` as `from` sends.
+#[wasm_bindgen(js_name = encodeFrame)]
+pub fn encode_frame(message: &str, from: Role) -> Result<Vec<u8>, JsError> {
+    Ok(match from {
+        Role::Sender => frame::encode(&serde_json::from_str::<SenderMessage>(message)?)?,
+        Role::Receiver => frame::encode(&serde_json::from_str::<ReceiverMessage>(message)?)?,
+    })
+}
+
+/// Reassembles the control messages `from` sends from bytes split anywhere.
+#[wasm_bindgen]
+pub struct FrameDecoder {
+    decoder: frame::FrameDecoder,
+    from: Role,
+}
+
+#[wasm_bindgen]
+impl FrameDecoder {
+    #[wasm_bindgen(constructor)]
+    pub fn new(from: Role) -> Self {
+        Self {
+            decoder: frame::FrameDecoder::default(),
+            from,
+        }
+    }
+
+    pub fn push(&mut self, data: &[u8]) {
+        self.decoder.push(data);
+    }
+
+    /// The next message as a JSON `SenderMessage` or `ReceiverMessage`, if one is complete.
+    #[wasm_bindgen(js_name = nextMessage)]
+    pub fn next_message(&mut self) -> Result<Option<String>, JsError> {
+        Ok(match self.from {
+            Role::Sender => self
+                .decoder
+                .next_message::<SenderMessage>()?
+                .map(|m| json(&m)),
+            Role::Receiver => self
+                .decoder
+                .next_message::<ReceiverMessage>()?
+                .map(|m| json(&m)),
+        })
+    }
+}
+
+/// The highest protocol version both sides speak.
+#[wasm_bindgen]
+pub fn negotiate(version: u32, min_version: u32) -> Option<u32> {
+    peer::negotiate(version, min_version)
+}
+
+/// Checks `entries`, a JSON `Entry[]`, against the offer rules.
+#[wasm_bindgen(js_name = validateOffer)]
+pub fn validate_offer(entries: &str) -> Result<(), JsError> {
+    Ok(offer::validate(&serde_json::from_str::<Vec<_>>(entries)?)?)
+}
+
+/// The control frame of an offer of `entries`, a JSON `Entry[]`, once they are valid.
+#[wasm_bindgen(js_name = encodeOffer)]
+pub fn encode_offer(entries: &str) -> Result<Vec<u8>, JsError> {
+    Ok(offer::encode(&serde_json::from_str::<Vec<_>>(entries)?)?)
+}
+
+/// Checks `files`, a JSON `AcceptedFile[]`, against the offered `entries`.
+#[wasm_bindgen(js_name = checkAccept)]
+pub fn check_accept(entries: &str, files: &str) -> Result<(), JsError> {
+    let entries: Vec<_> = serde_json::from_str(entries)?;
+    Ok(offer::check_accept(
+        &entries,
+        &serde_json::from_str::<Vec<_>>(files)?,
+    )?)
+}
+
+/// The JSON `AcceptedFile[]` for `entries`, given the JSON `(number | null)[]` size of each one present locally.
+#[wasm_bindgen(js_name = acceptFiles)]
+pub fn accept_files(entries: &str, local: &str) -> Result<String, JsError> {
+    let entries: Vec<_> = serde_json::from_str(entries)?;
+    Ok(json(&offer::accept(
+        &entries,
+        &serde_json::from_str::<Vec<_>>(local)?,
+    )))
+}
+
+/// JSON `[TopEntry[], number[]]`: the top-level entries of a valid offer, and the one each entry lies in.
+#[wasm_bindgen(js_name = topEntries)]
+pub fn top_entries(entries: &str) -> Result<String, JsError> {
+    Ok(json(&offer::top_entries(&serde_json::from_str::<Vec<_>>(
+        entries,
+    )?)))
+}
+
+/// JSON `number[]`: bytes of each top-level entry already present once `files` are accepted.
+#[wasm_bindgen(js_name = presentBytes)]
+pub fn present_bytes(entries: &str, files: &str) -> Result<String, JsError> {
+    let entries: Vec<_> = serde_json::from_str(entries)?;
+    Ok(json(&offer::present(
+        &entries,
+        &serde_json::from_str::<Vec<_>>(files)?,
+    )))
+}
+
 #[cfg(test)]
 mod bindings {
     use std::{env, fs, path::Path};
@@ -117,6 +226,7 @@ mod bindings {
     use fsend_proto::{
         code::NAMEPLATE_LEN,
         pairing::{ConnectionInfo, Sealed},
+        peer::{AcceptedFile, Cancel, Entry, ErrorReport, Hello, limits, offer::TopEntry},
         relay::{ClientMessage, ErrorCode, ServerMessage, Transport, VERSION},
     };
     use ts_rs::{Config, TS};
@@ -138,13 +248,40 @@ mod bindings {
             PairingError::decl(&cfg),
             ParsedCode::decl(&cfg),
             CodeError::decl(&cfg),
+            SenderMessage::decl(&cfg),
+            ReceiverMessage::decl(&cfg),
+            Hello::decl(&cfg),
+            Cancel::decl(&cfg),
+            ErrorReport::decl(&cfg),
+            Entry::decl(&cfg),
+            AcceptedFile::decl(&cfg),
+            peer::ErrorCode::decl(&cfg),
+            TopEntry::decl(&cfg),
         ];
         let header = format!(
             "// Generated by `cargo test -p fsend-proto-wasm`. Do not edit.\n\n\
              export const RELAY_VERSION = {VERSION};\n\
              export const CODE_LENGTH = {};\n\
-             export const NAMEPLATE_LENGTH = {NAMEPLATE_LEN};\n",
-            fsend_proto::code::CODE_LEN
+             export const NAMEPLATE_LENGTH = {NAMEPLATE_LEN};\n\
+             export const PEER_VERSION = {};\n\
+             export const PEER_MIN_VERSION = {};\n\
+             export const RECV_WINDOW = {};\n\
+             export const MIN_RECV_WINDOW = {};\n\
+             export const ACK_STEP = {};\n\
+             export const ACK_INTERVAL_MS = {};\n\
+             export const HELLO_TIMEOUT_MS = {};\n\
+             export const IDLE_TIMEOUT_MS = {};\n\
+             export const GOODBYE_TIMEOUT_MS = {};\n",
+            fsend_proto::code::CODE_LEN,
+            peer::VERSION,
+            peer::MIN_VERSION,
+            limits::RECV_WINDOW,
+            limits::MIN_RECV_WINDOW,
+            limits::ACK_STEP,
+            limits::ACK_INTERVAL.as_millis(),
+            limits::HELLO_TIMEOUT.as_millis(),
+            limits::IDLE_TIMEOUT.as_millis(),
+            limits::GOODBYE_TIMEOUT.as_millis(),
         );
         let expected = decls
             .iter()

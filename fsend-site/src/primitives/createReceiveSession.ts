@@ -7,8 +7,7 @@ import {
 } from "../lib/files/storage";
 import { createDiskSink, createDownloadSink } from "../lib/transfer/sinks";
 import { createTransferRun, stepOf } from "./createTransferRun";
-import { CODE_LENGTH } from "../lib/proto";
-import type { FilesAvailable } from "../lib/types";
+import { CODE_LENGTH, type TopEntry } from "../lib/proto";
 
 export type ReceiveState =
   | "input"
@@ -30,7 +29,7 @@ export function createReceiveSession() {
   );
 
   const [code, setCodeRaw] = createSignal("");
-  const [offered, setOffered] = createSignal<FilesAvailable[]>([]);
+  const [offered, setOffered] = createSignal<TopEntry[]>([]);
   const [folder, setFolder] = createSignal<FileSystemDirectoryHandle | null>(
     null,
   );
@@ -86,7 +85,7 @@ export function createReceiveSession() {
             setState("transferring");
             break;
           case "progress":
-            run.tracker.recordBytes(event.bytes);
+            run.tracker.recordBytes(event.entry, event.bytes);
             break;
           case "packing":
             setPacking(event.percent);

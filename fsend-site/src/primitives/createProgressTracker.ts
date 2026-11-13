@@ -33,7 +33,6 @@ export function createProgressTracker() {
   });
 
   const stats = new TransferStats();
-  let currentEntryIdx = 0;
   let statsInterval: ReturnType<typeof setInterval> | undefined;
 
   /** Stops the sampling interval. Safe to call when none is running. */
@@ -68,16 +67,6 @@ export function createProgressTracker() {
       skippedBytes,
     });
 
-    currentEntryIdx = 0;
-    // Find the first non-complete entry
-    while (
-      currentEntryIdx < entries.length &&
-      entries[currentEntryIdx].transferredBytes >=
-        entries[currentEntryIdx].sizeBytes
-    ) {
-      currentEntryIdx++;
-    }
-
     stats.reset();
     stats.record(skippedBytes);
 
@@ -95,24 +84,14 @@ export function createProgressTracker() {
     }, 500);
   }
 
-  function recordBytes(bytes: number) {
+  /** `bytes` more of the entry at `index` arrived. */
+  function recordBytes(index: number, bytes: number) {
     setProgress(
       produce((p) => {
+        const entry = p.entries[index];
+        if (!entry) return;
+        entry.transferredBytes += bytes;
         p.totalTransferredBytes += bytes;
-
-        // Distribute bytes to current entry
-        if (currentEntryIdx < p.entries.length) {
-          p.entries[currentEntryIdx].transferredBytes += bytes;
-
-          // Advance to next entry if current is complete
-          while (
-            currentEntryIdx < p.entries.length &&
-            p.entries[currentEntryIdx].transferredBytes >=
-              p.entries[currentEntryIdx].sizeBytes
-          ) {
-            currentEntryIdx++;
-          }
-        }
       }),
     );
   }

@@ -1,215 +1,70 @@
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::fmt::Debug;
+use std::io;
+use std::marker::PhantomData;
+use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use async_compression::tokio::write::GzipEncoder;
 use async_trait::async_trait;
-use bytes::Bytes;
 use colored::Colorize;
-use fsend_proto::peer::{
-    FileSendRecvTree, FilesAvailable, FilesToSkip, MAX_FRAME_BYTES, PROTO_VERSION,
-    ReceiverToSender, SenderToReceiver,
+use fsend_proto::peer::frame::{self, FrameDecoder};
+use fsend_proto::peer::limits::{
+    ACK_INTERVAL, ACK_STEP, GOODBYE_TIMEOUT, HELLO_TIMEOUT, IDLE_TIMEOUT, MAX_DEPTH,
+    MIN_RECV_WINDOW, RECV_WINDOW,
 };
-use futures_util::{SinkExt, StreamExt};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
+use fsend_proto::peer::offer::{self, EntryError, OfferError, TopEntry};
+use fsend_proto::peer::{
+    self, AcceptedFile, Cancel, Entry, ErrorCode, ErrorReport, Hello, Message, ReceiverMessage,
+    SenderMessage,
+};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tokio::fs::File;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
+use tokio::time::timeout;
 
 /// Read/write chunk on the data stream.
 pub const BUF_SIZE: usize = 64 * 1024;
-/// How long a incompatible peer gets to read our last packet.
-const GOODBYE_TIMEOUT: Duration = Duration::from_secs(5);
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The name a path is announced under.
-fn entry_name(path: &Path) -> std::io::Result<String> {
-    let name = match path.file_name() {
-        Some(name) => name.to_owned(),
-        None => std::fs::canonicalize(path)?
-            .file_name()
-            .map(|n| n.to_owned())
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("cannot send {}: it has no name", path.display()),
-                )
-            })?,
-    };
-    Ok(name.to_string_lossy().into_owned())
-}
-
-pub fn get_files_available(path: &Path) -> std::io::Result<FilesAvailable> {
-    let name = entry_name(path)?;
-    if path.is_file() {
-        Ok(FilesAvailable::File {
-            name,
-            size: path.metadata()?.len(),
-        })
-    } else {
-        let mut files = Vec::new();
-        for entry in std::fs::read_dir(path)? {
-            files.push(get_files_available(&entry?.path())?);
-        }
-        Ok(FilesAvailable::Dir { name, files })
-    }
-}
-
-#[derive(Debug, PartialEq, Clone)]
-pub enum TransferEntry {
-    Dir { path: PathBuf },
-    File { path: PathBuf, skip: u64, size: u64 },
-}
-
-/// Flattens the trees into the order of the wire bytes.
-pub fn flatten_trees(trees: &[FileSendRecvTree], root: &Path) -> Vec<TransferEntry> {
-    fn walk(tree: &FileSendRecvTree, parent: &Path, out: &mut Vec<TransferEntry>) {
-        match tree {
-            FileSendRecvTree::File { name, skip, size } => out.push(TransferEntry::File {
-                path: parent.join(name),
-                skip: *skip,
-                size: *size,
-            }),
-            FileSendRecvTree::Dir { name, files } => {
-                let dir = parent.join(name);
-                out.push(TransferEntry::Dir { path: dir.clone() });
-                for file in files {
-                    walk(file, &dir, out);
-                }
-            }
-        }
-    }
-
-    let mut out = Vec::new();
-    for tree in trees {
-        match tree {
-            FileSendRecvTree::File { skip, size, .. } => out.push(TransferEntry::File {
-                path: root.to_path_buf(),
-                skip: *skip,
-                size: *size,
-            }),
-            FileSendRecvTree::Dir { files, .. } => {
-                out.push(TransferEntry::Dir {
-                    path: root.to_path_buf(),
-                });
-                for file in files {
-                    walk(file, root, &mut out);
-                }
-            }
-        }
-    }
-    out
-}
-
-/// What the receiver keeps of the offer, after skip is applied.
-pub struct TransferPlan {
-    pub to_transfer: Vec<Option<FileSendRecvTree>>,
-    /// `(name, bytes present locally, total bytes)` per offered entry.
-    pub progress: Vec<(String, u64, u64)>,
-}
-
-pub fn plan_transfer(offered: &[FilesAvailable], to_skip: &[Option<FilesToSkip>]) -> TransferPlan {
-    let to_transfer = offered
-        .iter()
-        .zip(to_skip)
-        .map(|(file, skip)| match skip {
-            Some(s) => file.remove_skipped(s),
-            None => Some(file.to_send_recv_tree()),
-        })
-        .collect();
-
-    let progress = offered
-        .iter()
-        .zip(to_skip)
-        .map(|(file, skip)| {
-            (
-                file.name().to_string(),
-                skip.as_ref().map(|s| s.skip()).unwrap_or(0),
-                file.size(),
-            )
-        })
-        .collect();
-
-    TransferPlan {
-        to_transfer,
-        progress,
-    }
-}
-
-/// What the receiver want's to skip based on whats locally available.
-pub fn skip_list(
-    offered: &[FilesAvailable],
-    output_dir: &Path,
-    resume: bool,
-) -> Vec<Option<FilesToSkip>> {
-    if !resume {
-        return vec![None; offered.len()];
-    }
-    offered
-        .iter()
-        .map(|offer| {
-            get_files_available(&output_dir.join(offer.name()))
-                .ok()
-                .and_then(|local| offer.get_skippable(&local))
-        })
-        .collect()
-}
-
-/// Opens a file for receiving.
-pub async fn open_for_receive(path: &Path, skip: u64) -> std::io::Result<tokio::fs::File> {
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .await?;
-    file.seek(std::io::SeekFrom::Start(skip)).await?;
-    Ok(file)
-}
-
-/// Finishes a received file.
-pub async fn finish_received_file(file: &mut tokio::fs::File, size: u64) -> std::io::Result<()> {
-    file.set_len(size).await?;
-    file.sync_all().await?;
-    file.shutdown().await
-}
-
-pub async fn compress_gzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut encoder = GzipEncoder::new(&mut out);
-    encoder.write_all(data).await?;
-    encoder.shutdown().await?;
-    Ok(out)
-}
-
-pub async fn decompress_gzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut decoder = async_compression::tokio::write::GzipDecoder::new(&mut out);
-    decoder.write_all(data).await?;
-    decoder.shutdown().await?;
-    Ok(out)
-}
+const SENDER_HELLO: &str = "the sender did not say hello in time";
+const RECEIVER_HELLO: &str = "the receiver did not say hello in time";
+const SENDER_IDLE: &str = "the sender stopped sending";
+const RECEIVER_IDLE: &str = "the receiver stopped responding";
 
 #[derive(Debug, Error)]
 pub enum TransferError {
     #[error("io: {0}")]
-    Io(std::io::Error),
+    Io(io::Error),
     #[error("connection: {0}")]
     Connection(#[from] iroh::endpoint::ConnectionError),
-    #[error("wrong version: expected {0}, got {1}")]
-    WrongVersion(String, String),
+    #[error("connection to the peer lost: {0}")]
+    Disconnected(String),
+    #[error("{} of the given paths do not exist", .0.len())]
+    PathsNotFound(Vec<PathBuf>),
+    #[error("file does not exist: {0}")]
+    FileNotFound(PathBuf),
+    /// The selection breaks the offer rules.
+    #[error("cannot send these files: {0}")]
+    Unsendable(OfferError),
+    #[error(
+        "no common protocol version: the peer speaks {} to {}, this client {} to {}",
+        .min_version, .version, peer::MIN_VERSION, peer::VERSION
+    )]
+    Version { version: u32, min_version: u32 },
+    /// We declined the offer.
     #[error("transfer declined")]
     Declined,
     #[error("the peer declined the files")]
-    PeerDeclined,
-    #[error("{} of the given paths do not exist", .0.len())]
-    PathsNotFound(Vec<PathBuf>),
-    #[error("unexpected packet")]
-    UnexpectedPacket,
-    #[error("file does not exist: {0}")]
-    FileNotFound(PathBuf),
-    #[error("connection to the peer lost: {0}")]
-    Disconnected(String),
+    PeerDeclined(Option<String>),
+    #[error("the peer cancelled the transfer")]
+    PeerCancelled(Option<String>),
+    #[error("the peer failed ({code:?}): {message}")]
+    Peer { code: ErrorCode, message: String },
+    #[error("the peer sent an invalid offer: {0}")]
+    InvalidOffer(OfferError),
+    /// Traffic from the peer that the protocol does not allow.
+    #[error("protocol: {0}")]
+    Protocol(String),
+    #[error("timed out: {0}")]
+    Timeout(&'static str),
     #[error("bind: {0}")]
     Bind(#[from] iroh::endpoint::BindError),
     #[error("connect: {0}")]
@@ -220,19 +75,12 @@ pub enum TransferError {
     NodeId(#[from] iroh::KeyParsingError),
     #[error("the peer did not connect in time")]
     PeerTimeout,
-    #[error("the peer did not complete the handshake in time")]
-    HandshakeTimeout,
     #[error("the endpoint closed while waiting for the peer")]
     EndpointClosed,
     #[error("the peer sent connection info for another transport")]
     UnexpectedConnectionInfo,
     #[error("webrtc: {0}")]
     WebRtc(#[from] webrtc::error::Error),
-    #[error("json: {0}")]
-    Json(#[from] serde_json::Error),
-    /// Traffic from the peer that the framing does not allow.
-    #[error("protocol: {0}")]
-    Protocol(String),
     #[error("internal: {0}")]
     Internal(&'static str),
 }
@@ -240,19 +88,24 @@ pub enum TransferError {
 impl TransferError {
     /// Generate a user-facing error messages for user-facing "errors"
     pub fn user_error(&self) -> Option<String> {
-        match self {
-            Self::Declined => Some("Transfer declined.".to_owned()),
-            Self::PeerDeclined => Some(format!("{} the peer declined the files", "error:".red())),
-            Self::Disconnected(reason) => Some(format!(
-                "{} the connection to the peer was lost ({reason}).\n\
-                 Start a new session to resume the transfer where it stopped.",
-                "error:".red()
-            )),
-            Self::WrongVersion(expected, got) => Some(format!(
-                "{} protocol version mismatch: this client speaks {got}, the peer expects {expected}.\n\
-                 Update fsend on both sides.",
-                "error:".red()
-            )),
+        let error = "error:".red();
+        let update = "Update fsend on both sides.";
+        Some(match self {
+            Self::Declined => "Transfer declined.".to_owned(),
+            Self::PeerDeclined(_) => format!("{error} the peer declined the files"),
+            Self::PeerCancelled(_) => format!("{error} the peer cancelled the transfer"),
+            Self::Disconnected(reason) => format!(
+                "{error} the connection to the peer was lost ({reason}).\n\
+                 Start a new session to resume the transfer where it stopped."
+            ),
+            Self::Version { .. } => format!("{error} {self}.\n{update}"),
+            Self::Peer {
+                code: ErrorCode::Version,
+                message,
+            } => format!("{error} the peer speaks another protocol version ({message}).\n{update}"),
+            Self::Peer { message, .. } => format!("{error} the peer failed: {message}"),
+            Self::Unsendable(e) => format!("{error} cannot send these files: {e}"),
+            Self::Timeout(what) => format!("{error} timed out: {what}"),
             Self::PathsNotFound(paths) => {
                 let noun = if paths.len() == 1 {
                     "path does"
@@ -263,27 +116,16 @@ impl TransferError {
                     .iter()
                     .map(|p| format!("\n - {}", p.display().to_string().blue()))
                     .collect();
-
-                Some(format!(
-                    "{} {} {} not exist:{}",
-                    "error:".red(),
-                    paths.len(),
-                    noun,
-                    list
-                ))
+                format!("{error} {} {noun} not exist:{list}", paths.len())
             }
-            Self::HandshakeTimeout => Some(format!(
-                "{} the peer did not answer the handshake. It may run an incompatible version of fsend; update both sides.",
-                "error:".red()
-            )),
-            Self::PeerTimeout => Some(format!(
-                "{} the peer did not connect in time. Check that both sides are online and try again.",
-                "error:".red()
-            )),
+            Self::PeerTimeout => format!(
+                "{error} the peer did not connect in time. Check that both sides are online and try again."
+            ),
             Self::Io(_)
             | Self::Connection(_)
-            | Self::UnexpectedPacket
             | Self::FileNotFound(_)
+            | Self::InvalidOffer(_)
+            | Self::Protocol(_)
             | Self::Bind(_)
             | Self::Connect(_)
             | Self::Accept(_)
@@ -291,18 +133,37 @@ impl TransferError {
             | Self::EndpointClosed
             | Self::UnexpectedConnectionInfo
             | Self::WebRtc(_)
-            | Self::Json(_)
-            | Self::Protocol(_)
-            | Self::Internal(_) => None,
-        }
+            | Self::Internal(_) => return None,
+        })
+    }
+
+    /// The `error` that tells the peer about a failure on this side.
+    fn report(&self) -> Option<ErrorReport> {
+        let (code, message) = match self {
+            Self::Io(e) => (ErrorCode::Io, e.to_string()),
+            Self::Version { .. } => (
+                ErrorCode::Version,
+                format!(
+                    "versions {} to {} are supported",
+                    peer::MIN_VERSION,
+                    peer::VERSION
+                ),
+            ),
+            Self::InvalidOffer(e) => (ErrorCode::InvalidOffer, e.to_string()),
+            Self::Protocol(message) => (ErrorCode::Protocol, message.clone()),
+            Self::Timeout(what) => (ErrorCode::Timeout, what.to_string()),
+            Self::Internal(what) => (ErrorCode::Internal, what.to_string()),
+            _ => return None,
+        };
+        Some(ErrorReport { code, message })
     }
 }
 
 /// A stream that reports the peer as gone is a lost connection, not an I/O
 /// fault; the transports mark those with `ConnectionAborted`/`NotConnected`.
-impl From<std::io::Error> for TransferError {
-    fn from(e: std::io::Error) -> Self {
-        use std::io::ErrorKind::*;
+impl From<io::Error> for TransferError {
+    fn from(e: io::Error) -> Self {
+        use io::ErrorKind::*;
         match e.kind() {
             ConnectionAborted | ConnectionReset | NotConnected => Self::Disconnected(e.to_string()),
             _ => Self::Io(e),
@@ -310,18 +171,26 @@ impl From<std::io::Error> for TransferError {
     }
 }
 
-pub struct SendArgs {
-    pub files: Vec<PathBuf>,
-}
-
 pub struct ReceiveArgs {
     pub resume: bool,
 }
 
-pub type ProgressCb<'a> = &'a mut (dyn FnMut(&[(String, u64, u64)]) + Send);
-pub type WaitingCb<'a> = &'a mut (dyn FnMut() + Send);
-pub type DataCb<'a> = &'a mut (dyn FnMut(u64) + Send);
-pub type AcceptFilesCb<'a> = &'a mut (dyn FnMut(&[FilesAvailable]) -> Option<PathBuf> + Send);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Event<'a> {
+    /// Sender: the offer is out, the receiver is deciding.
+    Offered,
+    /// The offer was accepted; `present` counts the bytes of each entry already there.
+    Started {
+        entries: &'a [TopEntry],
+        present: &'a [u64],
+    },
+    /// `bytes` more of the entry at `entry` moved.
+    Progress { entry: usize, bytes: u64 },
+}
+
+pub type EventCb<'a> = &'a mut (dyn FnMut(Event<'_>) + Send);
+/// The directory to receive into, or `None` to decline.
+pub type AcceptCb<'a> = &'a mut (dyn FnMut(&[TopEntry]) -> Option<PathBuf> + Send);
 
 /// A bidirectional bytestream.
 pub trait ByteStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -330,7 +199,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + ?Sized> ByteStream for T {}
 #[async_trait]
 pub trait Transport: Send {
     fn connection_type_name(&self) -> String;
-    /// The control stream. Packets are length-prefixed frames of gzipped JSON.
+    /// The control stream, carrying peer protocol frames.
     async fn control(&mut self) -> Result<Box<dyn ByteStream>, TransferError>;
     /// The data stream, opened once the offer has been accepted.
     async fn data(&mut self) -> Result<Box<dyn ByteStream>, TransferError>;
@@ -339,293 +208,617 @@ pub trait Transport: Send {
     async fn close(&mut self, ok: bool);
 }
 
-pub(crate) type Control = Framed<Box<dyn ByteStream>, LengthDelimitedCodec>;
-
-pub(crate) fn frame(stream: Box<dyn ByteStream>) -> Control {
-    Framed::new(
-        stream,
-        LengthDelimitedCodec::builder()
-            .max_frame_length(MAX_FRAME_BYTES)
-            .new_codec(),
-    )
+/// The offer for the paths to send, and where each entry comes from.
+#[derive(Debug, Default)]
+pub struct Outgoing {
+    pub entries: Vec<Entry>,
+    sources: Vec<PathBuf>,
+    frame: Vec<u8>,
 }
 
-pub(crate) async fn send_packet<P: Serialize + std::fmt::Debug>(
-    control: &mut Control,
-    packet: &P,
+/// Walks `paths` into a valid offer.
+pub fn build_offer(paths: &[PathBuf]) -> Result<Outgoing, TransferError> {
+    let mut outgoing = Outgoing::default();
+    for path in paths {
+        if !path.exists() {
+            return Err(TransferError::FileNotFound(path.clone()));
+        }
+        outgoing.add(path, vec![entry_name(path)?])?;
+    }
+    outgoing.frame = offer::encode(&outgoing.entries).map_err(TransferError::Unsendable)?;
+    Ok(outgoing)
+}
+
+impl Outgoing {
+    /// Adds `source` under `path`, parents before children.
+    fn add(&mut self, source: &Path, path: Vec<String>) -> Result<(), TransferError> {
+        // Symlinked directories can loop.
+        if path.len() > MAX_DEPTH {
+            return Err(TransferError::Unsendable(OfferError::Entry {
+                id: self.entries.len(),
+                reason: EntryError::TooDeep,
+            }));
+        }
+        let metadata = std::fs::metadata(source)?;
+        self.sources.push(source.to_path_buf());
+        if metadata.is_file() {
+            self.entries.push(Entry::File {
+                path,
+                size: metadata.len(),
+            });
+            return Ok(());
+        }
+        self.entries.push(Entry::Dir { path: path.clone() });
+        let mut children = std::fs::read_dir(source)?.collect::<io::Result<Vec<_>>>()?;
+        children.sort_by_key(|child| child.file_name());
+        for child in children {
+            let mut child_path = path.clone();
+            child_path.push(child.file_name().to_string_lossy().into_owned());
+            self.add(&child.path(), child_path)?;
+        }
+        Ok(())
+    }
+}
+
+/// The name a path is announced under.
+fn entry_name(path: &Path) -> io::Result<String> {
+    let name = match path.file_name() {
+        Some(name) => name.to_owned(),
+        None => std::fs::canonicalize(path)?
+            .file_name()
+            .map(|n| n.to_owned())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("cannot send {}: it has no name", path.display()),
+                )
+            })?,
+    };
+    Ok(name.to_string_lossy().into_owned())
+}
+
+/// Where an offered path lands under `root`; each name must be a plain file name here.
+pub fn local_path(root: &Path, path: &[String]) -> io::Result<PathBuf> {
+    let mut out = root.to_path_buf();
+    for name in path {
+        let mut components = Path::new(name).components();
+        match (components.next(), components.next()) {
+            (Some(Component::Normal(_)), None) => out.push(name),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{name:?} is not a valid file name on this system"),
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Opens a file for receiving.
+pub async fn open_for_receive(path: &Path, offset: u64) -> io::Result<File> {
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .await?;
+    file.seek(io::SeekFrom::Start(offset)).await?;
+    Ok(file)
+}
+
+/// Finishes a received file.
+pub async fn finish_received_file(file: &mut File, size: u64) -> io::Result<()> {
+    file.set_len(size).await?;
+    file.sync_all().await?;
+    file.shutdown().await
+}
+
+/// A message the peer sends.
+pub trait PeerMessage: Message + Debug {
+    /// What it means where the flow expects another one.
+    fn unexpected(self) -> TransferError;
+    /// Whether it is the peer's last word.
+    fn is_final(&self) -> bool;
+}
+
+impl PeerMessage for SenderMessage {
+    fn unexpected(self) -> TransferError {
+        match self {
+            Self::Error(report) => report.into(),
+            Self::Cancel(Cancel { reason }) => TransferError::PeerCancelled(reason),
+            other => TransferError::Protocol(format!("unexpected {} message", other.kind())),
+        }
+    }
+
+    fn is_final(&self) -> bool {
+        matches!(self, Self::Cancel(_) | Self::Error(_))
+    }
+}
+
+impl PeerMessage for ReceiverMessage {
+    fn unexpected(self) -> TransferError {
+        match self {
+            Self::Error(report) => report.into(),
+            Self::Cancel(Cancel { reason }) => TransferError::PeerCancelled(reason),
+            other => TransferError::Protocol(format!("unexpected {} message", other.kind())),
+        }
+    }
+
+    fn is_final(&self) -> bool {
+        matches!(
+            self,
+            Self::Done | Self::Reject { .. } | Self::Cancel(_) | Self::Error(_)
+        )
+    }
+}
+
+impl From<ErrorReport> for TransferError {
+    fn from(ErrorReport { code, message }: ErrorReport) -> Self {
+        Self::Peer { code, message }
+    }
+}
+
+/// The control stream, one message per frame: we send `Out`, the peer sends `In`.
+pub struct Control<Out, In> {
+    stream: Box<dyn ByteStream>,
+    decoder: FrameDecoder,
+    buf: Vec<u8>,
+    messages: PhantomData<fn(Out) -> In>,
+}
+
+pub type SenderControl = Control<SenderMessage, ReceiverMessage>;
+pub type ReceiverControl = Control<ReceiverMessage, SenderMessage>;
+
+impl<Out: Message + Debug, In: PeerMessage> Control<Out, In> {
+    pub fn new(stream: Box<dyn ByteStream>) -> Self {
+        Self {
+            stream,
+            decoder: FrameDecoder::default(),
+            buf: vec![0; BUF_SIZE],
+            messages: PhantomData,
+        }
+    }
+
+    pub async fn send(&mut self, message: &Out) -> Result<(), TransferError> {
+        tracing::debug!("sending {message:?}");
+        let frame = frame::encode(message)
+            .map_err(|_| TransferError::Internal("a message does not fit in a frame"))?;
+        self.send_frame(&frame).await
+    }
+
+    async fn send_frame(&mut self, frame: &[u8]) -> Result<(), TransferError> {
+        self.stream.write_all(frame).await?;
+        self.stream.flush().await?;
+        Ok(())
+    }
+
+    /// The next message; one the peer may not send is a protocol error. Cancel safe.
+    pub async fn recv(&mut self) -> Result<In, TransferError> {
+        loop {
+            match self.decoder.next_message() {
+                Ok(Some(message)) => {
+                    tracing::debug!("received {message:?}");
+                    return Ok(message);
+                }
+                Ok(None) => {
+                    let n = self.stream.read(&mut self.buf).await?;
+                    if n == 0 {
+                        return Err(TransferError::Disconnected(
+                            "the control stream ended".into(),
+                        ));
+                    }
+                    self.decoder.push(&self.buf[..n]);
+                }
+                Err(e) => return Err(TransferError::Protocol(e.to_string())),
+            }
+        }
+    }
+
+    async fn recv_within(
+        &mut self,
+        limit: Duration,
+        what: &'static str,
+    ) -> Result<In, TransferError> {
+        timeout(limit, self.recv())
+            .await
+            .map_err(|_| TransferError::Timeout(what))?
+    }
+}
+
+/// Checks that the peer's `hello` leaves a common version.
+fn check_version(hello: &Hello) -> Result<(), TransferError> {
+    match peer::negotiate(hello.version, hello.min_version) {
+        Some(_) => Ok(()),
+        None => Err(TransferError::Version {
+            version: hello.version,
+            min_version: hello.min_version,
+        }),
+    }
+}
+
+/// Gives the peer a moment to read our last message, until it hangs up or says its last word.
+async fn goodbye<Out: Message + Debug, In: PeerMessage>(
+    transport: &mut dyn Transport,
+    control: &mut Control<Out, In>,
+) {
+    let last_word = async {
+        loop {
+            match control.recv().await {
+                Ok(message) if message.is_final() => return,
+                Ok(_) => {}
+                // A broken stream has nothing more to say; wait for the hang-up.
+                Err(TransferError::Protocol(_)) => std::future::pending().await,
+                Err(_) => return,
+            }
+        }
+    };
+    let _ = timeout(GOODBYE_TIMEOUT, async {
+        tokio::select! {
+            _ = transport.closed() => {}
+            () = last_word => {}
+        }
+    })
+    .await;
+}
+
+/// Tells the peer why `result` failed, if it should know, as `error(report)`.
+async fn explain<Out: Message + Debug, In: PeerMessage>(
+    transport: &mut dyn Transport,
+    control: &mut Control<Out, In>,
+    result: Result<(), TransferError>,
+    error: fn(ErrorReport) -> Out,
 ) -> Result<(), TransferError> {
-    tracing::debug!("sending packet: {packet:?}");
-    let json = serde_json::to_vec(packet)?;
-    let compressed = compress_gzip(&json).await?;
-    control.send(Bytes::from(compressed)).await?;
-    Ok(())
-}
-
-pub(crate) async fn recv_packet<P: DeserializeOwned + std::fmt::Debug>(
-    control: &mut Control,
-) -> Result<P, TransferError> {
-    let frame = control
-        .next()
-        .await
-        .ok_or_else(|| TransferError::Disconnected("the control stream ended".into()))??;
-    let json = decompress_gzip(&frame).await?;
-    let packet: P = serde_json::from_slice(&json)?;
-    tracing::debug!("received packet: {packet:?}");
-    Ok(packet)
-}
-
-/// Copies `skip..size` of `file` into `stream`.
-async fn send_file_data<S, R>(
-    stream: &mut S,
-    file: &mut R,
-    skip: u64,
-    size: u64,
-    write_cb: &mut (dyn FnMut(u64) + Send),
-) -> std::io::Result<()>
-where
-    S: AsyncWrite + Unpin,
-    R: AsyncRead + AsyncSeek + Unpin,
-{
-    file.seek(std::io::SeekFrom::Start(skip)).await?;
-    let mut buf = vec![0u8; BUF_SIZE];
-    let mut read = skip;
-    while read < size {
-        let to_read = std::cmp::min(BUF_SIZE as u64, size - read) as usize;
-        let n = file.read(&mut buf[..to_read]).await?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "unexpected eof",
-            ));
-        }
-        stream.write_all(&buf[..n]).await?;
-        read += n as u64;
-        write_cb(n as u64);
+    if let Err(failure) = &result
+        && let Some(report) = failure.report()
+        && control.send(&error(report)).await.is_ok()
+    {
+        goodbye(transport, control).await;
     }
-    Ok(())
+    result
 }
 
-/// Reads `skip..size` from `stream` into `file`.
-async fn receive_file_data<S, W>(
-    stream: &mut S,
-    file: &mut W,
-    skip: u64,
-    size: u64,
-    read_cb: &mut (dyn FnMut(u64) + Send),
-) -> std::io::Result<()>
-where
-    S: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut buf = vec![0u8; BUF_SIZE];
-    let mut written = skip;
-    while written < size {
-        let to_read = std::cmp::min(BUF_SIZE as u64, size - written) as usize;
-        let n = stream.read(&mut buf[..to_read]).await?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "the stream ended before the file was complete",
-            ));
-        }
-        file.write_all(&buf[..n]).await?;
-        written += n as u64;
-        read_cb(n as u64);
-    }
-    Ok(())
-}
-
-/// Gives the peer a moment to read our last packet before we close on it.
-async fn goodbye(transport: &mut dyn Transport) {
-    let _ = tokio::time::timeout(GOODBYE_TIMEOUT, transport.closed()).await;
+/// Bytes of the accepted files still to move.
+fn remaining(entries: &[Entry], files: &[AcceptedFile]) -> u64 {
+    files
+        .iter()
+        .map(|file| entries[file.id as usize].size() - file.offset)
+        .sum()
 }
 
 pub async fn send_files(
     transport: &mut dyn Transport,
-    args: SendArgs,
-    initial_progress_cb: ProgressCb<'_>,
-    waiting_cb: WaitingCb<'_>,
-    write_cb: DataCb<'_>,
+    outgoing: &Outgoing,
+    on_event: EventCb<'_>,
 ) -> Result<(), TransferError> {
-    let result = run_send(transport, args, initial_progress_cb, waiting_cb, write_cb).await;
+    let result = match transport.control().await {
+        Ok(stream) => {
+            let mut control = Control::new(stream);
+            let result = send(transport, &mut control, outgoing, on_event).await;
+            explain(transport, &mut control, result, SenderMessage::Error).await
+        }
+        Err(e) => Err(e),
+    };
     transport.close(result.is_ok()).await;
     result
 }
 
-async fn run_send(
+async fn send(
     transport: &mut dyn Transport,
-    args: SendArgs,
-    initial_progress_cb: ProgressCb<'_>,
-    waiting_cb: WaitingCb<'_>,
-    write_cb: DataCb<'_>,
+    control: &mut SenderControl,
+    outgoing: &Outgoing,
+    on_event: EventCb<'_>,
 ) -> Result<(), TransferError> {
-    let mut control = frame(transport.control().await?);
-
-    send_packet(
-        &mut control,
-        &SenderToReceiver::ConnRequest {
-            version: PROTO_VERSION.to_string(),
-        },
-    )
-    .await?;
-
-    let reply = tokio::time::timeout(HANDSHAKE_TIMEOUT, recv_packet(&mut control))
-        .await
-        .map_err(|_| TransferError::HandshakeTimeout)??;
-    match reply {
-        ReceiverToSender::Ok => {}
-        ReceiverToSender::WrongVersion { expected } => {
-            return Err(TransferError::WrongVersion(expected, PROTO_VERSION.into()));
-        }
-        _ => return Err(TransferError::UnexpectedPacket),
-    }
-
-    let mut files_available = Vec::new();
-    for path in &args.files {
-        if !path.exists() {
-            return Err(TransferError::FileNotFound(path.clone()));
-        }
-        files_available.push(get_files_available(path)?);
-    }
-
-    send_packet(
-        &mut control,
-        &SenderToReceiver::FileInfo {
-            files: files_available.clone(),
-        },
-    )
-    .await?;
-
-    waiting_cb();
-
-    let to_skip = match recv_packet::<ReceiverToSender>(&mut control).await? {
-        ReceiverToSender::AcceptFilesSkip { files } => files,
-        ReceiverToSender::RejectFiles => return Err(TransferError::PeerDeclined),
-        _ => return Err(TransferError::UnexpectedPacket),
+    control
+        .send(&SenderMessage::Hello(peer::hello(None)))
+        .await?;
+    let hello = match control.recv_within(HELLO_TIMEOUT, RECEIVER_HELLO).await? {
+        ReceiverMessage::Hello(hello) => hello,
+        other => return Err(other.unexpected()),
     };
-    if to_skip.len() != files_available.len() {
-        return Err(TransferError::UnexpectedPacket);
-    }
+    check_version(&hello)?;
+    let size = hello
+        .recv_window
+        .filter(|size| *size >= MIN_RECV_WINDOW)
+        .ok_or_else(|| TransferError::Protocol("the receiver announced no usable window".into()))?;
+    let mut window = Window {
+        size,
+        sent: 0,
+        acked: 0,
+    };
 
-    let plan = plan_transfer(&files_available, &to_skip);
-    initial_progress_cb(&plan.progress);
+    control.send_frame(&outgoing.frame).await?;
+    on_event(Event::Offered);
+    let files = match control.recv().await? {
+        ReceiverMessage::Accept { files } => files,
+        ReceiverMessage::Reject { reason } => return Err(TransferError::PeerDeclined(reason)),
+        other => return Err(other.unexpected()),
+    };
+    let entries = &outgoing.entries;
+    offer::check_accept(entries, &files).map_err(|e| TransferError::Protocol(e.to_string()))?;
+    let (tops, top_of) = offer::top_entries(entries);
+    on_event(Event::Started {
+        entries: &tops,
+        present: &offer::present(entries, &files),
+    });
 
-    let mut data = transport.data().await?;
-    for (path, tree) in args.files.iter().zip(plan.to_transfer) {
-        let Some(tree) = tree else { continue };
-        for entry in flatten_trees(std::slice::from_ref(&tree), path) {
-            if let TransferEntry::File { path, skip, size } = entry {
-                let mut file = tokio::fs::File::open(&path).await?;
-                send_file_data(&mut data, &mut file, skip, size, write_cb).await?;
+    if remaining(entries, &files) > 0 {
+        let mut data = transport.data().await?;
+        let mut buf = vec![0; BUF_SIZE];
+        for &AcceptedFile { id, offset } in &files {
+            let id = id as usize;
+            let mut left = entries[id].size() - offset;
+            if left == 0 {
+                continue;
+            }
+            let mut file = File::open(&outgoing.sources[id]).await?;
+            file.seek(io::SeekFrom::Start(offset)).await?;
+            while left > 0 {
+                while window.room() == 0 {
+                    window.ack(control.recv_within(IDLE_TIMEOUT, RECEIVER_IDLE).await?)?;
+                }
+                let n = left.min(window.room()).min(BUF_SIZE as u64);
+                let chunk = &mut buf[..n as usize];
+                file.read_exact(chunk).await?;
+                timeout(IDLE_TIMEOUT, window.write(data.as_mut(), chunk, control))
+                    .await
+                    .map_err(|_| TransferError::Timeout(RECEIVER_IDLE))??;
+                left -= n;
+                window.sent += n;
+                on_event(Event::Progress {
+                    entry: top_of[id],
+                    bytes: n,
+                });
             }
         }
+        timeout(IDLE_TIMEOUT, data.shutdown())
+            .await
+            .map_err(|_| TransferError::Timeout(RECEIVER_IDLE))??;
     }
-    data.shutdown().await?;
 
-    // The receiver hangs up once everything is on disk.
-    transport.closed().await
+    loop {
+        match control.recv_within(IDLE_TIMEOUT, RECEIVER_IDLE).await? {
+            ReceiverMessage::Done => return Ok(()),
+            message => window.ack(message)?,
+        }
+    }
+}
+
+/// Keeps the bytes the receiver has not acknowledged within its window.
+struct Window {
+    size: u64,
+    sent: u64,
+    acked: u64,
+}
+
+impl Window {
+    fn room(&self) -> u64 {
+        self.size - (self.sent - self.acked)
+    }
+
+    /// Writes `chunk` to the data stream, taking acks as they arrive.
+    async fn write(
+        &mut self,
+        data: &mut dyn ByteStream,
+        mut chunk: &[u8],
+        control: &mut SenderControl,
+    ) -> Result<(), TransferError> {
+        while !chunk.is_empty() {
+            tokio::select! {
+                written = data.write(chunk) => match written? {
+                    0 => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
+                    n => chunk = &chunk[n..],
+                },
+                message = control.recv() => self.ack(message?)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn ack(&mut self, message: ReceiverMessage) -> Result<(), TransferError> {
+        match message {
+            ReceiverMessage::Ack { bytes } if (self.acked..=self.sent).contains(&bytes) => {
+                self.acked = bytes;
+                Ok(())
+            }
+            ReceiverMessage::Ack { .. } => Err(TransferError::Protocol(
+                "an ack outside the bytes sent".into(),
+            )),
+            other => Err(other.unexpected()),
+        }
+    }
 }
 
 pub async fn receive_files(
     transport: &mut dyn Transport,
     args: ReceiveArgs,
-    initial_progress_cb: ProgressCb<'_>,
-    accept_files_cb: AcceptFilesCb<'_>,
-    read_cb: DataCb<'_>,
+    accept: AcceptCb<'_>,
+    on_event: EventCb<'_>,
 ) -> Result<(), TransferError> {
-    let result = run_receive(
-        transport,
-        args,
-        initial_progress_cb,
-        accept_files_cb,
-        read_cb,
-    )
-    .await;
+    // Over iroh the stream only shows up once the sender has written to it.
+    let result = match timeout(HELLO_TIMEOUT, transport.control()).await {
+        Ok(Ok(stream)) => {
+            let mut control = Control::new(stream);
+            let result = receive(transport, &mut control, args, accept, on_event).await;
+            explain(transport, &mut control, result, ReceiverMessage::Error).await
+        }
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(TransferError::Timeout(SENDER_HELLO)),
+    };
     transport.close(result.is_ok()).await;
     result
 }
 
-async fn run_receive(
+async fn receive(
     transport: &mut dyn Transport,
+    control: &mut ReceiverControl,
     args: ReceiveArgs,
-    initial_progress_cb: ProgressCb<'_>,
-    accept_files_cb: AcceptFilesCb<'_>,
-    read_cb: DataCb<'_>,
+    accept: AcceptCb<'_>,
+    on_event: EventCb<'_>,
 ) -> Result<(), TransferError> {
-    let handshake = async {
-        let mut control = frame(transport.control().await?);
-        let request: SenderToReceiver = recv_packet(&mut control).await?;
-        Ok::<_, TransferError>((control, request))
-    };
-    let (mut control, request) = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
-        .await
-        .map_err(|_| TransferError::HandshakeTimeout)??;
-
-    match request {
-        SenderToReceiver::ConnRequest { version } => {
-            if version != PROTO_VERSION {
-                send_packet(
-                    &mut control,
-                    &ReceiverToSender::WrongVersion {
-                        expected: PROTO_VERSION.into(),
-                    },
-                )
-                .await?;
-                goodbye(transport).await;
-                return Err(TransferError::WrongVersion(PROTO_VERSION.into(), version));
-            }
-            send_packet(&mut control, &ReceiverToSender::Ok).await?;
-        }
-        _ => return Err(TransferError::UnexpectedPacket),
+    control
+        .send(&ReceiverMessage::Hello(peer::hello(Some(RECV_WINDOW))))
+        .await?;
+    match control.recv_within(HELLO_TIMEOUT, SENDER_HELLO).await? {
+        SenderMessage::Hello(hello) => check_version(&hello)?,
+        other => return Err(other.unexpected()),
     }
-
-    let files_offered = match recv_packet::<SenderToReceiver>(&mut control).await? {
-        SenderToReceiver::FileInfo { files } => files,
-        _ => return Err(TransferError::UnexpectedPacket),
+    let entries = match control
+        .recv_within(HELLO_TIMEOUT, "the sender did not make an offer in time")
+        .await?
+    {
+        SenderMessage::Offer { entries } => entries,
+        other => return Err(other.unexpected()),
     };
+    offer::validate(&entries).map_err(TransferError::InvalidOffer)?;
+    let (tops, top_of) = offer::top_entries(&entries);
 
-    let output_path = match accept_files_cb(&files_offered) {
-        Some(p) => p,
-        None => {
-            send_packet(&mut control, &ReceiverToSender::RejectFiles).await?;
-            goodbye(transport).await;
-            return Err(TransferError::Declined);
-        }
+    let Some(out) = accept(&tops) else {
+        control
+            .send(&ReceiverMessage::Reject { reason: None })
+            .await?;
+        goodbye(transport, control).await;
+        return Err(TransferError::Declined);
     };
+    tokio::fs::create_dir_all(&out).await?;
+    let paths = entries
+        .iter()
+        .map(|entry| local_path(&out, entry.path()))
+        .collect::<io::Result<Vec<_>>>()?;
+    let local = if args.resume {
+        local_sizes(&entries, &paths).await
+    } else {
+        vec![None; entries.len()]
+    };
+    let files = offer::accept(&entries, &local);
+    control
+        .send(&ReceiverMessage::Accept {
+            files: files.clone(),
+        })
+        .await?;
+    on_event(Event::Started {
+        entries: &tops,
+        present: &offer::present(&entries, &files),
+    });
 
-    let files_to_skip = skip_list(&files_offered, &output_path, args.resume);
-    let plan = plan_transfer(&files_offered, &files_to_skip);
-    initial_progress_cb(&plan.progress);
-
-    send_packet(
-        &mut control,
-        &ReceiverToSender::AcceptFilesSkip {
-            files: files_to_skip,
-        },
-    )
-    .await?;
-
-    let mut data = transport.data().await?;
-    tokio::fs::create_dir_all(&output_path).await?;
-    for tree in plan.to_transfer.into_iter().flatten() {
-        let entries = flatten_trees(std::slice::from_ref(&tree), &output_path.join(tree.name()));
-        for entry in entries {
-            match entry {
-                TransferEntry::Dir { path } => tokio::fs::create_dir_all(path).await?,
-                TransferEntry::File { path, skip, size } => {
-                    let mut file = open_for_receive(&path, skip).await?;
-                    let received =
-                        receive_file_data(&mut data, &mut file, skip, size, read_cb).await;
-                    // Even a partial file must be on disk before the next session resumes it.
-                    file.flush().await?;
-                    received?;
-                    finish_received_file(&mut file, size).await?;
-                }
-            }
+    for (entry, path) in entries.iter().zip(&paths) {
+        if entry.is_dir() {
+            tokio::fs::create_dir_all(path).await?;
         }
     }
+    let mut incoming = if remaining(&entries, &files) > 0 {
+        let stream = tokio::select! {
+            stream = timeout(IDLE_TIMEOUT, transport.data()) => {
+                stream.map_err(|_| TransferError::Timeout(SENDER_IDLE))??
+            }
+            message = control.recv() => return Err(message?.unexpected()),
+        };
+        Some(Incoming::new(stream))
+    } else {
+        None
+    };
+    for &AcceptedFile { id, offset } in &files {
+        let id = id as usize;
+        let size = entries[id].size();
+        let mut file = open_for_receive(&paths[id], offset).await?;
+        let received = match &mut incoming {
+            Some(incoming) => {
+                let mut on_bytes = |bytes| {
+                    on_event(Event::Progress {
+                        entry: top_of[id],
+                        bytes,
+                    })
+                };
+                incoming
+                    .write_to(&mut file, size - offset, control, &mut on_bytes)
+                    .await
+            }
+            None => Ok(()),
+        };
+        // Even a partial file must be on disk before the next session resumes it.
+        file.flush().await?;
+        received?;
+        finish_received_file(&mut file, size).await?;
+    }
 
+    control.send(&ReceiverMessage::Done).await?;
+    goodbye(transport, control).await;
     Ok(())
+}
+
+/// The size of the file already at each entry's path, if there is one.
+async fn local_sizes(entries: &[Entry], paths: &[PathBuf]) -> Vec<Option<u64>> {
+    let mut sizes = Vec::with_capacity(entries.len());
+    for (entry, path) in entries.iter().zip(paths) {
+        let metadata = match entry {
+            Entry::File { .. } => tokio::fs::metadata(path).await.ok(),
+            Entry::Dir { .. } => None,
+        };
+        sizes.push(metadata.filter(|m| m.is_file()).map(|m| m.len()));
+    }
+    sizes
+}
+
+/// The receiving end of the data stream, acking what it wrote.
+struct Incoming {
+    stream: Box<dyn ByteStream>,
+    buf: Vec<u8>,
+    written: u64,
+    acked: u64,
+    acked_at: Instant,
+}
+
+impl Incoming {
+    fn new(stream: Box<dyn ByteStream>) -> Self {
+        Self {
+            stream,
+            buf: vec![0; BUF_SIZE],
+            written: 0,
+            acked: 0,
+            acked_at: Instant::now(),
+        }
+    }
+
+    /// Writes the next `len` bytes of the stream to `file`.
+    async fn write_to(
+        &mut self,
+        file: &mut File,
+        mut len: u64,
+        control: &mut ReceiverControl,
+        on_bytes: &mut (dyn FnMut(u64) + Send),
+    ) -> Result<(), TransferError> {
+        while len > 0 {
+            let want = len.min(BUF_SIZE as u64) as usize;
+            let n = tokio::select! {
+                read = timeout(IDLE_TIMEOUT, self.stream.read(&mut self.buf[..want])) => {
+                    read.map_err(|_| TransferError::Timeout(SENDER_IDLE))??
+                }
+                // The sender says nothing while it sends.
+                message = control.recv() => return Err(message?.unexpected()),
+            };
+            if n == 0 {
+                // The sender may say why it stopped.
+                return Err(match timeout(GOODBYE_TIMEOUT, control.recv()).await {
+                    Ok(Ok(message)) => message.unexpected(),
+                    _ => TransferError::Disconnected("the data stream ended early".into()),
+                });
+            }
+            file.write_all(&self.buf[..n]).await?;
+            len -= n as u64;
+            self.written += n as u64;
+            on_bytes(n as u64);
+            if self.written - self.acked >= ACK_STEP || self.acked_at.elapsed() >= ACK_INTERVAL {
+                control
+                    .send(&ReceiverMessage::Ack {
+                        bytes: self.written,
+                    })
+                    .await?;
+                self.acked = self.written;
+                self.acked_at = Instant::now();
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

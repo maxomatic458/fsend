@@ -49,7 +49,7 @@ describe("finished transfer summary", () => {
       tracker.initialize([
         { name: "a.bin", sizeBytes: 2000, skipBytes: 500, isDir: false },
       ]);
-      tracker.recordBytes(1500);
+      tracker.recordBytes(0, 1500);
 
       await sleep(60);
       tracker.complete();
@@ -82,7 +82,7 @@ describe("finished transfer summary", () => {
       // A cancelled or failed attempt never calls complete(), so its clock is
       // still running when the retry starts.
       tracker.initialize(entries);
-      tracker.recordBytes(1000);
+      tracker.recordBytes(0, 1000);
       tracker.initialize(entries);
 
       tracker.complete();

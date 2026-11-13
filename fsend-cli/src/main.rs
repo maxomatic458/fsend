@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use clap::Parser;
@@ -14,11 +13,11 @@ use tracing_subscriber::util::SubscriberInitExt;
 use fsend_cli::cli::{Args, Mode};
 use fsend_cli::iroh::IrohTransfer;
 use fsend_cli::relay::{Relay, RelayError, pair_as_receiver, pair_as_sender};
-use fsend_cli::transfer::{self, ReceiveArgs, SendArgs, TransferError};
+use fsend_cli::transfer::{self, Event, ReceiveArgs, TransferError, build_offer};
 use fsend_cli::webrtc::WebRtcTransfer;
 use fsend_proto::code::Code;
 use fsend_proto::pairing::ConnectionInfo;
-use fsend_proto::peer::{FilesAvailable, PROTO_VERSION};
+use fsend_proto::peer::{self, offer::TopEntry};
 use fsend_proto::relay::Transport;
 
 #[tokio::main]
@@ -82,7 +81,7 @@ fn log_filter(level: tracing::Level) -> Targets {
 fn print_version() {
     let rows = [
         ("fsend-cli", env!("CARGO_PKG_VERSION").to_owned()),
-        ("protocol", PROTO_VERSION.to_owned()),
+        ("protocol", peer::VERSION.to_string()),
     ];
 
     for (label, value) in rows {
@@ -165,6 +164,7 @@ async fn run_send(
     if !missing.is_empty() {
         return Err(TransferError::PathsNotFound(missing).into());
     }
+    let outgoing = build_offer(&files)?;
 
     let mut relay = pair_as_sender(relay_url, |code| {
         let link = code.link(download_url);
@@ -181,14 +181,10 @@ async fn run_send(
     drop(relay);
     announce_connection(transport.as_ref()).await;
 
-    let progress = Progress::default();
-    transfer::send_files(
-        transport.as_mut(),
-        SendArgs { files },
-        &mut |initial| progress.start(initial),
-        &mut || println!("Waiting for peer to accept files..."),
-        &mut |n| progress.update(n),
-    )
+    let mut progress = Progress::default();
+    transfer::send_files(transport.as_mut(), &outgoing, &mut |event| {
+        progress.on_event(event)
+    })
     .await?;
 
     println!("\nTransfer complete.");
@@ -209,22 +205,21 @@ async fn run_receive(
     drop(relay);
     announce_connection(transport.as_ref()).await;
 
-    let progress = Progress::default();
+    let mut progress = Progress::default();
     transfer::receive_files(
         transport.as_mut(),
         ReceiveArgs { resume },
-        &mut |initial| progress.start(initial),
-        &mut |files_offered| {
+        &mut |offered| {
             if auto_accept {
                 println!("Auto-accepting files.");
                 Some(output_dir.clone())
-            } else if accept_files(files_offered) {
+            } else if accept_files(offered) {
                 Some(output_dir.clone())
             } else {
                 None
             }
         },
-        &mut |n| progress.update(n),
+        &mut |event| progress.on_event(event),
     )
     .await?;
 
@@ -239,30 +234,39 @@ async fn announce_connection(transport: &dyn transfer::Transport) {
 }
 
 #[derive(Default)]
-struct Progress(Mutex<Option<CliProgressBars>>);
+struct Progress(Option<CliProgressBars>);
 
 impl Progress {
-    fn start(&self, initial: &[(String, u64, u64)]) {
-        *self.0.lock().unwrap() = Some(CliProgressBars::new(initial));
-    }
-
-    fn update(&self, bytes: u64) {
-        if let Some(bars) = &mut *self.0.lock().unwrap() {
-            bars.update(bytes);
+    fn on_event(&mut self, event: Event) {
+        match event {
+            Event::Offered => println!("Waiting for peer to accept files..."),
+            Event::Started { entries, present } => {
+                let initial: Vec<_> = entries
+                    .iter()
+                    .zip(present)
+                    .map(|(entry, present)| (entry.name.clone(), *present, entry.size))
+                    .collect();
+                self.0 = Some(CliProgressBars::new(&initial));
+            }
+            Event::Progress { entry, bytes } => {
+                if let Some(bars) = &mut self.0 {
+                    bars.update(entry, bytes);
+                }
+            }
         }
     }
 }
 
-fn accept_files(files: &[FilesAvailable]) -> bool {
+fn accept_files(files: &[TopEntry]) -> bool {
     println!("The following files will be received:\n");
 
-    let longest = files.iter().map(|f| f.name().len()).max().unwrap_or(0) + 1;
-    let total_size: u64 = files.iter().map(|f| f.size()).sum();
+    let longest = files.iter().map(|f| f.name.len()).max().unwrap_or(0) + 1;
+    let total_size: u64 = files.iter().map(|f| f.size).sum();
 
     for file in files {
-        let size_str = HumanBytes(file.size()).to_string();
-        let name = file.name();
-        let display = if matches!(file, FilesAvailable::Dir { .. }) {
+        let size_str = HumanBytes(file.size).to_string();
+        let name = &file.name;
+        let display = if file.dir {
             format!("{}/", name).blue()
         } else {
             format!("{} ", name).blue()
@@ -343,21 +347,12 @@ impl CliProgressBars {
         Self { bars, total }
     }
 
-    fn update(&mut self, mut progress: u64) {
+    fn update(&mut self, entry: usize, bytes: u64) {
         if let Some(pb) = &self.total {
-            pb.inc(progress);
+            pb.inc(bytes);
         }
-        for pb in &self.bars {
-            let remaining = pb.length().unwrap_or(0).saturating_sub(pb.position());
-            if remaining == 0 {
-                continue;
-            }
-            let inc = progress.min(remaining);
-            pb.inc(inc);
-            progress -= inc;
-            if progress == 0 {
-                break;
-            }
+        if let Some(pb) = self.bars.get(entry) {
+            pb.inc(bytes);
         }
     }
 }
@@ -376,7 +371,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn progress_bars_fill_files_in_order() {
+    fn progress_lands_on_its_entry() {
         let mut bars = CliProgressBars::new(&[
             ("a".into(), 0, 100),
             ("b".into(), 50, 100),
@@ -390,13 +385,11 @@ mod tests {
         assert_eq!(total.position(), 150);
         assert_eq!(total.length(), Some(300));
 
-        // Bytes land in the first file that still has room.
-        bars.update(30);
-        assert_eq!(positions(&bars), [30, 50, 100]);
-        // then they move to the next bar
-        bars.update(100);
+        bars.update(1, 30);
+        assert_eq!(positions(&bars), [0, 80, 100]);
+        bars.update(0, 100);
         assert_eq!(positions(&bars), [100, 80, 100]);
-        bars.update(20);
+        bars.update(1, 20);
         assert_eq!(positions(&bars), [100, 100, 100]);
         assert_eq!(bars.total.as_ref().unwrap().position(), 300);
     }
@@ -405,7 +398,7 @@ mod tests {
     fn a_single_file_has_no_total_bar() {
         let mut bars = CliProgressBars::new(&[("only".into(), 10, 40)]);
         assert!(bars.total.is_none());
-        bars.update(30);
+        bars.update(0, 30);
         assert_eq!(bars.bars[0].position(), 40);
     }
 
@@ -413,7 +406,7 @@ mod tests {
     fn progress_bars_survive_no_files() {
         let mut bars = CliProgressBars::new(&[]);
         assert!(bars.bars.is_empty() && bars.total.is_none());
-        bars.update(5);
+        bars.update(0, 5);
     }
 
     #[test]

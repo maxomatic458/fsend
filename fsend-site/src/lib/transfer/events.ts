@@ -1,4 +1,4 @@
-import type { FilesAvailable } from "../types";
+import type { TopEntry } from "../proto";
 
 export type ConnectionKind = "direct" | "relay" | "unknown";
 
@@ -21,12 +21,13 @@ export type TransferEvent =
   /// Receiver only
   | {
       type: "offered";
-      files: FilesAvailable[];
+      files: TopEntry[];
       accept: () => void;
       reject: () => void;
     }
   | { type: "transferring"; entries: TransferEntry[] }
-  | { type: "progress"; bytes: number }
+  /// `bytes` more of the entry at `entry` in `transferring`.
+  | { type: "progress"; entry: number; bytes: number }
   /// Receiver only: bytes are all in, but the sink is still packing them.
   | { type: "packing"; percent: number }
   | { type: "connectionType"; kind: ConnectionKind }

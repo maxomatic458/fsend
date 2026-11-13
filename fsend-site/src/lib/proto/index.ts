@@ -1,5 +1,14 @@
 import init, * as wasm from "./pkg/fsend_proto_wasm";
-import type { PairingError, ParsedCode, Sealed } from "./generated/protocol";
+import type {
+  AcceptedFile,
+  Entry,
+  PairingError,
+  ParsedCode,
+  ReceiverMessage,
+  Sealed,
+  SenderMessage,
+  TopEntry,
+} from "./generated/protocol";
 
 export * from "./generated/protocol";
 export { Role } from "./pkg/fsend_proto_wasm";
@@ -77,3 +86,67 @@ export class Channel {
     return JSON.parse(pairing(() => this.inner.open(frame)));
   }
 }
+
+/** A message of either side. */
+export type PeerMessage = SenderMessage | ReceiverMessage;
+
+/** One control frame of `message`; throws unless `from` sends it. */
+export const encodeFrame = (
+  message: PeerMessage,
+  from: wasm.Role,
+): Uint8Array => wasm.encodeFrame(JSON.stringify(message), from);
+
+/** Reassembles the control messages `from` sends, as `M`, from bytes split anywhere. */
+export class FrameDecoder<M extends PeerMessage> {
+  private inner: wasm.FrameDecoder;
+
+  constructor(from: wasm.Role) {
+    this.inner = new wasm.FrameDecoder(from);
+  }
+
+  push(data: Uint8Array): void {
+    this.inner.push(data);
+  }
+
+  /** The next complete message; throws on a malformed frame or a message `from` does not send. */
+  next(): M | undefined {
+    const message = this.inner.nextMessage();
+    return message === undefined ? undefined : JSON.parse(message);
+  }
+}
+
+/** The highest protocol version both sides speak. */
+export const negotiate = (
+  version: number,
+  minVersion: number,
+): number | undefined => wasm.negotiate(version, minVersion);
+
+/** Throws unless `entries` follows the offer rules. */
+export const validateOffer = (entries: Entry[]): void =>
+  wasm.validateOffer(JSON.stringify(entries));
+
+/** The control frame of an offer of `entries`; throws unless they follow the offer rules. */
+export const encodeOffer = (entries: Entry[]): Uint8Array =>
+  wasm.encodeOffer(JSON.stringify(entries));
+
+/** Throws unless `files` names files of `entries`, in order, with offsets within them. */
+export const checkAccept = (entries: Entry[], files: AcceptedFile[]): void =>
+  wasm.checkAccept(JSON.stringify(entries), JSON.stringify(files));
+
+/** Every file not complete yet, given the size of each entry already present. */
+export const acceptFiles = (
+  entries: Entry[],
+  local: (number | null)[],
+): AcceptedFile[] =>
+  JSON.parse(wasm.acceptFiles(JSON.stringify(entries), JSON.stringify(local)));
+
+/** The top-level entries of a valid offer, and the index of the one each entry lies in. */
+export const topEntries = (entries: Entry[]): [TopEntry[], number[]] =>
+  JSON.parse(wasm.topEntries(JSON.stringify(entries)));
+
+/** Bytes of each top-level entry already present once `files` are accepted. */
+export const presentBytes = (
+  entries: Entry[],
+  files: AcceptedFile[],
+): number[] =>
+  JSON.parse(wasm.presentBytes(JSON.stringify(entries), JSON.stringify(files)));

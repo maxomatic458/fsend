@@ -157,6 +157,8 @@ export function makeRecorder({ onOffered } = {}) {
     error: null,
     offered: null,
     entries: null,
+    /// Bytes present per entry by the end.
+    present: null,
     connectionType: null,
   };
 
@@ -173,9 +175,11 @@ export function makeRecorder({ onOffered } = {}) {
         break;
       case "transferring":
         record.entries = event.entries;
+        record.present = event.entries.map((entry) => entry.skipBytes);
         break;
       case "progress":
         record.progress += event.bytes;
+        record.present[event.entry] += event.bytes;
         break;
       case "connectionType":
         record.connectionType = event.kind;
@@ -216,3 +220,12 @@ export function waitFor(
 }
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** A control frame of `json`, valid or not. */
+export function jsonFrame(json) {
+  const payload = new TextEncoder().encode(json);
+  const frame = new Uint8Array(5 + payload.length);
+  new DataView(frame.buffer).setUint32(0, payload.length + 1);
+  frame.set(payload, 5);
+  return frame;
+}

@@ -13,7 +13,7 @@ use std::thread;
 use std::time::Instant;
 
 use fsend_cli::iroh::IrohTransfer;
-use fsend_cli::transfer::{ReceiveArgs, SendArgs, Transport, receive_files, send_files};
+use fsend_cli::transfer::{Event, ReceiveArgs, Transport, build_offer, receive_files, send_files};
 use fsend_cli::webrtc::{WebRtcConfig, WebRtcTransfer};
 use fsend_proto::pairing::ConnectionInfo;
 use iroh::Endpoint;
@@ -54,18 +54,11 @@ fn runtime() -> tokio::runtime::Runtime {
 
 fn send_harness(payload: PathBuf, transfer: impl Future<Output = Box<dyn Transport>>) {
     runtime().block_on(async {
+        let outgoing = build_offer(&[payload]).expect("offer");
         let mut transfer = transfer.await;
-        send_files(
-            transfer.as_mut(),
-            SendArgs {
-                files: vec![payload],
-            },
-            &mut |_| {},
-            &mut || {},
-            &mut |_| {},
-        )
-        .await
-        .expect("send");
+        send_files(transfer.as_mut(), &outgoing, &mut |_| {})
+            .await
+            .expect("send");
     });
 }
 
@@ -81,9 +74,12 @@ fn receive_harness(
         receive_files(
             transfer.as_mut(),
             ReceiveArgs { resume: false },
-            &mut |_| started = Some(Instant::now()),
             &mut |_| Some(out_dir.clone()),
-            &mut |_| {},
+            &mut |event| {
+                if matches!(event, Event::Started { .. }) {
+                    started = Some(Instant::now());
+                }
+            },
         )
         .await
         .expect("receive");
