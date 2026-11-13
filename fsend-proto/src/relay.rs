@@ -13,6 +13,7 @@ pub enum Transport {
 
 /// Control messages are text frames; signals after `paired` are binary frames.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum ClientMessage {
     Create {
@@ -27,6 +28,7 @@ pub enum ClientMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum ServerMessage {
     Created {

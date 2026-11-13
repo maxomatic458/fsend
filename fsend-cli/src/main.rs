@@ -13,14 +13,13 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use fsend_cli::cli::{Args, Mode};
 use fsend_cli::iroh::IrohTransfer;
-use fsend_cli::relay::{APP, Relay, RelayError, TRANSPORTS};
+use fsend_cli::relay::{Relay, RelayError, pair_as_receiver, pair_as_sender};
 use fsend_cli::transfer::{self, ReceiveArgs, SendArgs, TransferError};
 use fsend_cli::webrtc::WebRtcTransfer;
 use fsend_proto::code::Code;
 use fsend_proto::pairing::ConnectionInfo;
 use fsend_proto::peer::{FilesAvailable, PROTO_VERSION};
 use fsend_proto::relay::Transport;
-use fsend_proto::rendezvous::Rendezvous;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -91,11 +90,8 @@ fn print_version() {
     }
 }
 
-async fn connect_as_sender(
-    via: Transport,
-    relay: &mut Relay,
-) -> color_eyre::Result<Box<dyn transfer::Transport>> {
-    match via {
+async fn connect_as_sender(relay: &mut Relay) -> color_eyre::Result<Box<dyn transfer::Transport>> {
+    match relay.transport {
         Transport::Iroh => {
             let endpoint = IrohTransfer::create_endpoint().await?;
             let my_info = IrohTransfer::local_connection_info(&endpoint).await;
@@ -127,10 +123,9 @@ async fn connect_as_sender(
 }
 
 async fn connect_as_receiver(
-    transport: Transport,
     relay: &mut Relay,
 ) -> color_eyre::Result<Box<dyn transfer::Transport>> {
-    match transport {
+    match relay.transport {
         Transport::Iroh => {
             let endpoint = IrohTransfer::create_endpoint().await?;
             let my_info = IrohTransfer::local_connection_info(&endpoint).await;
@@ -171,23 +166,18 @@ async fn run_send(
         return Err(TransferError::PathsNotFound(missing).into());
     }
 
-    let rendezvous = Rendezvous::sender(TRANSPORTS.to_vec(), APP);
-    let mut relay = Relay::connect(relay_url, rendezvous).await?;
-    let code = relay.code().await?;
-    let link = code.link(download_url);
-    let code = code.to_string();
+    let mut relay = pair_as_sender(relay_url, |code| {
+        let link = code.link(download_url);
+        let code = code.to_string();
+        println!("Code: {}\n", code.bright_white());
+        println!("On the other peer, run:\n");
+        println!("  {} {}\n", "fsend receive".yellow(), code.yellow());
+        println!("or open in a browser:\n");
+        println!("  {}\n", link.blue());
+    })
+    .await?;
 
-    println!("Code: {}\n", code.bright_white());
-    println!("On the other peer, run:\n");
-    println!("  {} {}\n", "fsend receive".yellow(), code.yellow());
-
-    println!("or open in a browser:\n");
-    println!("  {}\n", link.blue());
-
-    let transport = relay.paired().await?;
-    tracing::info!("paired via {transport:?}");
-
-    let mut transport = connect_as_sender(transport, &mut relay).await?;
+    let mut transport = connect_as_sender(&mut relay).await?;
     drop(relay);
     announce_connection(transport.as_ref()).await;
 
@@ -214,12 +204,8 @@ async fn run_receive(
 ) -> color_eyre::Result<()> {
     let code: Code = code.parse().map_err(RelayError::from)?;
 
-    let rendezvous = Rendezvous::receiver(&code, TRANSPORTS.to_vec(), APP);
-    let mut relay = Relay::connect(relay_url, rendezvous).await?;
-    let transport = relay.paired().await?;
-    tracing::info!("paired via {transport:?}");
-
-    let mut transport = connect_as_receiver(transport, &mut relay).await?;
+    let mut relay = pair_as_receiver(relay_url, &code).await?;
+    let mut transport = connect_as_receiver(&mut relay).await?;
     drop(relay);
     announce_connection(transport.as_ref()).await;
 

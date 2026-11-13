@@ -1,6 +1,6 @@
 use fsend_proto::{
     code::{Code, CodeError},
-    rendezvous::{self, Action},
+    pairing::{self, PairingError, Signal},
 };
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -33,55 +33,80 @@ pub fn code_link(site: &str, code: &str) -> Result<String, JsError> {
     Ok(code.parse::<Code>()?.link(site))
 }
 
-#[wasm_bindgen]
-pub struct Rendezvous(rendezvous::Rendezvous);
+/// A fresh code for the nameplate the relay assigned, if it is valid.
+#[wasm_bindgen(js_name = newCode)]
+pub fn new_code(nameplate: &str) -> Option<String> {
+    Code::with_random_password(nameplate).map(|code| code.to_string())
+}
 
 #[wasm_bindgen]
-impl Rendezvous {
-    /// `transports` is a JSON `Transport[]`.
-    pub fn sender(transports: &str, app: &str) -> Result<Rendezvous, JsError> {
-        Ok(Self(rendezvous::Rendezvous::sender(
-            serde_json::from_str(transports)?,
-            app,
-        )))
-    }
+pub enum Role {
+    Sender,
+    Receiver,
+}
 
-    pub fn receiver(code: &str, transports: &str, app: &str) -> Result<Rendezvous, JsError> {
-        Ok(Self(rendezvous::Rendezvous::receiver(
-            &code.parse()?,
-            serde_json::from_str(transports)?,
-            app,
-        )))
-    }
+/// Thrown as an `Error` whose message is a JSON `PairingError`.
+fn thrown(error: PairingError) -> JsError {
+    JsError::new(&serde_json::to_string(&error).expect("pairing errors serialize"))
+}
 
-    pub fn text(&mut self, frame: &str) {
-        self.0.text(frame);
-    }
+// `Pake` and `Channel` take and return whole binary relay frames.
 
-    pub fn binary(&mut self, frame: &[u8]) {
-        self.0.binary(frame);
-    }
+#[wasm_bindgen]
+pub struct Pake {
+    pake: pairing::Pake,
+    message: Vec<u8>,
+}
 
-    pub fn closed(&mut self) {
-        self.0.closed();
-    }
-
-    /// `message` is a JSON `Sealed`.
-    #[wasm_bindgen(js_name = sendSealed)]
-    pub fn send_sealed(&mut self, message: &str) -> Result<(), JsError> {
-        self.0.send_sealed(serde_json::from_str(message)?);
-        Ok(())
-    }
-
-    /// The next action, if any: a binary frame for the relay as a
-    /// `Uint8Array`, any other action as a JSON `Action`.
-    pub fn poll(&mut self) -> Option<JsValue> {
-        Some(match self.0.poll()? {
-            Action::SendBinary { data } => data.into(),
-            action => serde_json::to_string(&action)
-                .expect("actions serialize")
-                .into(),
+#[wasm_bindgen]
+impl Pake {
+    pub fn start(code: &str) -> Result<Pake, JsError> {
+        let (pake, message) = pairing::Pake::start(&code.parse()?);
+        Ok(Self {
+            pake,
+            message: Signal::Pake(message).encode(),
         })
+    }
+
+    /// The first frame for the peer.
+    #[wasm_bindgen(getter)]
+    pub fn message(&self) -> Vec<u8> {
+        self.message.clone()
+    }
+
+    pub fn finish(self, frame: &[u8], role: Role) -> Result<Channel, JsError> {
+        let Some(Signal::Pake(message)) = Signal::decode(frame) else {
+            return Err(thrown(PairingError::UnexpectedSignal));
+        };
+        let role = match role {
+            Role::Sender => pairing::Role::Sender,
+            Role::Receiver => pairing::Role::Receiver,
+        };
+        self.pake
+            .finish(&message, role)
+            .map(Channel)
+            .map_err(thrown)
+    }
+}
+
+#[wasm_bindgen]
+pub struct Channel(pairing::Channel);
+
+#[wasm_bindgen]
+impl Channel {
+    /// `message` is a JSON `Sealed`.
+    pub fn seal(&mut self, message: &str) -> Result<Vec<u8>, JsError> {
+        let sealed = self.0.seal(&serde_json::from_str(message)?);
+        Ok(Signal::Sealed(sealed).encode())
+    }
+
+    /// The JSON `Sealed` in the peer's next frame.
+    pub fn open(&mut self, frame: &[u8]) -> Result<String, JsError> {
+        let Some(Signal::Sealed(sealed)) = Signal::decode(frame) else {
+            return Err(thrown(PairingError::UnexpectedSignal));
+        };
+        let message = self.0.open(&sealed).map_err(thrown)?;
+        Ok(serde_json::to_string(&message).expect("sealed messages serialize"))
     }
 }
 
@@ -90,9 +115,9 @@ mod bindings {
     use std::{env, fs, path::Path};
 
     use fsend_proto::{
+        code::NAMEPLATE_LEN,
         pairing::{ConnectionInfo, Sealed},
-        relay::{ErrorCode, Transport},
-        rendezvous::{Action, Event, RendezvousError},
+        relay::{ClientMessage, ErrorCode, ServerMessage, Transport, VERSION},
     };
     use ts_rs::{Config, TS};
 
@@ -104,19 +129,21 @@ mod bindings {
     fn typescript_bindings_are_fresh() {
         let cfg = Config::new().with_large_int("number");
         let decls = [
-            Action::decl(&cfg),
-            Event::decl(&cfg),
-            RendezvousError::decl(&cfg),
+            ClientMessage::decl(&cfg),
+            ServerMessage::decl(&cfg),
             ErrorCode::decl(&cfg),
             Transport::decl(&cfg),
             Sealed::decl(&cfg),
             ConnectionInfo::decl(&cfg),
+            PairingError::decl(&cfg),
             ParsedCode::decl(&cfg),
             CodeError::decl(&cfg),
         ];
         let header = format!(
             "// Generated by `cargo test -p fsend-proto-wasm`. Do not edit.\n\n\
-             export const CODE_LENGTH = {};\n",
+             export const RELAY_VERSION = {VERSION};\n\
+             export const CODE_LENGTH = {};\n\
+             export const NAMEPLATE_LENGTH = {NAMEPLATE_LEN};\n",
             fsend_proto::code::CODE_LEN
         );
         let expected = decls

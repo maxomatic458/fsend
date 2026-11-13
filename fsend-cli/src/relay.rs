@@ -1,18 +1,20 @@
-use std::{collections::VecDeque, time::Duration};
+use std::time::Duration;
 
 use colored::Colorize;
 use fsend_proto::{
     code::{Code, CodeError},
-    pairing::{ConnectionInfo, Sealed},
-    relay::{ErrorCode, PATH, Transport},
-    rendezvous::{Action, Event, Rendezvous, RendezvousError},
+    pairing::{Channel, ConnectionInfo, PairingError, Pake, Role, Sealed, Signal},
+    relay::{ClientMessage, ErrorCode, PATH, ServerMessage, Transport, VERSION},
 };
 use futures_util::{SinkExt, StreamExt};
 use thiserror::Error;
 use tokio::{net::TcpStream, time::timeout};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
+/// For connecting and for each reply of the relay.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// For each signal from the peer; the relay gives the two sides a minute.
+pub const PEER_TIMEOUT: Duration = Duration::from_secs(60);
 /// In order of preference.
 pub const TRANSPORTS: [Transport; 2] = [Transport::Iroh, Transport::Webrtc];
 pub const APP: &str = concat!("fsend-cli ", env!("CARGO_PKG_VERSION"));
@@ -27,10 +29,16 @@ pub enum RelayError {
     ConnectTimeout,
     #[error("relay connection: {0}")]
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
-    #[error(transparent)]
-    Rendezvous(#[from] RendezvousError),
-    #[error("unexpected message during pairing")]
-    Unexpected,
+    #[error("the relay connection closed")]
+    Closed,
+    #[error("timed out waiting for the relay or the other side")]
+    Timeout,
+    #[error("relay error ({code:?}): {message}")]
+    Relay { code: ErrorCode, message: String },
+    #[error("pairing failed: {0}")]
+    Pairing(#[from] PairingError),
+    #[error("protocol error: {0}")]
+    Protocol(&'static str),
 }
 
 impl RelayError {
@@ -38,11 +46,11 @@ impl RelayError {
     pub fn user_error(&self) -> Option<String> {
         let message = match self {
             Self::Code(_) => format!("{self}. A code looks like K7Q29XMV4P."),
-            Self::Connect(_) | Self::ConnectTimeout => self.to_string(),
-            Self::Rendezvous(RendezvousError::WrongCode) => {
+            Self::Connect(_) | Self::ConnectTimeout | Self::Timeout => self.to_string(),
+            Self::Pairing(PairingError::WrongCode) => {
                 "the codes did not match. A code works only once, so start a new session and try again.".into()
             }
-            Self::Rendezvous(RendezvousError::Relay { code, .. }) => match code {
+            Self::Relay { code, .. } => match code {
                 ErrorCode::NotFound => {
                     "no session with this code. Check the code; a code works only once.".into()
                 }
@@ -57,9 +65,9 @@ impl RelayError {
                 }
                 ErrorCode::Protocol | ErrorCode::Unknown => return None,
             },
-            Self::WebSocket(_)
-            | Self::Rendezvous(RendezvousError::Closed | RendezvousError::Protocol { .. })
-            | Self::Unexpected => return None,
+            Self::WebSocket(_) | Self::Closed | Self::Pairing(_) | Self::Protocol(_) => {
+                return None;
+            }
         };
         Some(format!("{} {message}", "error:".red()))
     }
@@ -67,90 +75,181 @@ impl RelayError {
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// The relay connection once both sides proved they hold the same code.
 pub struct Relay {
     ws: WsStream,
-    rendezvous: Rendezvous,
-    events: VecDeque<Event>,
-    failure: Option<RendezvousError>,
+    channel: Channel,
+    pub transport: Transport,
+}
+
+/// Creates a session at the relay at `base_url` and pairs with whoever joins
+/// it; `show_code` gets the code for the receiver.
+pub async fn pair_as_sender(
+    base_url: &str,
+    show_code: impl FnOnce(&Code),
+) -> Result<Relay, RelayError> {
+    let mut ws = connect(base_url).await?;
+    send(
+        &mut ws,
+        &ClientMessage::Create {
+            version: VERSION,
+            transports: TRANSPORTS.to_vec(),
+        },
+    )
+    .await?;
+    let ServerMessage::Created {
+        nameplate,
+        expires_in,
+    } = recv_message(&mut ws, CONNECT_TIMEOUT).await?
+    else {
+        return Err(RelayError::Protocol("expected created"));
+    };
+    let code = Code::with_random_password(&nameplate).ok_or(RelayError::Protocol(
+        "the relay assigned an invalid nameplate",
+    ))?;
+    show_code(&code);
+
+    let wait = Duration::from_secs(expires_in.into()) + CONNECT_TIMEOUT;
+    let transport = recv_paired(&mut ws, wait).await?;
+    handshake(ws, &code, Role::Sender, transport).await
+}
+
+/// Joins the session of `code` at the relay at `base_url`.
+pub async fn pair_as_receiver(base_url: &str, code: &Code) -> Result<Relay, RelayError> {
+    let mut ws = connect(base_url).await?;
+    send(
+        &mut ws,
+        &ClientMessage::Join {
+            version: VERSION,
+            nameplate: code.nameplate().to_owned(),
+            transports: TRANSPORTS.to_vec(),
+        },
+    )
+    .await?;
+    let transport = recv_paired(&mut ws, CONNECT_TIMEOUT).await?;
+    handshake(ws, code, Role::Receiver, transport).await
+}
+
+/// SPAKE2, then each side's sealed confirm proves both used the same code.
+async fn handshake(
+    mut ws: WsStream,
+    code: &Code,
+    role: Role,
+    transport: Transport,
+) -> Result<Relay, RelayError> {
+    let (pake, message) = Pake::start(code);
+    send_signal(&mut ws, Signal::Pake(message)).await?;
+    let Signal::Pake(peer_message) = recv_signal(&mut ws).await? else {
+        return Err(PairingError::UnexpectedSignal.into());
+    };
+    let mut channel = pake.finish(&peer_message, role)?;
+
+    let confirm = Sealed::Confirm { app: APP.into() };
+    send_signal(&mut ws, Signal::Sealed(channel.seal(&confirm))).await?;
+    let Signal::Sealed(peer_confirm) = recv_signal(&mut ws).await? else {
+        return Err(PairingError::UnexpectedSignal.into());
+    };
+    let Sealed::Confirm { app } = channel.open(&peer_confirm)? else {
+        return Err(RelayError::Protocol("expected a confirm message"));
+    };
+    tracing::info!("paired with {app} via {transport:?}");
+    Ok(Relay {
+        ws,
+        channel,
+        transport,
+    })
 }
 
 impl Relay {
-    /// Connects to the relay at `base_url` (`/relay` is appended).
-    pub async fn connect(base_url: &str, rendezvous: Rendezvous) -> Result<Self, RelayError> {
-        let url = format!("{}{PATH}", base_url.trim_end_matches('/'));
-        let (ws, _) = timeout(CONNECT_TIMEOUT, connect_async(url))
-            .await
-            .map_err(|_| RelayError::ConnectTimeout)?
-            .map_err(RelayError::Connect)?;
-        let mut relay = Self {
-            ws,
-            rendezvous,
-            events: VecDeque::new(),
-            failure: None,
-        };
-        relay.flush().await?;
-        Ok(relay)
-    }
-
-    /// Sender only: the code for the receiver.
-    pub async fn code(&mut self) -> Result<Code, RelayError> {
-        match self.next_event().await? {
-            Event::Code { code, .. } => Ok(code),
-            _ => Err(RelayError::Unexpected),
-        }
-    }
-
-    /// Waits until both sides proved they hold the same code.
-    pub async fn paired(&mut self) -> Result<Transport, RelayError> {
-        match self.next_event().await? {
-            Event::Paired { transport, .. } => Ok(transport),
-            _ => Err(RelayError::Unexpected),
-        }
-    }
-
     pub async fn send_connection(&mut self, info: ConnectionInfo) -> Result<(), RelayError> {
-        self.rendezvous.send_sealed(Sealed::Connection { info });
-        self.flush().await
+        let sealed = self.channel.seal(&Sealed::Connection { info });
+        send_signal(&mut self.ws, Signal::Sealed(sealed)).await
     }
 
     pub async fn connection(&mut self) -> Result<ConnectionInfo, RelayError> {
-        match self.next_event().await? {
-            Event::Sealed {
-                message: Sealed::Connection { info },
-            } => Ok(info),
-            _ => Err(RelayError::Unexpected),
-        }
-    }
-
-    async fn next_event(&mut self) -> Result<Event, RelayError> {
         loop {
-            if let Some(event) = self.events.pop_front() {
-                return Ok(event);
+            let Signal::Sealed(sealed) = recv_signal(&mut self.ws).await? else {
+                return Err(PairingError::UnexpectedSignal.into());
+            };
+            match self.channel.open(&sealed)? {
+                Sealed::Connection { info } => return Ok(info),
+                Sealed::Confirm { .. } => {
+                    return Err(RelayError::Protocol("repeated confirm message"));
+                }
+                Sealed::Unknown => {}
             }
-            if let Some(error) = &self.failure {
-                return Err(error.clone().into());
-            }
-            match self.ws.next().await {
-                Some(Ok(Message::Text(text))) => self.rendezvous.text(&text),
-                Some(Ok(Message::Binary(data))) => self.rendezvous.binary(&data),
-                Some(Ok(Message::Close(_)) | Err(_)) | None => self.rendezvous.closed(),
-                Some(Ok(_)) => continue,
-            }
-            self.flush().await?;
         }
     }
+}
 
-    /// Sends what the rendezvous queued; events and failures wait for `next_event`.
-    async fn flush(&mut self) -> Result<(), RelayError> {
-        while let Some(action) = self.rendezvous.poll() {
-            match action {
-                Action::Send { text } => self.ws.send(Message::text(text)).await?,
-                Action::SendBinary { data } => self.ws.send(Message::binary(data)).await?,
-                Action::Event { event } => self.events.push_back(event),
-                Action::Failed { error } => self.failure = Some(error),
+/// Connects to the relay at `base_url` (`/relay` is appended).
+async fn connect(base_url: &str) -> Result<WsStream, RelayError> {
+    let url = format!("{}{PATH}", base_url.trim_end_matches('/'));
+    let (ws, _) = timeout(CONNECT_TIMEOUT, connect_async(url))
+        .await
+        .map_err(|_| RelayError::ConnectTimeout)?
+        .map_err(RelayError::Connect)?;
+    Ok(ws)
+}
+
+async fn send(ws: &mut WsStream, message: &ClientMessage) -> Result<(), RelayError> {
+    let text = serde_json::to_string(message).expect("client messages serialize");
+    Ok(ws.send(Message::text(text)).await?)
+}
+
+async fn send_signal(ws: &mut WsStream, signal: Signal) -> Result<(), RelayError> {
+    Ok(ws.send(Message::binary(signal.encode())).await?)
+}
+
+enum Frame {
+    Message(ServerMessage),
+    Signal(Signal),
+}
+
+/// The next relay message or peer signal within `wait`; a relay error fails.
+async fn recv(ws: &mut WsStream, wait: Duration) -> Result<Frame, RelayError> {
+    let next = async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => match serde_json::from_str(&text) {
+                    Ok(ServerMessage::Error { code, message }) => {
+                        return Err(RelayError::Relay { code, message });
+                    }
+                    Ok(ServerMessage::Unknown) => {}
+                    Ok(message) => return Ok(Frame::Message(message)),
+                    Err(_) => return Err(RelayError::Protocol("malformed relay message")),
+                },
+                Some(Ok(Message::Binary(data))) => {
+                    let signal = Signal::decode(&data).ok_or(PairingError::UnexpectedSignal)?;
+                    return Ok(Frame::Signal(signal));
+                }
+                Some(Ok(Message::Close(_))) | None => return Err(RelayError::Closed),
+                Some(Ok(_)) => {}
+                Some(Err(error)) => return Err(error.into()),
             }
         }
-        Ok(())
+    };
+    timeout(wait, next).await.map_err(|_| RelayError::Timeout)?
+}
+
+async fn recv_message(ws: &mut WsStream, wait: Duration) -> Result<ServerMessage, RelayError> {
+    match recv(ws, wait).await? {
+        Frame::Message(message) => Ok(message),
+        Frame::Signal(_) => Err(PairingError::UnexpectedSignal.into()),
+    }
+}
+
+async fn recv_paired(ws: &mut WsStream, wait: Duration) -> Result<Transport, RelayError> {
+    match recv_message(ws, wait).await? {
+        ServerMessage::Paired { transport } => Ok(transport),
+        _ => Err(RelayError::Protocol("expected paired")),
+    }
+}
+
+async fn recv_signal(ws: &mut WsStream) -> Result<Signal, RelayError> {
+    match recv(ws, PEER_TIMEOUT).await? {
+        Frame::Signal(signal) => Ok(signal),
+        Frame::Message(_) => Err(RelayError::Protocol("unexpected relay message")),
     }
 }
 
@@ -158,7 +257,7 @@ impl Relay {
 mod tests {
     use super::*;
     use fsend_relay::Config;
-    use tokio::net::TcpListener;
+    use tokio::{net::TcpListener, sync::oneshot};
 
     async fn start_relay() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -174,32 +273,35 @@ mod tests {
         }
     }
 
-    async fn sender(url: &str) -> (Relay, Code) {
-        let mut relay = Relay::connect(url, Rendezvous::sender(TRANSPORTS.to_vec(), APP))
-            .await
-            .unwrap();
-        let code = relay.code().await.unwrap();
-        (relay, code)
-    }
-
-    async fn receiver(url: &str, code: &Code) -> Result<Relay, RelayError> {
-        Relay::connect(url, Rendezvous::receiver(code, TRANSPORTS.to_vec(), APP)).await
+    /// Pairs a sender with a receiver that uses `receiver_code(code)`.
+    async fn pair(
+        url: &str,
+        receiver_code: impl FnOnce(Code) -> Code,
+    ) -> (Result<Relay, RelayError>, Result<Relay, RelayError>) {
+        let (code_tx, code_rx) = oneshot::channel();
+        tokio::join!(
+            pair_as_sender(url, |code| code_tx.send(code.clone()).unwrap()),
+            async {
+                let code = receiver_code(code_rx.await.unwrap());
+                pair_as_receiver(url, &code).await
+            }
+        )
     }
 
     #[tokio::test]
     async fn both_sides_pair_through_the_relay_and_swap_connection_info() {
         let url = start_relay().await;
-        let (mut sender, code) = sender(&url).await;
-        let mut receiver = receiver(&url, &code).await.unwrap();
+        let (sender, receiver) = pair(&url, |code| code).await;
+        let (mut sender, mut receiver) = (sender.unwrap(), receiver.unwrap());
+        assert_eq!(sender.transport, Transport::Iroh);
+        assert_eq!(receiver.transport, Transport::Iroh);
 
         let (sent, received) = tokio::join!(
             async {
-                assert_eq!(sender.paired().await.unwrap(), Transport::Iroh);
                 sender.send_connection(iroh_info("sender")).await.unwrap();
                 sender.connection().await.unwrap()
             },
             async {
-                assert_eq!(receiver.paired().await.unwrap(), Transport::Iroh);
                 let info = receiver.connection().await.unwrap();
                 receiver
                     .send_connection(iroh_info("receiver"))
@@ -215,15 +317,12 @@ mod tests {
     #[tokio::test]
     async fn a_wrong_code_fails_on_both_sides() {
         let url = start_relay().await;
-        let (mut sender, code) = sender(&url).await;
-        let wrong = Code::new(code.nameplate(), "000000").unwrap();
-        let mut receiver = receiver(&url, &wrong).await.unwrap();
-
-        let (sent, received) = tokio::join!(sender.paired(), receiver.paired());
-        for result in [sent, received] {
-            let err = result.unwrap_err();
+        let (sender, receiver) =
+            pair(&url, |code| Code::new(code.nameplate(), "000000").unwrap()).await;
+        for result in [sender, receiver] {
+            let err = result.err().unwrap();
             assert!(
-                matches!(err, RelayError::Rendezvous(RendezvousError::WrongCode)),
+                matches!(err, RelayError::Pairing(PairingError::WrongCode)),
                 "{err}"
             );
             assert!(err.user_error().unwrap().contains("did not match"));
@@ -234,12 +333,7 @@ mod tests {
     async fn an_unknown_code_is_reported() {
         let url = start_relay().await;
         let code = "ZZZZ000000".parse().unwrap();
-        let err = receiver(&url, &code)
-            .await
-            .unwrap()
-            .paired()
-            .await
-            .unwrap_err();
+        let err = pair_as_receiver(&url, &code).await.err().unwrap();
         assert!(
             err.user_error()
                 .unwrap()
@@ -258,14 +352,8 @@ mod tests {
             let _ = ws.close(None).await;
         });
 
-        let mut relay = Relay::connect(&url, Rendezvous::sender(TRANSPORTS.to_vec(), APP))
-            .await
-            .unwrap();
-        let err = relay.code().await.unwrap_err();
-        assert!(
-            matches!(err, RelayError::Rendezvous(RendezvousError::Closed)),
-            "{err}"
-        );
+        let err = pair_as_sender(&url, |_| {}).await.err().unwrap();
+        assert!(matches!(err, RelayError::Closed), "{err}");
     }
 
     #[tokio::test]
@@ -273,7 +361,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         drop(listener);
-        let result = Relay::connect(&url, Rendezvous::sender(TRANSPORTS.to_vec(), APP)).await;
+        let result = pair_as_sender(&url, |_| {}).await;
         assert!(matches!(result, Err(RelayError::Connect(_))));
     }
 }

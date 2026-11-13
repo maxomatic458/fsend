@@ -1,12 +1,8 @@
 import init, * as wasm from "./pkg/fsend_proto_wasm";
-import type {
-  Action,
-  ParsedCode,
-  Sealed,
-  Transport,
-} from "./generated/protocol";
+import type { PairingError, ParsedCode, Sealed } from "./generated/protocol";
 
 export * from "./generated/protocol";
+export { Role } from "./pkg/fsend_proto_wasm";
 
 let loading: Promise<unknown> | undefined;
 
@@ -23,46 +19,61 @@ export const parseCode = (input: string): ParsedCode =>
 export const codeLink = (site: string, code: string): string =>
   wasm.codeLink(site, code);
 
-/** Sans-IO pairing over the relay: feed it frames, drain `poll`. */
-export class Rendezvous {
-  private constructor(private inner: wasm.Rendezvous) {}
+/** A fresh code for the nameplate the relay assigned, if it is valid. */
+export const newCode = (nameplate: string): string | undefined =>
+  wasm.newCode(nameplate);
 
-  static sender(transports: Transport[], app: string): Rendezvous {
-    return new Rendezvous(
-      wasm.Rendezvous.sender(JSON.stringify(transports), app),
-    );
+const PAIRING_ERRORS: Record<PairingError, string> = {
+  wrong_code:
+    "The codes did not match. A code works only once, so start a new transfer and try again.",
+  invalid_pake: "Pairing failed: the other side sent an invalid key exchange.",
+  tampered: "Pairing failed: a message from the other side did not open.",
+  malformed: "Pairing failed: the other side sent a malformed message.",
+  unexpected_signal: "Pairing failed: unexpected message from the other side.",
+};
+
+export class PairingFailure extends Error {
+  constructor(readonly error: PairingError) {
+    super(PAIRING_ERRORS[error]);
+  }
+}
+
+/** Rethrows the wasm's JSON `PairingError` as a {@link PairingFailure}. */
+function pairing<T>(call: () => T): T {
+  try {
+    return call();
+  } catch (error) {
+    throw new PairingFailure(JSON.parse((error as Error).message));
+  }
+}
+
+/** SPAKE2 for a code; takes and returns whole relay frames, like {@link Channel}. */
+export class Pake {
+  private constructor(private inner: wasm.Pake) {}
+
+  static start(code: string): Pake {
+    return new Pake(wasm.Pake.start(code));
   }
 
-  static receiver(
-    code: string,
-    transports: Transport[],
-    app: string,
-  ): Rendezvous {
-    return new Rendezvous(
-      wasm.Rendezvous.receiver(code, JSON.stringify(transports), app),
-    );
+  /** The first frame for the peer. */
+  get message(): Uint8Array {
+    return this.inner.message;
   }
 
-  text(frame: string): void {
-    this.inner.text(frame);
+  finish(frame: Uint8Array, role: wasm.Role): Channel {
+    return new Channel(pairing(() => this.inner.finish(frame, role)));
+  }
+}
+
+/** Seals messages for the peer and opens theirs, in order. */
+export class Channel {
+  constructor(private inner: wasm.Channel) {}
+
+  seal(message: Sealed): Uint8Array {
+    return this.inner.seal(JSON.stringify(message));
   }
 
-  binary(frame: Uint8Array): void {
-    this.inner.binary(frame);
-  }
-
-  closed(): void {
-    this.inner.closed();
-  }
-
-  sendSealed(message: Sealed): void {
-    this.inner.sendSealed(JSON.stringify(message));
-  }
-
-  poll(): Action | undefined {
-    const action: Uint8Array | string | undefined = this.inner.poll();
-    if (action instanceof Uint8Array)
-      return { type: "send_binary", data: action };
-    return action === undefined ? undefined : JSON.parse(action);
+  open(frame: Uint8Array): Sealed {
+    return JSON.parse(pairing(() => this.inner.open(frame)));
   }
 }

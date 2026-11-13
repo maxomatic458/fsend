@@ -31,6 +31,11 @@ impl Code {
             .then(|| Self(format!("{nameplate}{password}")))
     }
 
+    /// A fresh code for the nameplate the relay assigned.
+    pub fn with_random_password(nameplate: &str) -> Option<Self> {
+        Self::new(nameplate, &random_symbols(PASSWORD_LEN))
+    }
+
     pub fn nameplate(&self) -> &str {
         &self.0[..NAMEPLATE_LEN]
     }
@@ -149,6 +154,11 @@ mod tests {
         );
         assert_eq!(Code::new("K7Q", "29XMV4P"), None);
         assert_eq!(Code::new("k7q2", "9XMV4P"), None);
+
+        let fresh = Code::with_random_password("K7Q2").unwrap();
+        assert_eq!(fresh.nameplate(), "K7Q2");
+        assert!(is_canonical(fresh.password(), PASSWORD_LEN));
+        assert_eq!(Code::with_random_password("k7-2"), None);
     }
 
     #[test]

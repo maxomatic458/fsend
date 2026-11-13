@@ -6,6 +6,9 @@ use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use spake2::{Ed25519Group, Identity, Password, Spake2};
+use thiserror::Error;
+
+use crate::code::Code;
 
 /// How to reach a peer, carried in [`Sealed::Connection`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,9 +47,25 @@ pub enum Role {
     Receiver,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum PairingError {
+    #[error("the codes do not match")]
+    WrongCode,
+    #[error("invalid SPAKE2 message")]
+    InvalidPake,
+    #[error("a sealed message failed to open")]
+    Tampered,
+    #[error("malformed sealed message")]
+    Malformed,
+    #[error("unexpected signal")]
+    UnexpectedSignal,
+}
+
 /// A binary relay frame after `paired`: a kind byte, then the body.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Signal {
+pub enum Signal {
     Pake(Vec<u8>),
     Sealed(Vec<u8>),
 }
@@ -55,7 +74,7 @@ impl Signal {
     const PAKE: u8 = 0;
     const SEALED: u8 = 1;
 
-    pub(crate) fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Vec<u8> {
         let (kind, body) = match self {
             Self::Pake(body) => (Self::PAKE, body),
             Self::Sealed(body) => (Self::SEALED, body),
@@ -63,7 +82,7 @@ impl Signal {
         [&[kind], body.as_slice()].concat()
     }
 
-    pub(crate) fn decode(frame: &[u8]) -> Option<Self> {
+    pub fn decode(frame: &[u8]) -> Option<Self> {
         let (&kind, body) = frame.split_first()?;
         match kind {
             Self::PAKE => Some(Self::Pake(body.to_vec())),
@@ -73,18 +92,30 @@ impl Signal {
     }
 }
 
-pub(crate) type Pake = Spake2<Ed25519Group>;
+/// SPAKE2 keyed by the code's password, bound to its nameplate.
+pub struct Pake(Spake2<Ed25519Group>);
 
-/// Starts SPAKE2 for the code's password, returning the outbound message.
-pub(crate) fn start_pake(nameplate: &str, password: &str) -> (Pake, Vec<u8>) {
-    Pake::start_symmetric(
-        &Password::new(password.as_bytes()),
-        &Identity::new(format!("fsend:{nameplate}").as_bytes()),
-    )
+impl Pake {
+    /// Returns the first message for the peer.
+    pub fn start(code: &Code) -> (Self, Vec<u8>) {
+        let (pake, message) = Spake2::start_symmetric(
+            &Password::new(code.password().as_bytes()),
+            &Identity::new(format!("fsend:{}", code.nameplate()).as_bytes()),
+        );
+        (Self(pake), message)
+    }
+
+    pub fn finish(self, peer_message: &[u8], role: Role) -> Result<Channel, PairingError> {
+        let key = self
+            .0
+            .finish(peer_message)
+            .map_err(|_| PairingError::InvalidPake)?;
+        Ok(Channel::new(&key, role))
+    }
 }
 
 /// Seals and opens messages with per-direction keys and counter nonces.
-pub(crate) struct Channel {
+pub struct Channel {
     seal: Direction,
     open: Direction,
 }
@@ -105,16 +136,15 @@ impl Direction {
         }
     }
 
-    fn next_nonce(&mut self) -> Nonce<Aes256Gcm> {
+    fn nonce(&self) -> Nonce<Aes256Gcm> {
         let mut nonce = [0; 12];
         nonce[4..].copy_from_slice(&self.counter.to_be_bytes());
-        self.counter += 1;
         Nonce::<Aes256Gcm>::from(nonce)
     }
 }
 
 impl Channel {
-    pub(crate) fn new(shared_key: &[u8], role: Role) -> Self {
+    fn new(shared_key: &[u8], role: Role) -> Self {
         let hkdf = Hkdf::<Sha256>::new(None, shared_key);
         let to_receiver = Direction::new(&hkdf, "fsend sender to receiver");
         let to_sender = Direction::new(&hkdf, "fsend receiver to sender");
@@ -130,19 +160,30 @@ impl Channel {
         }
     }
 
-    pub(crate) fn seal(&mut self, message: &Sealed) -> Vec<u8> {
+    pub fn seal(&mut self, message: &Sealed) -> Vec<u8> {
         let plaintext = serde_json::to_vec(message).expect("sealed messages serialize");
-        let nonce = self.seal.next_nonce();
-        self.seal
+        let ciphertext = self
+            .seal
             .cipher
-            .encrypt(&nonce, plaintext.as_slice())
-            .expect("AES-GCM encrypts any message this size")
+            .encrypt(&self.seal.nonce(), plaintext.as_slice())
+            .expect("AES-GCM encrypts any message this size");
+        self.seal.counter += 1;
+        ciphertext
     }
 
-    /// The plaintext, or `None` if the message was not sealed with the peer's key.
-    pub(crate) fn open(&mut self, ciphertext: &[u8]) -> Option<Vec<u8>> {
-        let nonce = self.open.next_nonce();
-        self.open.cipher.decrypt(&nonce, ciphertext).ok()
+    /// Opens the peer's next message. Their first is the confirm, so if that
+    /// fails to open the two sides used different codes.
+    pub fn open(&mut self, ciphertext: &[u8]) -> Result<Sealed, PairingError> {
+        let plaintext = self
+            .open
+            .cipher
+            .decrypt(&self.open.nonce(), ciphertext)
+            .map_err(|_| match self.open.counter {
+                0 => PairingError::WrongCode,
+                _ => PairingError::Tampered,
+            })?;
+        self.open.counter += 1;
+        serde_json::from_slice(&plaintext).map_err(|_| PairingError::Malformed)
     }
 }
 
@@ -151,13 +192,17 @@ mod tests {
     use super::*;
     use crate::testing::pinned;
 
-    fn channels(sender_password: &str, receiver_password: &str) -> (Channel, Channel) {
-        let (a, a_msg) = start_pake("K7Q2", sender_password);
-        let (b, b_msg) = start_pake("K7Q2", receiver_password);
-        (
-            Channel::new(&a.finish(&b_msg).unwrap(), Role::Sender),
-            Channel::new(&b.finish(&a_msg).unwrap(), Role::Receiver),
-        )
+    fn channels(receiver_code: &str) -> Result<(Channel, Channel), PairingError> {
+        let (sender, sender_msg) = Pake::start(&"K7Q29XMV4P".parse().unwrap());
+        let (receiver, receiver_msg) = Pake::start(&receiver_code.parse().unwrap());
+        Ok((
+            sender.finish(&receiver_msg, Role::Sender)?,
+            receiver.finish(&sender_msg, Role::Receiver)?,
+        ))
+    }
+
+    fn confirm() -> Sealed {
+        Sealed::Confirm { app: "a".into() }
     }
 
     #[test]
@@ -173,26 +218,79 @@ mod tests {
 
     #[test]
     fn sealed_messages_open_in_order_on_the_other_side() {
-        let (mut sender, mut receiver) = channels("9XMV4P", "9XMV4P");
-        let hello = Sealed::Confirm { app: "a".into() };
-        let first = sender.seal(&hello);
-        let second = sender.seal(&hello);
-        assert_ne!(first, second, "every message gets a fresh nonce");
-        assert_eq!(
-            receiver.open(&first).unwrap(),
-            serde_json::to_vec(&hello).unwrap()
+        let (mut sender, mut receiver) = channels("K7Q29XMV4P").unwrap();
+        let first = sender.seal(&confirm());
+        let second = sender.seal(&Sealed::Unknown);
+        assert_ne!(
+            first,
+            sender.seal(&confirm()),
+            "every message gets a fresh nonce"
         );
-        assert!(receiver.open(&second).is_some());
+        assert_eq!(receiver.open(&first), Ok(confirm()));
+        assert_eq!(receiver.open(&second), Ok(Sealed::Unknown));
         // The directions use different keys.
-        let echo = receiver.seal(&hello);
-        assert!(sender.open(&echo).is_some());
-        assert!(receiver.open(&echo).is_none());
+        let echo = receiver.seal(&confirm());
+        assert_eq!(sender.open(&echo), Ok(confirm()));
+        assert_eq!(receiver.open(&echo), Err(PairingError::Tampered));
     }
 
     #[test]
-    fn a_wrong_password_cannot_open_anything() {
-        let (mut sender, mut receiver) = channels("9XMV4P", "9XMV4Q");
-        assert!(receiver.open(&sender.seal(&Sealed::Unknown)).is_none());
+    fn a_wrong_code_fails_the_first_open() {
+        let (mut sender, mut receiver) = channels("K7Q29XMV4Q").unwrap();
+        assert_eq!(
+            receiver.open(&sender.seal(&confirm())),
+            Err(PairingError::WrongCode)
+        );
+        assert_eq!(
+            sender.open(&receiver.seal(&confirm())),
+            Err(PairingError::WrongCode)
+        );
+    }
+
+    #[test]
+    fn tampered_and_replayed_messages_are_rejected() {
+        let (mut sender, mut receiver) = channels("K7Q29XMV4P").unwrap();
+        let first = sender.seal(&confirm());
+        assert_eq!(receiver.open(&first), Ok(confirm()));
+        assert_eq!(receiver.open(&first), Err(PairingError::Tampered));
+
+        let mut second = sender.seal(&confirm());
+        second[0] ^= 1;
+        assert_eq!(receiver.open(&second), Err(PairingError::Tampered));
+    }
+
+    #[test]
+    fn a_malformed_spake2_message_is_rejected() {
+        let (pake, _) = Pake::start(&"K7Q29XMV4P".parse().unwrap());
+        assert!(matches!(
+            pake.finish(&[7], Role::Sender),
+            Err(PairingError::InvalidPake)
+        ));
+    }
+
+    #[test]
+    fn sealing_keeps_its_wire_format() {
+        let mut sender = Channel::new(&[7; 32], Role::Sender);
+        let mut receiver = Channel::new(&[7; 32], Role::Receiver);
+        let sealed = sender.seal(&confirm());
+        assert_eq!(hex(&sealed), GOLDEN);
+        assert_eq!(receiver.open(&sealed), Ok(confirm()));
+    }
+
+    /// AES-256-GCM under HKDF-SHA256(key [7; 32], "fsend sender to receiver"), nonce 0.
+    const GOLDEN: &str =
+        "5962af4ec9853db9ef7ec862bd1c4d86992984da0dc3d4b4832e4689305f7c93b9b5b71d3f8730bb86bd6d24";
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn errors_serialize_for_the_web_app() {
+        assert_eq!(
+            serde_json::to_string(&PairingError::WrongCode).unwrap(),
+            r#""wrong_code""#
+        );
     }
 
     #[test]

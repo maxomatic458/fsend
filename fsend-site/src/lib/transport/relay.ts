@@ -1,111 +1,159 @@
 import { RELAY_URL } from "../../config";
-import type {
-  ConnectionInfo,
-  Event,
-  Rendezvous,
-  RendezvousError,
+import {
+  NAMEPLATE_LENGTH,
+  Pake,
+  RELAY_VERSION,
+  Role,
+  newCode,
+  type Channel,
+  type ClientMessage,
+  type ConnectionInfo,
+  type ErrorCode,
+  type ServerMessage,
+  type Transport,
 } from "../proto";
 
-/** Drives a Rendezvous over a WebSocket to the relay. */
-export class RelayConnection {
-  private ws: WebSocket;
-  private opened = false;
-  private outbox: (string | Uint8Array)[] = [];
-  private events: Event[] = [];
-  private failure: Error | null = null;
+const APP = "fsend-web";
+const TRANSPORTS: Transport[] = ["webrtc"];
+
+type Known = Extract<ServerMessage, { type: "created" | "paired" }>;
+
+/** A WebSocket to the relay; pair it first, then swap connection info. */
+export class Relay {
+  private frames: (string | Uint8Array)[] = [];
+  private closed = false;
   private wake: (() => void) | null = null;
+  private channel: Channel | null = null;
 
-  constructor(private rendezvous: Rendezvous) {
-    this.ws = new WebSocket(`${RELAY_URL.replace(/\/+$/, "")}/relay`);
-    this.ws.binaryType = "arraybuffer";
-    this.ws.onopen = () => {
-      this.opened = true;
-      for (const frame of this.outbox.splice(0)) this.ws.send(frame);
+  private constructor(private ws: WebSocket) {
+    ws.onmessage = (ev) => {
+      const data = ev.data;
+      this.frames.push(typeof data === "string" ? data : new Uint8Array(data));
+      this.notify();
     };
-    this.ws.onmessage = (ev) => {
-      if (typeof ev.data === "string") this.rendezvous.text(ev.data);
-      else this.rendezvous.binary(new Uint8Array(ev.data));
-      this.pump();
+    ws.onclose = () => {
+      this.closed = true;
+      this.notify();
     };
-    this.ws.onclose = () => {
-      if (!this.opened) this.fail(new Error("Could not reach the relay"));
-      this.rendezvous.closed();
-      this.pump();
-    };
-    this.pump();
   }
 
-  /** Resolves with the next event, rejects once pairing failed. */
-  async next(): Promise<Event> {
-    for (;;) {
-      const event = this.events.shift();
-      if (event) return event;
-      if (this.failure) throw this.failure;
-      await new Promise<void>((resolve) => (this.wake = resolve));
-    }
+  /** Connects; aborting closes the connection, failing whatever waits on it. */
+  static connect(abort: AbortSignal): Promise<Relay> {
+    abort.throwIfAborted();
+    const ws = new WebSocket(`${RELAY_URL.replace(/\/+$/, "")}/relay`);
+    ws.binaryType = "arraybuffer";
+    abort.addEventListener("abort", () => ws.close());
+    return new Promise((resolve, reject) => {
+      ws.onopen = () => resolve(new Relay(ws));
+      ws.onclose = () => reject(new Error("Could not reach the relay"));
+    });
   }
 
-  async expect<T extends Event["type"]>(
-    type: T,
-  ): Promise<Extract<Event, { type: T }>> {
-    const event = await this.next();
-    if (event.type !== type) {
-      throw new Error(`Unexpected ${event.type} event during pairing`);
+  /** Creates a session and pairs with whoever joins it. */
+  async pairAsSender(
+    onCode: (code: string, expiresInSecs: number) => void,
+  ): Promise<void> {
+    this.send({
+      type: "create",
+      version: RELAY_VERSION,
+      transports: TRANSPORTS,
+    });
+    const { nameplate, expires_in } = await this.expect("created");
+    const code = newCode(nameplate);
+    if (!code) throw protocolError("the relay assigned an invalid nameplate");
+    onCode(code, expires_in);
+    await this.expect("paired");
+    await this.handshake(code, Role.Sender);
+  }
+
+  async pairAsReceiver(code: string): Promise<void> {
+    this.send({
+      type: "join",
+      version: RELAY_VERSION,
+      nameplate: code.slice(0, NAMEPLATE_LENGTH),
+      transports: TRANSPORTS,
+    });
+    await this.expect("paired");
+    await this.handshake(code, Role.Receiver);
+  }
+
+  /** SPAKE2, then each side's sealed confirm proves both used the same code. */
+  private async handshake(code: string, role: Role): Promise<void> {
+    const pake = Pake.start(code);
+    this.ws.send(pake.message);
+    const channel = pake.finish(await this.signal(), role);
+    this.ws.send(channel.seal({ type: "confirm", app: APP }));
+    const confirm = channel.open(await this.signal());
+    if (confirm.type !== "confirm") {
+      throw protocolError("expected a confirm message");
     }
-    return event as Extract<Event, { type: T }>;
+    this.channel = channel;
   }
 
   sendConnection(info: ConnectionInfo): void {
-    this.rendezvous.sendSealed({ type: "connection", info });
-    this.pump();
+    this.ws.send(this.paired().seal({ type: "connection", info }));
   }
 
   async connection(): Promise<ConnectionInfo> {
-    const { message } = await this.expect("sealed");
-    if (message.type !== "connection") {
-      throw new Error(`Unexpected ${message.type} message during pairing`);
+    for (;;) {
+      const message = this.paired().open(await this.signal());
+      if (message.type === "connection") return message.info;
+      if (message.type === "confirm") {
+        throw protocolError("repeated confirm message");
+      }
     }
-    return message.info;
   }
 
   close(): void {
-    this.fail(new Error("The relay connection was closed"));
     this.ws.close();
   }
 
-  private pump(): void {
-    for (
-      let action = this.rendezvous.poll();
-      action;
-      action = this.rendezvous.poll()
-    ) {
-      switch (action.type) {
-        case "send":
-          this.send(action.text);
-          break;
-        case "send_binary":
-          this.send(action.data);
-          break;
-        case "event":
-          this.events.push(action.event);
-          break;
-        case "failed":
-          this.fail(new Error(describe(action.error)));
-          this.ws.close();
-          break;
+  private paired(): Channel {
+    if (!this.channel) throw protocolError("not paired yet");
+    return this.channel;
+  }
+
+  private send(message: ClientMessage): void {
+    this.ws.send(JSON.stringify(message));
+  }
+
+  private async expect<T extends Known["type"]>(
+    type: T,
+  ): Promise<Extract<Known, { type: T }>> {
+    const frame = await this.next();
+    if (frame instanceof Uint8Array || frame.type !== type) {
+      throw protocolError(`expected ${type}`);
+    }
+    return frame as Extract<Known, { type: T }>;
+  }
+
+  private async signal(): Promise<Uint8Array> {
+    const frame = await this.next();
+    if (!(frame instanceof Uint8Array)) {
+      throw protocolError(`unexpected ${frame.type} message`);
+    }
+    return frame;
+  }
+
+  /** The next signal or known relay message; a relay error throws. */
+  private async next(): Promise<Uint8Array | Known> {
+    for (;;) {
+      const frame = this.frames.shift();
+      if (frame instanceof Uint8Array) return frame;
+      if (frame === undefined) {
+        if (this.closed) throw new Error("Lost the connection to the relay.");
+        await new Promise<void>((resolve) => (this.wake = resolve));
+        continue;
+      }
+      const message = parse(frame);
+      if (message.type === "error") {
+        throw new Error(describe(message.code, message.message));
+      }
+      // Skips messages this version does not know.
+      if (message.type === "created" || message.type === "paired") {
+        return message;
       }
     }
-    this.notify();
-  }
-
-  private send(frame: string | Uint8Array): void {
-    if (this.opened) this.ws.send(frame);
-    else this.outbox.push(frame);
-  }
-
-  private fail(error: Error): void {
-    this.failure ??= error;
-    this.notify();
   }
 
   private notify(): void {
@@ -114,30 +162,33 @@ export class RelayConnection {
   }
 }
 
-function describe(error: RendezvousError): string {
-  switch (error.type) {
-    case "wrong_code":
-      return "The codes did not match. A code works only once, so start a new transfer and try again.";
-    case "closed":
-      return "Lost the connection to the relay.";
-    case "protocol":
-      return `Pairing failed: ${error.message}.`;
-    case "relay":
-      switch (error.code) {
-        case "not_found":
-          return "No transfer with this code. Check the code; a code works only once.";
-        case "expired":
-          return "The code has expired. Start a new transfer.";
-        case "version":
-          return "This page is out of date. Reload it and try again.";
-        case "no_common_transport":
-          return "The other side cannot connect to a browser.";
-        case "peer_left":
-          return "The other side left.";
-        case "busy":
-          return "The relay is busy. Try again in a moment.";
-        default:
-          return `Relay error: ${error.message}.`;
-      }
+function parse(frame: string): ServerMessage {
+  try {
+    return JSON.parse(frame);
+  } catch {
+    throw protocolError("malformed relay message");
+  }
+}
+
+function protocolError(message: string): Error {
+  return new Error(`Pairing failed: ${message}.`);
+}
+
+function describe(code: ErrorCode, message: string): string {
+  switch (code) {
+    case "not_found":
+      return "No transfer with this code. Check the code; a code works only once.";
+    case "expired":
+      return "The code has expired. Start a new transfer.";
+    case "version":
+      return "This page is out of date. Reload it and try again.";
+    case "no_common_transport":
+      return "The other side cannot connect to a browser.";
+    case "peer_left":
+      return "The other side left.";
+    case "busy":
+      return "The relay is busy. Try again in a moment.";
+    default:
+      return `Relay error: ${message}.`;
   }
 }

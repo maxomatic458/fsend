@@ -1,4 +1,4 @@
-import { RelayConnection } from "./relay";
+import { Relay } from "./relay";
 import {
   createOfferer,
   createAnswerer,
@@ -8,17 +8,8 @@ import {
   type DisconnectWatcher,
 } from "./webrtc";
 import { createControlChannel, type ControlChannel } from "./control";
-import {
-  loadProto,
-  parseCode,
-  Rendezvous,
-  type ConnectionInfo,
-  type Transport,
-} from "../proto";
+import { loadProto, parseCode, type ConnectionInfo } from "../proto";
 import type { SenderToReceiver, ReceiverToSender } from "../types";
-
-const APP = "fsend-web";
-const TRANSPORTS: Transport[] = ["webrtc"];
 
 /// Live peer to peer session
 export interface Session<In, Out> {
@@ -43,18 +34,6 @@ function sdpOf(info: ConnectionInfo): string {
     throw new Error("The peer sent connection details for another transport");
   }
   return info.sdp;
-}
-
-/// Pairs over the relay; aborting closes the connection, failing whatever waits on it.
-async function pair(
-  start: () => Rendezvous,
-  abort: AbortSignal,
-): Promise<RelayConnection> {
-  await loadProto();
-  const relay = new RelayConnection(start());
-  if (abort.aborted) relay.close();
-  else abort.addEventListener("abort", () => relay.close());
-  return relay;
 }
 
 function assemble<In, Out>(
@@ -86,13 +65,13 @@ export async function openSenderSession(
   abort: AbortSignal,
   hooks: SenderSessionHooks,
 ): Promise<SenderSession | null> {
-  const relay = await pair(() => Rendezvous.sender(TRANSPORTS, APP), abort);
+  await loadProto();
+  const relay = await Relay.connect(abort);
   try {
-    const { code, expires_in } = await relay.expect("code");
-    hooks.onCode(code, expires_in);
-    hooks.onWaitingPeer();
-
-    await relay.expect("paired");
+    await relay.pairAsSender((code, expiresInSecs) => {
+      hooks.onCode(code, expiresInSecs);
+      hooks.onWaitingPeer();
+    });
     hooks.onHandshaking();
 
     const { connection, offerSdp } = await createOfferer();
@@ -122,12 +101,9 @@ export async function openReceiverSession(
   const parsed = parseCode(code);
   if ("error" in parsed) throw new Error(`Invalid code: ${parsed.message}`);
 
-  const relay = await pair(
-    () => Rendezvous.receiver(parsed.code, TRANSPORTS, APP),
-    abort,
-  );
+  const relay = await Relay.connect(abort);
   try {
-    await relay.expect("paired");
+    await relay.pairAsReceiver(parsed.code);
 
     const answerer = await createAnswerer(sdpOf(await relay.connection()));
     const pc = answerer.pc;
