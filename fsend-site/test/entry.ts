@@ -4,8 +4,9 @@
  */
 export { runSend } from "../src/lib/transfer/send";
 export { runReceive } from "../src/lib/transfer/receive";
-export { createDiskSink, createDownloadSink } from "../src/lib/transfer/sinks";
+export { createFolderSink, createZipSink } from "../src/lib/transfer/sinks";
 export { buildOffer } from "../src/lib/files/tree";
+export { BrowserStorage } from "../src/lib/files/storage";
 export { watchDisconnect } from "../src/lib/transport/webrtc";
 export { DATA_CHUNK_BYTES, MAX_BUFFERED_BYTES } from "../src/config";
 export { createSendSession } from "../src/primitives/createSendSession";

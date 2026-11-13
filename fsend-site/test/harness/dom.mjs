@@ -45,29 +45,6 @@ export function installDom(globals) {
     },
   };
 
-  // jszip reads Blob input through FileReader, which Node has no equivalent
-  // of. Without this the zip path can't be tested at all.
-  globals.FileReader = class FileReader {
-    constructor() {
-      this.result = null;
-      this.error = null;
-      this.onload = null;
-      this.onerror = null;
-    }
-    readAsArrayBuffer(blob) {
-      blob.arrayBuffer().then(
-        (buf) => {
-          this.result = buf;
-          this.onload?.({ target: this });
-        },
-        (err) => {
-          this.error = err;
-          this.onerror?.({ target: this });
-        },
-      );
-    }
-  };
-
   // supportsFileSystemAccess() checks for these on window; the fallback path
   // is the one that must run when they are absent.
   globals.window = globals;

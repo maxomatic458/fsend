@@ -1,33 +1,48 @@
-import type { Local, TopEntry } from "../proto";
+import type { Entry, Local, TopEntry } from "../proto";
+import { formatBytes } from "../format";
+import {
+  writeZip,
+  zipName,
+  type BrowserStorage,
+  type ZipInput,
+} from "../files/storage";
 
 /// Long enough for the browser to have started reading the blob.
 const REVOKE_DELAY_MS = 60_000;
 
 /// Bytes are written into this sink
 export interface TransferSink {
-  /// What is already at `path`.
-  probe(path: string[]): Promise<Local>;
+  /// Called once the offer of `tops` is accepted, before anything is probed.
+  prepare(tops: TopEntry[]): Promise<void>;
+  /// What is already at the path of `entry`.
+  probe(entry: Entry): Promise<Local>;
   /// The file at `path`, which `probe` found.
   read(path: string[]): Promise<Blob>;
+  /// Throws unless `remaining` more bytes fit, of an offer of `total`.
+  reserve(remaining: number, total: number): Promise<void>;
   createDir(path: string[]): Promise<void>;
   /// Opens a file to write from `offset` on; at 0 whatever was there is dropped.
   open(path: string[], offset: number): Promise<void>;
   write(chunk: Uint8Array): Promise<void>;
   closeFile(): Promise<void>;
   // Finish the transfer, by either flushing writes and closing files or by
-  // zipping and downloading the in-memory buffers.
+  // zipping and downloading the received files.
   finish(
-    entries: TopEntry[],
+    entries: Entry[],
+    tops: TopEntry[],
     onProgress?: (percent: number) => void,
   ): Promise<void>;
   abandon(): Promise<void>;
 }
 
-// Disk if the File System Access API is available
-export function createDiskSink(
+/// Writes into a folder: the picked one, or `storage`'s incoming folder,
+/// which is saved to Downloads at the end.
+export function createFolderSink(
   dirHandle: FileSystemDirectoryHandle,
+  storage?: BrowserStorage,
 ): TransferSink {
   let writable: FileSystemWritableFileStream | null = null;
+  let tops: TopEntry[] = [];
 
   const dirOf = async (path: string[], create: boolean) => {
     let dir = dirHandle;
@@ -42,26 +57,56 @@ export function createDiskSink(
     return dir.getFileHandle(path[path.length - 1]);
   };
 
+  const probe = async (dir: FileSystemDirectoryHandle, name: string) => {
+    try {
+      const file = await dir.getFileHandle(name);
+      return { kind: "file", size: (await file.getFile()).size } as const;
+    } catch (err) {
+      return (err as DOMException).name === "TypeMismatchError"
+        ? ({ kind: "dir" } as const)
+        : ({ kind: "missing" } as const);
+    }
+  };
+
   return {
-    async probe(path) {
+    async prepare(offered) {
+      tops = offered;
+      await storage?.keepOnly(offered);
+    },
+
+    async probe(entry) {
       let dir: FileSystemDirectoryHandle;
       try {
-        dir = await dirOf(path.slice(0, -1), false);
+        dir = await dirOf(entry.path.slice(0, -1), false);
       } catch {
         return { kind: "missing" };
       }
-      try {
-        const file = await dir.getFileHandle(path[path.length - 1]);
-        return { kind: "file", size: (await file.getFile()).size };
-      } catch (err) {
-        return (err as DOMException).name === "TypeMismatchError"
-          ? { kind: "dir" }
-          : { kind: "missing" };
+      const name = entry.path[entry.path.length - 1];
+      const local = await probe(dir, name);
+      // Browser storage only holds earlier transfers, so whatever is in the way is stale.
+      if (storage && local.kind !== "missing" && local.kind !== entry.kind) {
+        await dir.removeEntry(name, { recursive: true });
+        return { kind: "missing" };
       }
+      return local;
     },
 
     async read(path) {
       return (await fileAt(path)).getFile();
+    },
+
+    async reserve(remaining, total) {
+      const free = await storage?.free();
+      if (free === undefined) return;
+      // Several files are zipped next to the staged ones.
+      const needed =
+        remaining + (tops.length === 1 && !tops[0].dir ? 0 : total);
+      if (needed > free) {
+        throw new Error(
+          `Not enough browser storage: ${formatBytes(needed)} needed, ${formatBytes(free)} free. ` +
+            "Clear the browser storage, or choose Download as Zip.",
+        );
+      }
     },
 
     async createDir(path) {
@@ -87,8 +132,10 @@ export function createDiskSink(
       writable = null;
     },
 
-    async finish() {
-      // Already on disk.
+    async finish(entries, tops, onProgress) {
+      if (!storage) return;
+      const file = await storage.export(entries, tops, onProgress);
+      triggerDownload(file, file.name);
     },
 
     async abandon() {
@@ -99,13 +146,15 @@ export function createDiskSink(
   };
 }
 
-/// Download to memory
-export function createDownloadSink(): TransferSink {
-  const buffers = new Map<string, Uint8Array[]>();
+/// Buffers in memory and saves the files at the end, zipped if more than one.
+export function createZipSink(): TransferSink {
+  const files = new Map<string, Blob>();
   const dirs: string[] = [];
-  let current: Uint8Array[] | null = null;
+  let current: { path: string; chunks: Uint8Array[] } | null = null;
 
   return {
+    async prepare() {},
+
     async probe() {
       // Nothing is kept between attempts, so there is never anything to skip.
       return { kind: "missing" };
@@ -115,48 +164,51 @@ export function createDownloadSink(): TransferSink {
       throw new Error("Nothing is stored before the transfer");
     },
 
+    async reserve() {
+      // The browser says nothing reliable about free memory.
+    },
+
     async createDir(path) {
       dirs.push(path.join("/"));
     },
 
     async open(path) {
-      const key = path.join("/");
-      current = buffers.get(key) ?? [];
-      buffers.set(key, current);
+      current = { path: path.join("/"), chunks: [] };
     },
 
     async write(chunk) {
-      current!.push(chunk);
+      current!.chunks.push(chunk);
     },
 
     async closeFile() {
+      // A blob lets the browser keep the bytes outside the JS heap.
+      if (current)
+        files.set(current.path, new Blob(current.chunks as BlobPart[]));
       current = null;
     },
 
-    async finish(entries, onProgress) {
-      if (entries.length === 1 && !entries[0].dir && buffers.size === 1) {
-        const [[path, chunks]] = buffers;
-        triggerDownload(new Blob(chunks as BlobPart[]), path);
+    async finish(_, tops, onProgress) {
+      if (tops.length === 1 && !tops[0].dir && files.size === 1) {
+        const [[path, blob]] = files;
+        triggerDownload(blob, path);
         return;
       }
 
-      const JSZip = (await import("jszip")).default;
-      const zip = new JSZip();
-      for (const dir of dirs) zip.folder(dir);
-      for (const [path, chunks] of buffers) {
-        zip.file(path, new Blob(chunks as BlobPart[]));
-      }
-      const blob = await zip.generateAsync({ type: "blob" }, (meta) =>
-        onProgress?.(meta.percent),
+      const inputs: ZipInput[] = [
+        ...dirs.map((name) => ({ name })),
+        ...[...files].map(([name, input]) => ({ name, input })),
+      ];
+      const chunks: Uint8Array[] = [];
+      await writeZip(inputs, (chunk) => void chunks.push(chunk), onProgress);
+      triggerDownload(
+        new Blob(chunks as BlobPart[], { type: "application/zip" }),
+        zipName(tops),
       );
-      const name =
-        entries.length === 1 ? `${entries[0].name}.zip` : "fsend-files.zip";
-      triggerDownload(blob, name);
     },
 
     async abandon() {
       // A partial in-memory transfer is worthless — nothing can resume it.
-      buffers.clear();
+      files.clear();
       dirs.length = 0;
       current = null;
     },

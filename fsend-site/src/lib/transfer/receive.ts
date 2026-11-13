@@ -1,6 +1,6 @@
 import { openReceiverSession, type Link } from "../transport/session";
 import { getConnectionType } from "../transport/webrtc";
-import { entrySize, fingerprintOf } from "../files/tree";
+import { entrySize, fingerprintOf, offerSizeBytes } from "../files/tree";
 import {
   ACK_INTERVAL_MS,
   ACK_STEP,
@@ -56,11 +56,15 @@ export async function runReceive(
       .catch(() => {});
 
     const peer = Peer.receiver(link, abort);
-    const tops = await peer.explained(() => receive(peer, sink, policy, emit));
+    const { entries, tops } = await peer.explained(() =>
+      receive(peer, sink, policy, emit),
+    );
     link.peer.stop();
     link.pc.close();
 
-    await sink.finish(tops, (percent) => emit({ type: "packing", percent }));
+    await sink.finish(entries, tops, (percent) =>
+      emit({ type: "packing", percent }),
+    );
     emit({ type: "complete" });
   } catch (err) {
     await sink.abandon();
@@ -71,13 +75,13 @@ export async function runReceive(
   }
 }
 
-/** Returns the top-level entries received. */
+/** Returns the offer received, and its top-level entries. */
 async function receive(
   peer: ReceiverPeer,
   sink: TransferSink,
   policy: ConflictPolicy,
   emit: TransferListener,
-): Promise<TopEntry[]> {
+): Promise<{ entries: Entry[]; tops: TopEntry[] }> {
   await peer.hello("the sender did not say hello in time", RECV_WINDOW);
   const offer = await peer.next(
     HELLO_TIMEOUT_MS,
@@ -112,13 +116,19 @@ async function receive(
     throw new TransferFailure("Transfer rejected");
   }
 
+  await sink.prepare(tops);
   const local: Local[] = [];
-  for (const entry of entries) local.push(await sink.probe(entry.path));
+  for (const entry of entries) local.push(await sink.probe(entry));
   const checked = filesToCheck(entries, local);
   const verified =
     checked.length === 0 ? [] : await verify(peer, sink, entries, checked);
   const plan = planReceive(entries, local, verified);
   const files = acceptPlan(plan, policy);
+  const remaining = files.reduce(
+    (n, { id, offset }) => n + entrySize(entries[id]) - offset,
+    0,
+  );
+  await sink.reserve(remaining, offerSizeBytes(entries));
   peer.send({ type: "accept", files });
   emit(transferring(tops, presentBytes(entries, files)));
   if (plan.conflicts.length > 0) {
@@ -169,7 +179,7 @@ async function receive(
 
   peer.send({ type: "done" });
   await peer.goodbye();
-  return tops;
+  return { entries, tops };
 }
 
 /** Asks the sender for fingerprints of the `checked` files; returns the ids of those that match ours. */

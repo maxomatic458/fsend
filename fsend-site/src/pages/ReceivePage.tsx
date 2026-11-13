@@ -14,6 +14,7 @@ import { TransferProgress } from "../components/TransferProgress";
 import { ErrorCard } from "../components/ErrorCard";
 import { Button } from "../components/Button";
 import { Busy } from "../components/Busy";
+import { StorageUsage } from "../components/StorageUsage";
 import { formatBytes } from "../lib/format";
 import type { ConflictPolicy } from "../lib/proto";
 
@@ -24,7 +25,8 @@ export function ReceivePage() {
   const navigate = useNavigate();
   const location = useLocation();
   const receive = createReceiveSession();
-  const toDisk = () => receive.mode() === "disk";
+  const toFs = () => receive.mode() === "fs";
+  const toFolder = () => toFs() && receive.kind() === "picked";
 
   createWindowDropTarget(() => {});
   const exitGuard = createExitGuard(receive.isTransferring);
@@ -73,24 +75,39 @@ export function ReceivePage() {
             />
 
             <div class="w-full flex flex-col gap-3">
-              {/* If the File System Access API is available the user can choose download type */}
-              <Show when={receive.canUseDisk}>
-                <label class="flex items-center gap-2 text-sm text-ink-dim cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={toDisk()}
-                    onChange={(e) =>
-                      receive.setMode(
-                        e.currentTarget.checked ? "disk" : "download",
-                      )
-                    }
-                    class="rounded"
-                  />
-                  Save straight to a folder
-                </label>
+              <Show when={receive.kind()}>
+                <div class="flex flex-wrap gap-x-5 gap-y-2 text-sm text-ink-dim">
+                  <label class="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="storage"
+                      checked={toFs()}
+                      onChange={() => receive.setMode("fs")}
+                    />
+                    {receive.kind() === "picked"
+                      ? "Save to Folder"
+                      : "Save in Browser Storage"}
+                  </label>
+                  <label class="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="storage"
+                      checked={!toFs()}
+                      onChange={() => receive.setMode("zip")}
+                    />
+                    Download as Zip
+                  </label>
+                </div>
               </Show>
 
-              <Show when={toDisk()}>
+              <Show when={toFs() && receive.kind() === "browser"}>
+                <StorageUsage
+                  used={receive.storageUsed()}
+                  onClear={receive.clearStorage}
+                />
+              </Show>
+
+              <Show when={toFolder()}>
                 <div class="flex gap-2.5">
                   <div class="flex-1 min-w-0 flex items-center px-4 py-3 border border-line rounded-lg bg-surface-2 text-ink truncate">
                     {receive.folder()?.name ?? "No folder selected"}
@@ -132,9 +149,11 @@ export function ReceivePage() {
             </Button>
 
             <p class="text-[13px] text-ink-faint text-center leading-relaxed max-w-[460px]">
-              {toDisk()
+              {toFolder()
                 ? "Files are written straight to the folder you choose, so size is limited by disk space. An interrupted transfer resumes where it stopped; other files that already exist are skipped or replaced, as chosen above."
-                : "Files land in your Downloads folder, zipped if there is more than one. The transfer is held in memory until it finishes, so size is limited by RAM and it can't be resumed."}
+                : toFs()
+                  ? "Files are kept in this browser's storage while they arrive, then saved to your Downloads folder, zipped if there is more than one. An interrupted transfer resumes where it stopped, as long as it stays in browser storage."
+                  : "Files land in your Downloads folder, zipped if there is more than one. The transfer is held in memory until it finishes, so size is limited by RAM and it can't be resumed."}
             </p>
           </div>
         </Show>
@@ -150,7 +169,7 @@ export function ReceivePage() {
         <Show when={receive.state() === "offered"}>
           <FileOffer
             files={receive.offered()}
-            inMemory={!toDisk()}
+            inMemory={!toFs()}
             onAccept={receive.acceptOffer}
             onReject={receive.rejectOffer}
           />
@@ -168,15 +187,15 @@ export function ReceivePage() {
             connection={receive.connection()}
             hint={
               receive.packing() !== null
-                ? `Packing the zip… ${Math.round(receive.packing()!)}%`
+                ? `Packing the zip... ${Math.round(receive.packing()!)}%`
                 : receive.state() !== "transferring"
                   ? undefined
-                  : toDisk()
+                  : toFs()
                     ? "Cancelling keeps what has arrived, so you can resume later."
                     : "Keep this tab open until the transfer finishes."
             }
             actions={
-              <Show when={receive.state() === "transferring" && toDisk()}>
+              <Show when={receive.state() === "transferring" && toFs()}>
                 <Button tone="ghost" size="sm" onClick={cancelTransfer}>
                   Cancel
                 </Button>
@@ -191,7 +210,7 @@ export function ReceivePage() {
               </p>
               <p class="text-ink-muted mb-4">
                 {formatBytes(receive.progress.totalTransferredBytes)}{" "}
-                {toDisk()
+                {toFolder()
                   ? `saved to ${receive.folder()?.name}`
                   : "Should now be downloading in your browser"}
               </p>
@@ -219,7 +238,7 @@ export function ReceivePage() {
                 </p>
               </Show>
 
-              <Show when={!toDisk()}>
+              <Show when={!toFolder()}>
                 <p class="text-[13px] text-ink-faint mb-4">
                   Check your downloads — saving may still be in progress for a
                   large file.

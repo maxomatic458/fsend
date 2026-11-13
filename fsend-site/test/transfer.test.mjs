@@ -12,13 +12,15 @@ import {
   bytes,
   waitFor,
   jsonFrame,
+  unzip,
 } from "./harness/index.mjs";
 
 const {
+  BrowserStorage,
   runSend,
   runReceive,
-  createDiskSink,
-  createDownloadSink,
+  createFolderSink,
+  createZipSink,
   encodeFrame,
   Role,
 } = await import("./.build/app.mjs");
@@ -64,7 +66,7 @@ async function transfer(spec, { mode = "file", policy = "skip", dir } = {}) {
   const code = await waitFor(() => send.record.code, { label: "share code" });
   const receiverDone = runReceive(
     code,
-    createDiskSink(dirHandle),
+    createFolderSink(dirHandle),
     policy,
     recv.emit,
     new AbortController().signal,
@@ -176,7 +178,7 @@ describe("complete transfers (fallback, no File System Access API)", () => {
     const code = await waitFor(() => send.record.code, { label: "share code" });
     const receiverDone = runReceive(
       code,
-      createDownloadSink(),
+      createZipSink(),
       "skip",
       recv.emit,
       new AbortController().signal,
@@ -208,15 +210,146 @@ describe("complete transfers (fallback, no File System Access API)", () => {
     assert.equal(recv.error, null);
     const downloads = getDownloads();
     assert.equal(downloads.length, 1);
-    assert.match(downloads[0].name, /\.zip$/);
-    assert.ok(downloads[0].blob.size > 0, "zip should not be empty");
+    assert.equal(downloads[0].name, "bundle.zip");
+    assertFiles(await unzip(downloads[0].blob), expectedSnapshot(spec));
   });
 
   test("multiple loose files are zipped together", async () => {
     const spec = { "one.bin": bytes(100, 61), "two.bin": bytes(100, 62) };
     const { recv } = await fallbackTransfer(spec);
     assert.equal(recv.error, null);
-    assert.match(getDownloads()[0].name, /\.zip$/);
+    assert.equal(getDownloads()[0].name, "fsend-files.zip");
+    assertFiles(await unzip(getDownloads()[0].blob), expectedSnapshot(spec));
+  });
+});
+
+describe("browser storage (OPFS)", () => {
+  /** fsend's storage below a fresh origin, with `quota` bytes. */
+  const openStorage = (origin = new MemoryDirectoryHandle(), quota = 1e9) =>
+    BrowserStorage.open(origin, async () => ({ quota, usage: 0 }));
+
+  /** One transfer of `spec` into `storage`, as the receive page runs it. */
+  async function staged(storage, spec, { cutAfter } = {}) {
+    const send = makeRecorder();
+    const recv = makeRecorder();
+    const senderDone = runSend(
+      makeEntries(spec),
+      send.emit,
+      new AbortController().signal,
+    );
+    const code = await waitFor(() => send.record.code, { label: "share code" });
+    const receiverDone = runReceive(
+      code,
+      createFolderSink(storage.incoming, storage),
+      "replace",
+      recv.emit,
+      new AbortController().signal,
+    );
+    if (cutAfter !== undefined) {
+      await waitFor(() => recv.record.progress > cutAfter, {
+        label: "partial download",
+      });
+      peerConnections.at(-2).simulateAbruptDisconnect();
+      void senderDone.catch(() => {});
+      await receiverDone;
+    } else {
+      await Promise.all([senderDone, receiverDone]);
+    }
+    return { send: send.record, recv: recv.record };
+  }
+
+  test("several files are zipped out of storage, then dropped", async () => {
+    const storage = await openStorage();
+    const spec = {
+      "top.bin": bytes(5000, 181),
+      folder: { "x.dat": bytes(900, 182) },
+    };
+    const { recv } = await staged(storage, spec);
+
+    assert.equal(recv.error, null);
+    const [download] = getDownloads();
+    assert.equal(download.name, "fsend-files.zip");
+    assertFiles(await unzip(download.blob), expectedSnapshot(spec));
+    assert.deepEqual(storage.incoming.snapshot(), {});
+    // Only the export is left, until the next transfer.
+    assert.equal(await storage.usage(), download.blob.size);
+  });
+
+  test("a single file is saved as it is", async () => {
+    const storage = await openStorage();
+    const spec = { "movie.bin": bytes(3000, 183) };
+    await staged(storage, spec);
+
+    const [download] = getDownloads();
+    assert.equal(download.name, "movie.bin");
+    assertFiles(
+      { "movie.bin": new Uint8Array(await download.blob.arrayBuffer()) },
+      expectedSnapshot(spec),
+    );
+  });
+
+  test("an interrupted transfer resumes from storage", async () => {
+    const storage = await openStorage();
+    const spec = { "movie.bin": bytes(2_000_000, 184) };
+    const first = await staged(storage, spec, { cutAfter: 200_000 });
+    assert.ok(first.recv.error, "the first attempt fails");
+    const partial = storage.incoming.snapshot()["movie.bin"].length;
+    assert.ok(partial > 0 && partial < 2_000_000, `${partial} bytes kept`);
+
+    const { send, recv } = await staged(storage, spec);
+    assert.equal(recv.error, null);
+    assert.equal(send.progress, 2_000_000 - partial);
+    const download = getDownloads().at(-1);
+    assertFiles(
+      { "movie.bin": new Uint8Array(await download.blob.arrayBuffer()) },
+      expectedSnapshot(spec),
+    );
+  });
+
+  test("stale entries are dropped or replaced without asking", async () => {
+    const storage = await openStorage();
+    const put = async (name, data) => {
+      const file = await storage.incoming.getFileHandle(name, { create: true });
+      file.bytes = data;
+    };
+    await put("other.bin", bytes(10, 1));
+    await put("folder", bytes(10, 2));
+    await put("a.bin", bytes(10, 3));
+    const spec = {
+      folder: { "x.dat": bytes(900, 185) },
+      "a.bin": bytes(20, 186),
+    };
+
+    const { recv } = await staged(storage, spec);
+    assert.equal(recv.error, null);
+    assertFiles(await unzip(getDownloads()[0].blob), expectedSnapshot(spec));
+    assert.deepEqual(recv.conflicts, { replaced: 1, skipped: 0 });
+  });
+
+  test("a transfer that does not fit is refused", async () => {
+    const storage = await openStorage(undefined, 1000);
+    const { send, recv } = await staged(storage, {
+      "big.bin": bytes(5000, 187),
+    });
+    assert.match(recv.error ?? "", /Not enough browser storage/);
+    assert.match(send.error ?? "", /The other side failed/);
+  });
+
+  test("clearing removes everything kept", async () => {
+    const storage = await openStorage();
+    await staged(storage, { "a.bin": bytes(100, 188) }, {});
+    assert.ok((await storage.usage()) > 0);
+    await storage.clear();
+    assert.equal(await storage.usage(), 0);
+  });
+
+  test("a browser that refuses storage opens none", async () => {
+    const refusing = {
+      getDirectoryHandle: async () => {
+        throw new DOMException("denied", "SecurityError");
+      },
+    };
+    assert.equal(await BrowserStorage.open(refusing), null);
   });
 });
 
@@ -234,7 +367,7 @@ describe("interrupted transfers", () => {
     const code = await waitFor(() => send.record.code, { label: "share code" });
     const receiverDone = runReceive(
       code,
-      createDiskSink(new MemoryDirectoryHandle()),
+      createFolderSink(new MemoryDirectoryHandle()),
       "skip",
       recv.emit,
       new AbortController().signal,
@@ -283,7 +416,7 @@ describe("interrupted transfers", () => {
     const code = await waitFor(() => send.record.code, { label: "share code" });
     const receiverDone = runReceive(
       code,
-      createDiskSink(new MemoryDirectoryHandle()),
+      createFolderSink(new MemoryDirectoryHandle()),
       "skip",
       recv.emit,
       new AbortController().signal,
@@ -327,7 +460,7 @@ describe("interrupted transfers", () => {
     const code = await waitFor(() => send.record.code, { label: "share code" });
     const receiverDone = runReceive(
       code,
-      createDiskSink(new MemoryDirectoryHandle()),
+      createFolderSink(new MemoryDirectoryHandle()),
       "skip",
       recv.emit,
       new AbortController().signal,
@@ -358,7 +491,7 @@ describe("interrupted transfers", () => {
     const code = await waitFor(() => send.record.code, { label: "share code" });
     const receiverDone = runReceive(
       code,
-      createDiskSink(new MemoryDirectoryHandle()),
+      createFolderSink(new MemoryDirectoryHandle()),
       "skip",
       recv.emit,
       new AbortController().signal,
@@ -389,7 +522,7 @@ describe("interrupted transfers", () => {
     const code = await waitFor(() => send.record.code, { label: "share code" });
     const receiverDone = runReceive(
       code,
-      createDiskSink(new MemoryDirectoryHandle()),
+      createFolderSink(new MemoryDirectoryHandle()),
       "skip",
       recv.emit,
       controller.signal,
@@ -463,7 +596,7 @@ describe("protocol errors", () => {
       });
       const receiverDone = runReceive(
         code,
-        createDiskSink(new MemoryDirectoryHandle()),
+        createFolderSink(new MemoryDirectoryHandle()),
         "skip",
         recv.emit,
         new AbortController().signal,
@@ -498,7 +631,7 @@ describe("resuming an interrupted download", () => {
       });
       const receiverDone = runReceive(
         code,
-        createDiskSink(dirHandle),
+        createFolderSink(dirHandle),
         "skip",
         recv.emit,
         new AbortController().signal,
@@ -534,7 +667,7 @@ describe("resuming an interrupted download", () => {
     });
     const receiverDone2 = runReceive(
       code2,
-      createDiskSink(dirHandle),
+      createFolderSink(dirHandle),
       "skip",
       recv2.emit,
       new AbortController().signal,
@@ -629,7 +762,7 @@ describe("relay behaviour", () => {
     const recv = makeRecorder();
     await runReceive(
       code,
-      createDiskSink(new MemoryDirectoryHandle()),
+      createFolderSink(new MemoryDirectoryHandle()),
       "skip",
       recv.emit,
       new AbortController().signal,
@@ -681,7 +814,7 @@ describe("relay behaviour", () => {
     assert.equal(code, code.toUpperCase(), "codes are shown upper-case");
     await runReceive(
       code.toLowerCase(),
-      createDiskSink(new MemoryDirectoryHandle()),
+      createFolderSink(new MemoryDirectoryHandle()),
       "skip",
       recv.emit,
       new AbortController().signal,

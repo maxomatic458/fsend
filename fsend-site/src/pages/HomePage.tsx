@@ -4,7 +4,7 @@ import { Title, Meta, Link } from "@solidjs/meta";
 import { FiUpload, FiDownload } from "solid-icons/fi";
 import { handleDrop } from "../lib/files/source";
 import { setPendingDrop } from "../lib/pendingDrop";
-import { hasFileSystemAccess } from "../lib/files/storage";
+import { folderKind } from "../lib/files/storage";
 import { GITHUB_URL, MDN_FS_API, MDN_WEBRTC, SITE_URL } from "../lib/links";
 import { createWindowDropTarget } from "../primitives/createWindowDropTarget";
 import { Logo } from "../components/Logo";
@@ -82,9 +82,11 @@ const FAQ_ITEMS = [
       <>
         Anything with WebRTC. Chrome, Edge and Opera also ship the{" "}
         <Ext href={MDN_FS_API}>File System Access API</Ext>, so fsend writes
-        straight to disk and can resume interrupted transfers. Firefox and
-        Safari buffer the transfer in memory and save a zip at the end, which
-        caps a transfer at your available RAM.
+        straight to a folder you pick. Firefox and Safari keep the transfer in
+        the browser's own storage and save it to Downloads at the end, zipped if
+        there is more than one file. Both can resume interrupted transfers.
+        Where neither works, as in some private windows, the transfer is held in
+        memory, which caps it at your available RAM.
       </>
     ),
   },
@@ -118,7 +120,7 @@ function Eyebrow(props: { children: string }) {
 
 export function HomePage() {
   const navigate = useNavigate();
-  const canUseDisk = hasFileSystemAccess();
+  const canResume = folderKind() !== null;
   const [isProcessing, setIsProcessing] = createSignal(false);
 
   const isDragging = createWindowDropTarget(async (data) => {
@@ -173,13 +175,12 @@ export function HomePage() {
         </div>
 
         <div class="w-full max-w-[560px] mt-10 flex flex-col gap-3.5">
-          <Show when={!canUseDisk}>
+          <Show when={!canResume}>
             <div class="flex gap-3 items-start text-left bg-warn-bg border border-warn-line text-warn-ink rounded-lg px-4 py-3.5 text-sm leading-relaxed">
               <div>
-                Your browser has limited support. Folders will be downloaded as
-                zip files and you won't be able to resume interrupted transfers.
-                For the best experience, use a Chromium-based browser like
-                Chrome, Edge or Opera.
+                Your browser has limited support. Transfers are held in memory
+                and you won't be able to resume interrupted ones. For the best
+                experience, use a current Chrome, Edge, Firefox or Safari.
               </div>
               <div class="flex-shrink-0"></div>
             </div>
