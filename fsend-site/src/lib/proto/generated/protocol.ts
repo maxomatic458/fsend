@@ -35,9 +35,9 @@ export type ParsedCode = { code: string, } | { error: CodeError, message: string
 
 export type CodeError = { "type": "empty" } | { "type": "wrong_length", "value": number } | { "type": "invalid_char", "value": string };
 
-export type SenderMessage = { "type": "hello" } & Hello | { "type": "offer", entries: Array<Entry>, } | { "type": "cancel" } & Cancel | { "type": "error" } & ErrorReport;
+export type SenderMessage = { "type": "hello" } & Hello | { "type": "offer", entries: Array<Entry>, } | { "type": "hashes", hashes: Array<Fingerprint>, } | { "type": "cancel" } & Cancel | { "type": "error" } & ErrorReport;
 
-export type ReceiverMessage = { "type": "hello" } & Hello | { "type": "accept", files: Array<AcceptedFile>, } | { "type": "reject", reason?: string, } | { "type": "ack", bytes: number, } | { "type": "done" } | { "type": "cancel" } & Cancel | { "type": "error" } & ErrorReport;
+export type ReceiverMessage = { "type": "hello" } & Hello | { "type": "check", files: Array<CheckedFile>, } | { "type": "accept", files: Array<AcceptedFile>, } | { "type": "reject", reason?: string, } | { "type": "ack", bytes: number, } | { "type": "done" } | { "type": "cancel" } & Cancel | { "type": "error" } & ErrorReport;
 
 export type Hello = { version: number, min_version: number, features: Array<string>, 
 /**
@@ -53,6 +53,30 @@ export type Entry = { "kind": "file", path: Array<string>, size: number, } | { "
 
 export type AcceptedFile = { id: number, offset: number, };
 
+export type CheckedFile = { id: number, len: number, };
+
+export type Fingerprint = string;
+
 export type PeerErrorCode = "version" | "protocol" | "invalid_offer" | "io" | "timeout" | "internal";
 
 export type TopEntry = { name: string, dir: boolean, size: number, };
+
+export type Local = { "kind": "missing" } | { "kind": "file", size: number, } | { "kind": "dir" } | { "kind": "other" };
+
+export type ConflictPolicy = "skip" | "replace";
+
+export type Conflict = { id: number, 
+/**
+ * False when the local entry is of another kind; it, and all below it, are skipped.
+ */
+replaceable: boolean, };
+
+export type Plan = { 
+/**
+ * Files to receive whatever the policy: new ones and resumed ones, in offer order.
+ */
+files: Array<AcceptedFile>, 
+/**
+ * Directories to create, in offer order.
+ */
+dirs: Array<number>, conflicts: Array<Conflict>, };

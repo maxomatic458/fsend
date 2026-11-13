@@ -1,16 +1,22 @@
 import { openReceiverSession, type Link } from "../transport/session";
 import { getConnectionType } from "../transport/webrtc";
-import { entrySize } from "../files/tree";
+import { entrySize, fingerprintOf } from "../files/tree";
 import {
   ACK_INTERVAL_MS,
   ACK_STEP,
   HELLO_TIMEOUT_MS,
   IDLE_TIMEOUT_MS,
   RECV_WINDOW,
-  acceptFiles,
+  acceptPlan,
+  filesToCheck,
+  planReceive,
   presentBytes,
   topEntries,
   validateOffer,
+  type CheckedFile,
+  type ConflictPolicy,
+  type Entry,
+  type Local,
   type TopEntry,
 } from "../proto";
 import {
@@ -27,11 +33,11 @@ import type { TransferListener } from "./events";
 
 const SENDER_IDLE = "the sender stopped sending";
 
-/// Receives a transfer into `sink`.
+/// Receives a transfer into `sink`; files there that differ from the offer are handled by `policy`.
 export async function runReceive(
   code: string,
   sink: TransferSink,
-  resume: boolean,
+  policy: ConflictPolicy,
   emit: TransferListener,
   abort: AbortSignal,
 ): Promise<void> {
@@ -50,9 +56,7 @@ export async function runReceive(
       .catch(() => {});
 
     const peer = Peer.receiver(link, abort);
-    const tops = await peer.explained(() =>
-      receive(peer, sink, resume && sink.canResume, emit),
-    );
+    const tops = await peer.explained(() => receive(peer, sink, policy, emit));
     link.peer.stop();
     link.pc.close();
 
@@ -71,7 +75,7 @@ export async function runReceive(
 async function receive(
   peer: ReceiverPeer,
   sink: TransferSink,
-  resume: boolean,
+  policy: ConflictPolicy,
   emit: TransferListener,
 ): Promise<TopEntry[]> {
   await peer.hello("the sender did not say hello in time", RECV_WINDOW);
@@ -108,19 +112,28 @@ async function receive(
     throw new TransferFailure("Transfer rejected");
   }
 
-  const local: (number | null)[] = [];
-  for (const entry of entries) {
-    local.push(
-      resume && entry.kind === "file" ? await sink.probe(entry.path) : null,
-    );
-  }
-  const files = acceptFiles(entries, local);
+  const local: Local[] = [];
+  for (const entry of entries) local.push(await sink.probe(entry.path));
+  const checked = filesToCheck(entries, local);
+  const verified =
+    checked.length === 0 ? [] : await verify(peer, sink, entries, checked);
+  const plan = planReceive(entries, local, verified);
+  const files = acceptPlan(plan, policy);
   peer.send({ type: "accept", files });
   emit(transferring(tops, presentBytes(entries, files)));
-
-  for (const entry of entries) {
-    if (entry.kind === "dir") await sink.createDir(entry.path);
+  if (plan.conflicts.length > 0) {
+    const replaced =
+      policy === "replace"
+        ? plan.conflicts.filter((conflict) => conflict.replaceable).length
+        : 0;
+    emit({
+      type: "conflicts",
+      replaced,
+      skipped: plan.conflicts.length - replaced,
+    });
   }
+
+  for (const id of plan.dirs) await sink.createDir(entries[id].path);
   let written = 0;
   let acked = 0;
   let ackedAt = performance.now();
@@ -157,4 +170,25 @@ async function receive(
   peer.send({ type: "done" });
   await peer.goodbye();
   return tops;
+}
+
+/** Asks the sender for fingerprints of the `checked` files; returns the ids of those that match ours. */
+async function verify(
+  peer: ReceiverPeer,
+  sink: TransferSink,
+  entries: Entry[],
+  checked: CheckedFile[],
+): Promise<number[]> {
+  peer.send({ type: "check", files: checked });
+  const answer = await peer.next();
+  if (answer.type !== "hashes") throw unexpected(answer);
+  if (answer.hashes.length !== checked.length) {
+    throw protocolError("the hashes do not match the check");
+  }
+  const verified = [];
+  for (const [i, { id, len }] of checked.entries()) {
+    const ours = await fingerprintOf(await sink.read(entries[id].path), len);
+    if (ours === answer.hashes[i]) verified.push(id);
+  }
+  return verified;
 }

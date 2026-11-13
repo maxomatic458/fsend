@@ -15,6 +15,10 @@ import { ErrorCard } from "../components/ErrorCard";
 import { Button } from "../components/Button";
 import { Busy } from "../components/Busy";
 import { formatBytes } from "../lib/format";
+import type { ConflictPolicy } from "../lib/proto";
+
+const count = (n: number, one: string, many: string) =>
+  `${n} ${n === 1 ? one : many}`;
 
 export function ReceivePage() {
   const navigate = useNavigate();
@@ -101,14 +105,18 @@ export function ReceivePage() {
                     </span>
                   </Button>
                 </div>
-                <label class="flex items-center gap-2 text-sm text-ink-dim cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={receive.resume()}
-                    onChange={(e) => receive.setResume(e.currentTarget.checked)}
-                    class="rounded"
-                  />
-                  Resume an interrupted transfer
+                <label class="flex items-center justify-between gap-3 text-sm text-ink-dim">
+                  If Files Already Exist
+                  <select
+                    value={receive.policy()}
+                    onChange={(e) =>
+                      receive.setPolicy(e.currentTarget.value as ConflictPolicy)
+                    }
+                    class="px-3 py-2 border border-line rounded-lg bg-surface-2 text-ink cursor-pointer"
+                  >
+                    <option value="skip">Skip Them</option>
+                    <option value="replace">Replace Them</option>
+                  </select>
                 </label>
               </Show>
             </div>
@@ -125,7 +133,7 @@ export function ReceivePage() {
 
             <p class="text-[13px] text-ink-faint text-center leading-relaxed max-w-[460px]">
               {toDisk()
-                ? "Files are written straight to the folder you choose, so size is limited by disk space and an interrupted transfer can be resumed."
+                ? "Files are written straight to the folder you choose, so size is limited by disk space. An interrupted transfer resumes where it stopped; other files that already exist are skipped or replaced, as chosen above."
                 : "Files land in your Downloads folder, zipped if there is more than one. The transfer is held in memory until it finishes, so size is limited by RAM and it can't be resumed."}
             </p>
           </div>
@@ -187,6 +195,29 @@ export function ReceivePage() {
                   ? `saved to ${receive.folder()?.name}`
                   : "Should now be downloading in your browser"}
               </p>
+
+              <Show when={receive.conflicts().skipped > 0}>
+                <p class="text-[13px] text-ink-faint mb-4">
+                  Skipped{" "}
+                  {count(
+                    receive.conflicts().skipped,
+                    "existing entry",
+                    "existing entries",
+                  )}{" "}
+                  that differ from the offer.
+                </p>
+              </Show>
+              <Show when={receive.conflicts().replaced > 0}>
+                <p class="text-[13px] text-ink-faint mb-4">
+                  Replaced{" "}
+                  {count(
+                    receive.conflicts().replaced,
+                    "existing file",
+                    "existing files",
+                  )}{" "}
+                  that differed from the offer.
+                </p>
+              </Show>
 
               <Show when={!toDisk()}>
                 <p class="text-[13px] text-ink-faint mb-4">

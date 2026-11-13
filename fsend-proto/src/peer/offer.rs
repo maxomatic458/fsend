@@ -4,7 +4,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 use super::{
-    AcceptedFile, Entry, SenderMessage, frame,
+    AcceptedFile, CheckedFile, Entry, SenderMessage, frame,
     limits::{MAX_COMPONENT_BYTES, MAX_DEPTH, MAX_ENTRIES, MAX_PATH_BYTES, MAX_TOTAL_BYTES},
 };
 
@@ -107,60 +107,45 @@ pub fn encode(entries: &[Entry]) -> Result<Vec<u8>, OfferError> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum AcceptError {
+pub enum FileListError {
     #[error("entry {0} is not in the offer")]
     UnknownId(u32),
     #[error("entry {0} is a directory")]
     Directory(u32),
-    #[error("entry {0} is accepted out of order")]
+    #[error("entry {0} is listed out of order")]
     OutOfOrder(u32),
-    #[error("entry {0} is accepted past its end")]
+    #[error("entry {0} is listed past its end")]
     PastEnd(u32),
 }
 
 /// Checks an accept against the offer: known files, in offer order, offsets within them.
-pub fn check_accept(entries: &[Entry], files: &[AcceptedFile]) -> Result<(), AcceptError> {
+pub fn check_accept(entries: &[Entry], files: &[AcceptedFile]) -> Result<(), FileListError> {
+    check_files(entries, files.iter().map(|file| (file.id, file.offset)))
+}
+
+/// Checks a `check` against the offer, like [`check_accept`].
+pub fn check_lengths(entries: &[Entry], files: &[CheckedFile]) -> Result<(), FileListError> {
+    check_files(entries, files.iter().map(|file| (file.id, file.len)))
+}
+
+fn check_files(
+    entries: &[Entry],
+    files: impl Iterator<Item = (u32, u64)>,
+) -> Result<(), FileListError> {
     let mut next = 0;
-    for &AcceptedFile { id, offset } in files {
+    for (id, position) in files {
         let index = id as usize;
         match entries.get(index) {
-            None => return Err(AcceptError::UnknownId(id)),
-            Some(_) if index < next => return Err(AcceptError::OutOfOrder(id)),
-            Some(Entry::Dir { .. }) => return Err(AcceptError::Directory(id)),
-            Some(Entry::File { size, .. }) if offset > *size => {
-                return Err(AcceptError::PastEnd(id));
+            None => return Err(FileListError::UnknownId(id)),
+            Some(_) if index < next => return Err(FileListError::OutOfOrder(id)),
+            Some(Entry::Dir { .. }) => return Err(FileListError::Directory(id)),
+            Some(Entry::File { size, .. }) if position > *size => {
+                return Err(FileListError::PastEnd(id));
             }
             Some(Entry::File { .. }) => next = index + 1,
         }
     }
     Ok(())
-}
-
-/// Where to resume a file of `size` with `local` bytes present, `None` if it is complete.
-pub fn resume_offset(size: u64, local: Option<u64>) -> Option<u64> {
-    match local {
-        None => Some(0),
-        // A larger local file is no prefix of this one.
-        Some(local) if local > size => (size > 0).then_some(0),
-        Some(local) => (local < size).then_some(local),
-    }
-}
-
-/// The receiver's accept: every file of the offer that is not complete yet.
-/// `local` holds, per entry, the size of the file already present.
-pub fn accept(entries: &[Entry], local: &[Option<u64>]) -> Vec<AcceptedFile> {
-    entries
-        .iter()
-        .zip(local)
-        .enumerate()
-        .filter_map(|(id, (entry, local))| match entry {
-            Entry::File { size, .. } => resume_offset(*size, *local).map(|offset| AcceptedFile {
-                id: id as u32,
-                offset,
-            }),
-            Entry::Dir { .. } => None,
-        })
-        .collect()
 }
 
 /// A top-level entry of an offer, with the size of everything below it.
@@ -337,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_are_checked_against_the_offer() {
+    fn accepts_and_checks_are_checked_against_the_offer() {
         let entries = [file(&["a"], 10), dir(&["d"]), file(&["d", "b"], 5)];
         let accepted = |files: &[(u32, u64)]| {
             let files: Vec<_> = files
@@ -348,45 +333,27 @@ mod tests {
         };
         assert_eq!(accepted(&[]), Ok(()));
         assert_eq!(accepted(&[(0, 0), (2, 5)]), Ok(()));
-        assert_eq!(accepted(&[(3, 0)]), Err(AcceptError::UnknownId(3)));
-        assert_eq!(accepted(&[(1, 0)]), Err(AcceptError::Directory(1)));
-        assert_eq!(accepted(&[(2, 0), (0, 0)]), Err(AcceptError::OutOfOrder(0)));
-        assert_eq!(accepted(&[(0, 0), (0, 0)]), Err(AcceptError::OutOfOrder(0)));
-        assert_eq!(accepted(&[(0, 11)]), Err(AcceptError::PastEnd(0)));
-    }
-
-    #[test]
-    fn resume_follows_the_local_size() {
-        assert_eq!(resume_offset(100, None), Some(0));
-        assert_eq!(resume_offset(100, Some(40)), Some(40));
-        // Complete files are skipped, larger ones start over.
-        assert_eq!(resume_offset(100, Some(100)), None);
-        assert_eq!(resume_offset(100, Some(150)), Some(0));
-        // An empty file is complete with any local file.
-        assert_eq!(resume_offset(0, None), Some(0));
-        assert_eq!(resume_offset(0, Some(0)), None);
-        assert_eq!(resume_offset(0, Some(9)), None);
-    }
-
-    #[test]
-    fn the_accept_leaves_out_directories_and_complete_files() {
-        let entries = [
-            file(&["new"], 10),
-            dir(&["d"]),
-            file(&["d", "partial"], 10),
-            file(&["d", "done"], 10),
-            file(&["d", "stale"], 10),
-        ];
+        assert_eq!(accepted(&[(3, 0)]), Err(FileListError::UnknownId(3)));
+        assert_eq!(accepted(&[(1, 0)]), Err(FileListError::Directory(1)));
         assert_eq!(
-            accept(&entries, &[None, None, Some(4), Some(10), Some(20)]),
-            [
-                AcceptedFile { id: 0, offset: 0 },
-                AcceptedFile { id: 2, offset: 4 },
-                AcceptedFile { id: 4, offset: 0 },
-            ]
+            accepted(&[(2, 0), (0, 0)]),
+            Err(FileListError::OutOfOrder(0))
         );
-        // Without resume everything starts at zero.
-        assert_eq!(accept(&entries, &[None; 5]).len(), 4);
+        assert_eq!(
+            accepted(&[(0, 0), (0, 0)]),
+            Err(FileListError::OutOfOrder(0))
+        );
+        assert_eq!(accepted(&[(0, 11)]), Err(FileListError::PastEnd(0)));
+
+        let checked = [
+            CheckedFile { id: 0, len: 10 },
+            CheckedFile { id: 2, len: 6 },
+        ];
+        assert_eq!(check_lengths(&entries, &checked[..1]), Ok(()));
+        assert_eq!(
+            check_lengths(&entries, &checked),
+            Err(FileListError::PastEnd(2))
+        );
     }
 
     #[test]

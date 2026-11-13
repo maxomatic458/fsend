@@ -6,9 +6,14 @@ const {
   encodeFrame,
   FrameDecoder,
   Role,
-  acceptFiles,
+  acceptPlan,
   checkAccept,
+  checkLengths,
+  filesToCheck,
+  fingerprint,
+  fingerprintRanges,
   parseServerMessage,
+  planReceive,
   presentBytes,
   topEntries,
   validateOffer,
@@ -111,16 +116,52 @@ describe("offer helpers", () => {
     );
   });
 
-  test("the accept resumes, skips and starts over like the CLI", () => {
-    const files = acceptFiles(entries, [4, null, 5, 9]);
-    assert.deepEqual(files, [
+  test("verified prefixes resume and the rest conflict, like the CLI", () => {
+    const local = [
+      { kind: "file", size: 4 },
+      { kind: "missing" },
+      { kind: "file", size: 5 },
+      { kind: "file", size: 3 },
+    ];
+    const checked = filesToCheck(entries, local);
+    assert.deepEqual(checked, [
+      { id: 0, len: 4 },
+      { id: 2, len: 5 },
+      { id: 3, len: 3 },
+    ]);
+    checkLengths(entries, checked);
+    assert.throws(() => checkLengths(entries, [{ id: 2, len: 6 }]), /past/);
+
+    // a.txt matches, d/c does not, d/b is complete.
+    const plan = planReceive(entries, local, [0, 2]);
+    assert.deepEqual(plan, {
+      files: [{ id: 0, offset: 4 }],
+      dirs: [1],
+      conflicts: [{ id: 3, replaceable: true }],
+    });
+    assert.deepEqual(acceptPlan(plan, "skip"), plan.files);
+    const replaced = acceptPlan(plan, "replace");
+    assert.deepEqual(replaced, [
       { id: 0, offset: 4 },
       { id: 3, offset: 0 },
     ]);
-    checkAccept(entries, files);
+    checkAccept(entries, replaced);
     assert.throws(
       () => checkAccept(entries, [{ id: 1, offset: 0 }]),
       /directory/,
+    );
+  });
+
+  test("fingerprints match the CLI's", () => {
+    const mib = 1024 * 1024;
+    assert.deepEqual(fingerprintRanges(2 * mib), [[0, 2 * mib]]);
+    assert.deepEqual(fingerprintRanges(2 * mib + 1), [
+      [0, mib],
+      [mib + 1, 2 * mib + 1],
+    ]);
+    assert.equal(
+      fingerprint(new TextEncoder().encode("fsend")),
+      "e56767a1277b0357a6d715ea3ebead85",
     );
   });
 

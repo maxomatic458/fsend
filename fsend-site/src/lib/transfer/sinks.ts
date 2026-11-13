@@ -1,16 +1,16 @@
-import type { TopEntry } from "../proto";
+import type { Local, TopEntry } from "../proto";
 
 /// Long enough for the browser to have started reading the blob.
 const REVOKE_DELAY_MS = 60_000;
 
 /// Bytes are written into this sink
 export interface TransferSink {
-  /// can the transfer be resumed
-  readonly canResume: boolean;
-  /// The size of the file already at `path`, null if there is none.
-  probe(path: string[]): Promise<number | null>;
+  /// What is already at `path`.
+  probe(path: string[]): Promise<Local>;
+  /// The file at `path`, which `probe` found.
+  read(path: string[]): Promise<Blob>;
   createDir(path: string[]): Promise<void>;
-  /// Opens a file to write from `offset` on.
+  /// Opens a file to write from `offset` on; at 0 whatever was there is dropped.
   open(path: string[], offset: number): Promise<void>;
   write(chunk: Uint8Array): Promise<void>;
   closeFile(): Promise<void>;
@@ -37,18 +37,31 @@ export function createDiskSink(
     return dir;
   };
 
-  return {
-    canResume: true,
+  const fileAt = async (path: string[]) => {
+    const dir = await dirOf(path.slice(0, -1), false);
+    return dir.getFileHandle(path[path.length - 1]);
+  };
 
+  return {
     async probe(path) {
+      let dir: FileSystemDirectoryHandle;
       try {
-        const dir = await dirOf(path.slice(0, -1), false);
-        const handle = await dir.getFileHandle(path[path.length - 1]);
-        return (await handle.getFile()).size;
+        dir = await dirOf(path.slice(0, -1), false);
       } catch {
-        // Not there yet.
-        return null;
+        return { kind: "missing" };
       }
+      try {
+        const file = await dir.getFileHandle(path[path.length - 1]);
+        return { kind: "file", size: (await file.getFile()).size };
+      } catch (err) {
+        return (err as DOMException).name === "TypeMismatchError"
+          ? { kind: "dir" }
+          : { kind: "missing" };
+      }
+    },
+
+    async read(path) {
+      return (await fileAt(path)).getFile();
     },
 
     async createDir(path) {
@@ -93,11 +106,13 @@ export function createDownloadSink(): TransferSink {
   let current: Uint8Array[] | null = null;
 
   return {
-    canResume: false,
-
     async probe() {
       // Nothing is kept between attempts, so there is never anything to skip.
-      return null;
+      return { kind: "missing" };
+    },
+
+    async read() {
+      throw new Error("Nothing is stored before the transfer");
     },
 
     async createDir(path) {

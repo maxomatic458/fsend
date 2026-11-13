@@ -1,9 +1,14 @@
 import init, * as wasm from "./pkg/fsend_proto_wasm";
 import type {
   AcceptedFile,
+  CheckedFile,
+  ConflictPolicy,
   Entry,
+  Fingerprint,
+  Local,
   PairingError,
   ParsedCode,
+  Plan,
   ReceiverMessage,
   Sealed,
   SenderMessage,
@@ -138,12 +143,42 @@ export const encodeOffer = (entries: Entry[]): Uint8Array =>
 export const checkAccept = (entries: Entry[], files: AcceptedFile[]): void =>
   wasm.checkAccept(JSON.stringify(entries), JSON.stringify(files));
 
-/** Every file not complete yet, given the size of each entry already present. */
-export const acceptFiles = (
+/** Throws unless `files` names files of `entries`, in order, with lengths within them. */
+export const checkLengths = (entries: Entry[], files: CheckedFile[]): void =>
+  wasm.checkLengths(JSON.stringify(entries), JSON.stringify(files));
+
+/** The byte ranges of a file's first `len` bytes that are fingerprinted. */
+export const fingerprintRanges = (len: number): [number, number][] =>
+  JSON.parse(wasm.fingerprintRanges(len));
+
+/** The fingerprint of the bytes in {@link fingerprintRanges}, concatenated. */
+export const fingerprint = (sampled: Uint8Array): Fingerprint =>
+  JSON.parse(wasm.fingerprint(sampled));
+
+/** The local files, given what is at each entry's path, that may be a prefix of the offered ones. */
+export const filesToCheck = (entries: Entry[], local: Local[]): CheckedFile[] =>
+  JSON.parse(wasm.filesToCheck(JSON.stringify(entries), JSON.stringify(local)));
+
+/** What to do with each entry, given the ids of the checked files whose fingerprints matched. */
+export const planReceive = (
   entries: Entry[],
-  local: (number | null)[],
+  local: Local[],
+  verified: number[],
+): Plan =>
+  JSON.parse(
+    wasm.planReceive(
+      JSON.stringify(entries),
+      JSON.stringify(local),
+      Uint32Array.from(verified),
+    ),
+  );
+
+/** The files to accept under `policy`. */
+export const acceptPlan = (
+  plan: Plan,
+  policy: ConflictPolicy,
 ): AcceptedFile[] =>
-  JSON.parse(wasm.acceptFiles(JSON.stringify(entries), JSON.stringify(local)));
+  JSON.parse(wasm.acceptPlan(JSON.stringify(plan), JSON.stringify(policy)));
 
 /** The top-level entries of a valid offer, and the index of the one each entry lies in. */
 export const topEntries = (entries: Entry[]): [TopEntry[], number[]] =>

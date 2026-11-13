@@ -1,11 +1,17 @@
 import { DATA_CHUNK_BYTES, MAX_BUFFERED_BYTES } from "../../config";
 import { openSenderSession, type Link } from "../transport/session";
 import { getConnectionType } from "../transport/webrtc";
-import { buildOffer, entrySize, type Outgoing } from "../files/tree";
+import {
+  buildOffer,
+  entrySize,
+  fingerprintOf,
+  type Outgoing,
+} from "../files/tree";
 import {
   IDLE_TIMEOUT_MS,
   MIN_RECV_WINDOW,
   checkAccept,
+  checkLengths,
   encodeOffer,
   loadProto,
   presentBytes,
@@ -81,7 +87,20 @@ async function send(
 
   peer.sendFrame(offer);
   emit({ type: "waitingAccept" });
-  const answer = await peer.next();
+  let answer = await peer.next();
+  if (answer.type === "check") {
+    try {
+      checkLengths(entries, answer.files);
+    } catch (err) {
+      throw protocolError(messageOf(err));
+    }
+    const hashes = [];
+    for (const { id, len } of answer.files) {
+      hashes.push(await fingerprintOf(sources[id]!, len));
+    }
+    peer.send({ type: "hashes", hashes });
+    answer = await peer.next();
+  }
   if (answer.type === "reject") {
     throw new TransferFailure("The receiver rejected the files");
   }

@@ -1,4 +1,9 @@
-import type { Entry } from "../proto";
+import {
+  fingerprint,
+  fingerprintRanges,
+  type Entry,
+  type Fingerprint,
+} from "../proto";
 import type { SelectedEntry } from "../types";
 
 /** What a file entry reads from; only its size and slices are used. */
@@ -65,3 +70,24 @@ export const entrySize = (entry: Entry): number =>
 
 export const offerSizeBytes = (entries: Entry[]): number =>
   entries.reduce((total, entry) => total + entrySize(entry), 0);
+
+/** The fingerprint of the first `len` bytes of `source`. */
+export async function fingerprintOf(
+  source: Source,
+  len: number,
+): Promise<Fingerprint> {
+  const ranges = fingerprintRanges(len);
+  const sampled = new Uint8Array(
+    ranges.reduce((n, [start, end]) => n + end - start, 0),
+  );
+  let offset = 0;
+  for (const [start, end] of ranges) {
+    const part = new Uint8Array(await source.slice(start, end).arrayBuffer());
+    if (part.length !== end - start) {
+      throw new Error("A file is shorter than expected");
+    }
+    sampled.set(part, offset);
+    offset += part.length;
+  }
+  return fingerprint(sampled);
+}

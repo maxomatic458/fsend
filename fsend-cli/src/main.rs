@@ -10,14 +10,15 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use fsend_cli::cli::{Args, Mode};
+use fsend_cli::cli::{Args, Mode, OnConflict};
 use fsend_cli::iroh::IrohTransfer;
 use fsend_cli::relay::{Relay, RelayError, pair_as_receiver, pair_as_sender};
-use fsend_cli::transfer::{self, Event, ReceiveArgs, TransferError, build_offer};
+use fsend_cli::transfer::{self, Event, TransferError, build_offer};
 use fsend_cli::webrtc::WebRtcTransfer;
 use fsend_proto::code::Code;
 use fsend_proto::pairing::ConnectionInfo;
-use fsend_proto::peer::{self, offer::TopEntry};
+use fsend_proto::peer::resume::{Conflict, ConflictPolicy};
+use fsend_proto::peer::{self, Entry, offer::TopEntry};
 use fsend_proto::relay::Transport;
 
 #[tokio::main]
@@ -53,11 +54,17 @@ async fn run() -> color_eyre::Result<()> {
     match args.mode {
         Mode::Send { files } => run_send(&args.relay_url, &args.download_url, files).await?,
         Mode::Receive {
-            overwrite,
+            on_conflict,
             output_dir,
             code,
             auto_accept,
-        } => run_receive(&args.relay_url, code, output_dir, !overwrite, auto_accept).await?,
+        } => {
+            let on_conflict = on_conflict.unwrap_or(match auto_accept {
+                true => OnConflict::Skip,
+                false => OnConflict::Ask,
+            });
+            run_receive(&args.relay_url, code, output_dir, on_conflict, auto_accept).await?
+        }
         Mode::Version => print_version(),
     }
 
@@ -195,7 +202,7 @@ async fn run_receive(
     relay_url: &str,
     code: String,
     output_dir: PathBuf,
-    resume: bool,
+    on_conflict: OnConflict,
     auto_accept: bool,
 ) -> color_eyre::Result<()> {
     let code: Code = code.parse().map_err(RelayError::from)?;
@@ -208,7 +215,6 @@ async fn run_receive(
     let mut progress = Progress::default();
     transfer::receive_files(
         transport.as_mut(),
-        ReceiveArgs { resume },
         &mut |offered| {
             if auto_accept {
                 println!("Auto-accepting files.");
@@ -219,6 +225,7 @@ async fn run_receive(
                 None
             }
         },
+        &mut |entries, conflicts| resolve_conflicts(entries, conflicts, on_conflict),
         &mut |event| progress.on_event(event),
     )
     .await?;
@@ -288,6 +295,59 @@ fn accept_files(files: &[TopEntry]) -> bool {
         .with_prompt("Accept these files?")
         .interact()
         .unwrap_or(false)
+}
+
+/// Lists the conflicts and picks what to do with them.
+fn resolve_conflicts(
+    entries: &[Entry],
+    conflicts: &[Conflict],
+    on_conflict: OnConflict,
+) -> ConflictPolicy {
+    const SHOWN: usize = 10;
+    let list = |conflicts: &[&Conflict]| {
+        for conflict in conflicts.iter().take(SHOWN) {
+            println!(
+                " - {}",
+                entries[conflict.id as usize].path().join("/").blue()
+            );
+        }
+        if conflicts.len() > SHOWN {
+            println!(" ... and {} more", conflicts.len() - SHOWN);
+        }
+    };
+    let (replaceable, blocked): (Vec<_>, Vec<_>) = conflicts.iter().partition(|c| c.replaceable);
+    if !blocked.is_empty() {
+        println!("\nSkipping these, a file or folder of another kind is in the way:\n");
+        list(&blocked);
+    }
+    if replaceable.is_empty() {
+        return ConflictPolicy::Skip;
+    }
+    println!("\nThese files already exist and differ from the offered ones:\n");
+    list(&replaceable);
+    println!();
+    match on_conflict {
+        OnConflict::Skip => {
+            println!("Skipping them.");
+            ConflictPolicy::Skip
+        }
+        OnConflict::Replace => {
+            println!("Replacing them.");
+            ConflictPolicy::Replace
+        }
+        OnConflict::Ask => {
+            let choice = dialoguer::Select::with_theme(&ColorfulTheme::default())
+                .with_prompt("What should happen to them?")
+                .items(["Skip", "Replace"])
+                .default(0)
+                .interact()
+                .unwrap_or(0);
+            match choice {
+                1 => ConflictPolicy::Replace,
+                _ => ConflictPolicy::Skip,
+            }
+        }
+    }
 }
 
 struct CliProgressBars {

@@ -13,9 +13,10 @@ use std::thread;
 use std::time::Instant;
 
 use fsend_cli::iroh::IrohTransfer;
-use fsend_cli::transfer::{Event, ReceiveArgs, Transport, build_offer, receive_files, send_files};
+use fsend_cli::transfer::{Event, Transport, build_offer, receive_files, send_files};
 use fsend_cli::webrtc::{WebRtcConfig, WebRtcTransfer};
 use fsend_proto::pairing::ConnectionInfo;
+use fsend_proto::peer::resume::ConflictPolicy;
 use iroh::Endpoint;
 use iroh::endpoint::presets;
 
@@ -73,8 +74,8 @@ fn receive_harness(
         let out_dir = out.clone();
         receive_files(
             transfer.as_mut(),
-            ReceiveArgs { resume: false },
             &mut |_| Some(out_dir.clone()),
+            &mut |_, _| ConflictPolicy::Replace,
             &mut |event| {
                 if matches!(event, Event::Started { .. }) {
                     started = Some(Instant::now());

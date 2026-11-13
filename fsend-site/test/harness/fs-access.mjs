@@ -14,6 +14,14 @@ class NotFoundError extends Error {
   }
 }
 
+/** What browsers throw for an entry of the other kind. */
+class TypeMismatchError extends Error {
+  constructor(name) {
+    super(`TypeMismatchError: ${name}`);
+    this.name = "TypeMismatchError";
+  }
+}
+
 export class MemoryFileHandle {
   constructor(name) {
     this.kind = "file";
@@ -82,7 +90,7 @@ export class MemoryDirectoryHandle {
   async getDirectoryHandle(name, { create = false } = {}) {
     const existing = this._children.get(name);
     if (existing) {
-      if (existing.kind !== "directory") throw new NotFoundError(name);
+      if (existing.kind !== "directory") throw new TypeMismatchError(name);
       return existing;
     }
     if (!create) throw new NotFoundError(name);
@@ -94,7 +102,7 @@ export class MemoryDirectoryHandle {
   async getFileHandle(name, { create = false } = {}) {
     const existing = this._children.get(name);
     if (existing) {
-      if (existing.kind !== "file") throw new NotFoundError(name);
+      if (existing.kind !== "file") throw new TypeMismatchError(name);
       return existing;
     }
     if (!create) throw new NotFoundError(name);

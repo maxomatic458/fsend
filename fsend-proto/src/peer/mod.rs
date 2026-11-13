@@ -1,8 +1,11 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+use resume::Fingerprint;
+
 pub mod frame;
 pub mod limits;
 pub mod offer;
+pub mod resume;
 
 pub const VERSION: u32 = 4;
 pub const MIN_VERSION: u32 = 4;
@@ -19,6 +22,10 @@ pub enum SenderMessage {
     Offer {
         entries: Vec<Entry>,
     },
+    /// The fingerprint of each file in the receiver's `check`, in its order.
+    Hashes {
+        hashes: Vec<Fingerprint>,
+    },
     Cancel(Cancel),
     Error(ErrorReport),
 }
@@ -30,6 +37,10 @@ pub enum SenderMessage {
 pub enum ReceiverMessage {
     /// Sent first.
     Hello(Hello),
+    /// Files the receiver already has part of, in offer order; at most once, before `accept`.
+    Check {
+        files: Vec<CheckedFile>,
+    },
     /// The files to send, in offer order.
     Accept {
         files: Vec<AcceptedFile>,
@@ -60,6 +71,7 @@ impl Message for SenderMessage {
         match self {
             Self::Hello(_) => "hello",
             Self::Offer { .. } => "offer",
+            Self::Hashes { .. } => "hashes",
             Self::Cancel(_) => "cancel",
             Self::Error(_) => "error",
         }
@@ -70,6 +82,7 @@ impl Message for ReceiverMessage {
     fn kind(&self) -> &'static str {
         match self {
             Self::Hello(_) => "hello",
+            Self::Check { .. } => "check",
             Self::Accept { .. } => "accept",
             Self::Reject { .. } => "reject",
             Self::Ack { .. } => "ack",
@@ -144,6 +157,14 @@ pub struct AcceptedFile {
     pub offset: u64,
 }
 
+/// The first `len` bytes of a file, to fingerprint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct CheckedFile {
+    pub id: u32,
+    pub len: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(rename = "PeerErrorCode"))]
 #[serde(rename_all = "snake_case")]
@@ -210,6 +231,12 @@ mod tests {
             },
             r#"{"type":"offer","entries":[{"kind":"dir","path":["d"]},{"kind":"file","path":["d","a.txt"],"size":3}]}"#,
         );
+        pinned(
+            SenderMessage::Hashes {
+                hashes: vec![Fingerprint(0x0123456789abcdef_0011223344556677)],
+            },
+            r#"{"type":"hashes","hashes":["0123456789abcdef0011223344556677"]}"#,
+        );
         pinned(SenderMessage::Cancel(cancel(None)), r#"{"type":"cancel"}"#);
         pinned(
             SenderMessage::Cancel(cancel(Some("bye"))),
@@ -226,6 +253,12 @@ mod tests {
         pinned(
             ReceiverMessage::Hello(hello(Some(1024))),
             r#"{"type":"hello","version":4,"min_version":4,"features":[],"recv_window":1024}"#,
+        );
+        pinned(
+            ReceiverMessage::Check {
+                files: vec![CheckedFile { id: 1, len: 2 }],
+            },
+            r#"{"type":"check","files":[{"id":1,"len":2}]}"#,
         );
         pinned(
             ReceiverMessage::Accept {
@@ -266,10 +299,19 @@ mod tests {
     fn unknown_and_wrong_direction_types_fail_to_parse() {
         let from_sender = |json: &str| serde_json::from_str::<SenderMessage>(json);
         let from_receiver = |json: &str| serde_json::from_str::<ReceiverMessage>(json);
-        for json in [r#"{"type":"accept","files":[]}"#, r#"{"type":"done"}"#] {
+        for json in [
+            r#"{"type":"accept","files":[]}"#,
+            r#"{"type":"check","files":[]}"#,
+            r#"{"type":"done"}"#,
+        ] {
             assert!(from_sender(json).is_err(), "{json}");
         }
-        assert!(from_receiver(r#"{"type":"offer","entries":[]}"#).is_err());
+        for json in [
+            r#"{"type":"offer","entries":[]}"#,
+            r#"{"type":"hashes","hashes":[]}"#,
+        ] {
+            assert!(from_receiver(json).is_err(), "{json}");
+        }
         for json in [
             r#"{"type":"resume","x":1}"#,
             r#"{"x":1}"#,
@@ -277,6 +319,8 @@ mod tests {
             // Unknown values inside a message, too.
             r#"{"type":"error","code":"disk_on_fire","message":"m"}"#,
             r#"{"type":"offer","entries":[{"kind":"link","path":["a"]}]}"#,
+            r#"{"type":"hashes","hashes":["0123"]}"#,
+            r#"{"type":"hashes","hashes":["0123456789ABCDEF0011223344556677"]}"#,
         ] {
             assert!(from_sender(json).is_err(), "{json}");
             assert!(from_receiver(json).is_err(), "{json}");

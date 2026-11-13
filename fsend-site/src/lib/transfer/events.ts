@@ -26,6 +26,8 @@ export type TransferEvent =
       reject: () => void;
     }
   | { type: "transferring"; entries: TransferEntry[] }
+  /// Receiver only: existing entries that differ from the offer, replaced or left alone.
+  | { type: "conflicts"; replaced: number; skipped: number }
   /// `bytes` more of the entry at `entry` in `transferring`.
   | { type: "progress"; entry: number; bytes: number }
   /// Receiver only: bytes are all in, but the sink is still packing them.

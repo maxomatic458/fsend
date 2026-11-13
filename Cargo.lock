@@ -1470,6 +1470,7 @@ dependencies = [
  "spake2",
  "thiserror 2.0.20",
  "ts-rs",
+ "xxhash-rust",
  "zstd",
 ]
 
@@ -5889,6 +5890,12 @@ checksum = "d7d8a75eaf6557bb84a65ace8609883db44a29951042ada9b393151532e41fcb"
 dependencies = [
  "xml-rs",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
 
 [[package]]
 name = "yasna"

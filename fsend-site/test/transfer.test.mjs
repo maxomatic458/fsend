@@ -50,7 +50,7 @@ function assertFiles(actual, expected) {
  * Runs a sender and a native-FS receiver against each other.
  * Returns once both have settled.
  */
-async function transfer(spec, { mode = "file", resume = false, dir } = {}) {
+async function transfer(spec, { mode = "file", policy = "skip", dir } = {}) {
   const dirHandle = dir ?? new MemoryDirectoryHandle();
   const send = makeRecorder();
   const recv = makeRecorder();
@@ -65,7 +65,7 @@ async function transfer(spec, { mode = "file", resume = false, dir } = {}) {
   const receiverDone = runReceive(
     code,
     createDiskSink(dirHandle),
-    resume,
+    policy,
     recv.emit,
     new AbortController().signal,
   );
@@ -177,7 +177,7 @@ describe("complete transfers (fallback, no File System Access API)", () => {
     const receiverDone = runReceive(
       code,
       createDownloadSink(),
-      false,
+      "skip",
       recv.emit,
       new AbortController().signal,
     );
@@ -235,7 +235,7 @@ describe("interrupted transfers", () => {
     const receiverDone = runReceive(
       code,
       createDiskSink(new MemoryDirectoryHandle()),
-      false,
+      "skip",
       recv.emit,
       new AbortController().signal,
     );
@@ -284,7 +284,7 @@ describe("interrupted transfers", () => {
     const receiverDone = runReceive(
       code,
       createDiskSink(new MemoryDirectoryHandle()),
-      false,
+      "skip",
       recv.emit,
       new AbortController().signal,
     );
@@ -328,7 +328,7 @@ describe("interrupted transfers", () => {
     const receiverDone = runReceive(
       code,
       createDiskSink(new MemoryDirectoryHandle()),
-      false,
+      "skip",
       recv.emit,
       new AbortController().signal,
     );
@@ -359,7 +359,7 @@ describe("interrupted transfers", () => {
     const receiverDone = runReceive(
       code,
       createDiskSink(new MemoryDirectoryHandle()),
-      false,
+      "skip",
       recv.emit,
       new AbortController().signal,
     );
@@ -390,7 +390,7 @@ describe("interrupted transfers", () => {
     const receiverDone = runReceive(
       code,
       createDiskSink(new MemoryDirectoryHandle()),
-      false,
+      "skip",
       recv.emit,
       controller.signal,
     );
@@ -434,6 +434,14 @@ describe("protocol errors", () => {
     ["a message only the sender sends", () => encodeFrame(offer, Role.Sender)],
     ["an unknown message", () => jsonFrame('{"type":"resume"}')],
     ["a malformed message", () => jsonFrame('{"type":"accept"}')],
+    [
+      "a check of an unknown file",
+      () =>
+        encodeFrame(
+          { type: "check", files: [{ id: 7, len: 1 }] },
+          Role.Receiver,
+        ),
+    ],
   ]) {
     test(`${name} from the receiver fails the sender`, async () => {
       const send = makeRecorder();
@@ -456,7 +464,7 @@ describe("protocol errors", () => {
       const receiverDone = runReceive(
         code,
         createDiskSink(new MemoryDirectoryHandle()),
-        false,
+        "skip",
         recv.emit,
         new AbortController().signal,
       );
@@ -491,7 +499,7 @@ describe("resuming an interrupted download", () => {
       const receiverDone = runReceive(
         code,
         createDiskSink(dirHandle),
-        false,
+        "skip",
         recv.emit,
         new AbortController().signal,
       );
@@ -513,7 +521,7 @@ describe("resuming an interrupted download", () => {
       "the partial prefix must match the source",
     );
 
-    // Second attempt, with resume on: only the remainder should be sent.
+    // Second attempt: only the remainder should be sent.
     const send2 = makeRecorder();
     const recv2 = makeRecorder();
     const senderDone2 = runSend(
@@ -527,7 +535,7 @@ describe("resuming an interrupted download", () => {
     const receiverDone2 = runReceive(
       code2,
       createDiskSink(dirHandle),
-      true,
+      "skip",
       recv2.emit,
       new AbortController().signal,
     );
@@ -549,10 +557,7 @@ describe("resuming an interrupted download", () => {
     const done = await dirHandle.getFileHandle("done.bin", { create: true });
     done.bytes = spec["done.bin"];
 
-    const { send, recv } = await transfer(spec, {
-      resume: true,
-      dir: dirHandle,
-    });
+    const { send, recv } = await transfer(spec, { dir: dirHandle });
     assert.equal(send.error, null);
     assert.equal(recv.error, null);
     assertFiles(dirHandle.snapshot(), expectedSnapshot(spec));
@@ -563,9 +568,57 @@ describe("resuming an interrupted download", () => {
     );
   });
 
+  /** A folder with `a.bin` differing from the start and `b.bin` larger than offered. */
+  const conflicting = async () => {
+    const dir = new MemoryDirectoryHandle();
+    const a = await dir.getFileHandle("a.bin", { create: true });
+    a.bytes = bytes(2000, 9);
+    const b = await dir.getFileHandle("b.bin", { create: true });
+    b.bytes = bytes(400, 9);
+    return dir;
+  };
+  const offered = { "a.bin": bytes(5000, 171), "b.bin": bytes(300, 172) };
+
+  test("files that differ are skipped by default", async () => {
+    const dir = await conflicting();
+    const before = dir.snapshot();
+    const { send, recv } = await transfer(offered, { dir });
+    assert.equal(send.error, null);
+    assert.equal(recv.error, null);
+    assertFiles(dir.snapshot(), before);
+    assert.equal(send.progress, 0);
+    assert.deepEqual(recv.conflicts, { replaced: 0, skipped: 2 });
+  });
+
+  test("files that differ are replaced when chosen", async () => {
+    const dir = await conflicting();
+    const { send, recv } = await transfer(offered, { dir, policy: "replace" });
+    assert.equal(recv.error, null);
+    assertFiles(dir.snapshot(), expectedSnapshot(offered));
+    assert.equal(send.progress, 5300);
+    assert.deepEqual(recv.conflicts, { replaced: 2, skipped: 0 });
+  });
+
+  test("entries of another kind in the way are always skipped", async () => {
+    const dir = new MemoryDirectoryHandle();
+    const file = await dir.getFileHandle("folder", { create: true });
+    file.bytes = bytes(10, 1);
+    await dir.getDirectoryHandle("f.bin", { create: true });
+    const spec = {
+      folder: { "x.dat": bytes(900, 22) },
+      "f.bin": bytes(10, 2),
+      "g.bin": bytes(10, 3),
+    };
+    const { send, recv } = await transfer(spec, { dir, policy: "replace" });
+    assert.equal(recv.error, null);
+    assert.deepEqual(Object.keys(dir.snapshot()).sort(), ["folder", "g.bin"]);
+    assert.equal(send.progress, 10);
+    assert.deepEqual(recv.conflicts, { replaced: 0, skipped: 2 });
+  });
+
   test("resuming without existing data transfers everything", async () => {
     const spec = { "fresh.bin": bytes(50_000, 121) };
-    const { dirHandle, send } = await transfer(spec, { resume: true });
+    const { dirHandle, send } = await transfer(spec);
     assert.equal(send.error, null);
     assertFiles(dirHandle.snapshot(), expectedSnapshot(spec));
   });
@@ -577,7 +630,7 @@ describe("relay behaviour", () => {
     await runReceive(
       code,
       createDiskSink(new MemoryDirectoryHandle()),
-      false,
+      "skip",
       recv.emit,
       new AbortController().signal,
     );
@@ -629,7 +682,7 @@ describe("relay behaviour", () => {
     await runReceive(
       code.toLowerCase(),
       createDiskSink(new MemoryDirectoryHandle()),
-      false,
+      "skip",
       recv.emit,
       new AbortController().signal,
     );

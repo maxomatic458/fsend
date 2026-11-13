@@ -12,9 +12,10 @@ use fsend_proto::peer::limits::{
     MIN_RECV_WINDOW, RECV_WINDOW,
 };
 use fsend_proto::peer::offer::{self, EntryError, OfferError, TopEntry};
+use fsend_proto::peer::resume::{self, Conflict, ConflictPolicy, Fingerprint, Local};
 use fsend_proto::peer::{
-    self, AcceptedFile, Cancel, Entry, ErrorCode, ErrorReport, Hello, Message, ReceiverMessage,
-    SenderMessage,
+    self, AcceptedFile, Cancel, CheckedFile, Entry, ErrorCode, ErrorReport, Hello, Message,
+    ReceiverMessage, SenderMessage,
 };
 use thiserror::Error;
 use tokio::fs::File;
@@ -171,10 +172,6 @@ impl From<io::Error> for TransferError {
     }
 }
 
-pub struct ReceiveArgs {
-    pub resume: bool,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event<'a> {
     /// Sender: the offer is out, the receiver is deciding.
@@ -191,6 +188,8 @@ pub enum Event<'a> {
 pub type EventCb<'a> = &'a mut (dyn FnMut(Event<'_>) + Send);
 /// The directory to receive into, or `None` to decline.
 pub type AcceptCb<'a> = &'a mut (dyn FnMut(&[TopEntry]) -> Option<PathBuf> + Send);
+/// What to do with the entries of the offer that conflict with local ones.
+pub type ConflictCb<'a> = &'a mut (dyn FnMut(&[Entry], &[Conflict]) -> ConflictPolicy + Send);
 
 /// A bidirectional bytestream.
 pub trait ByteStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -295,16 +294,45 @@ pub fn local_path(root: &Path, path: &[String]) -> io::Result<PathBuf> {
     Ok(out)
 }
 
-/// Opens a file for receiving.
+/// Opens a file for receiving; at offset 0 whatever was there is dropped.
 pub async fn open_for_receive(path: &Path, offset: u64) -> io::Result<File> {
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(false)
+        .truncate(offset == 0)
         .open(path)
         .await?;
     file.seek(io::SeekFrom::Start(offset)).await?;
     Ok(file)
+}
+
+/// The fingerprint of the first `len` bytes of each file.
+async fn fingerprints(files: Vec<(PathBuf, u64)>) -> io::Result<Vec<Fingerprint>> {
+    tokio::task::spawn_blocking(move || {
+        files
+            .iter()
+            .map(|(path, len)| fingerprint(path, *len))
+            .collect()
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+fn fingerprint(path: &Path, len: u64) -> io::Result<Fingerprint> {
+    use std::io::{Read, Seek};
+    let mut file = std::fs::File::open(path)?;
+    let mut sampled = Vec::new();
+    for (start, end) in Fingerprint::ranges(len) {
+        file.seek(io::SeekFrom::Start(start))?;
+        let want = end - start;
+        if (&mut file).take(want).read_to_end(&mut sampled)? as u64 != want {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("{} is shorter than {len} bytes", path.display()),
+            ));
+        }
+    }
+    Ok(Fingerprint::of(&sampled))
 }
 
 /// Finishes a received file.
@@ -529,12 +557,24 @@ async fn send(
 
     control.send_frame(&outgoing.frame).await?;
     on_event(Event::Offered);
-    let files = match control.recv().await? {
+    let entries = &outgoing.entries;
+    let mut answer = control.recv().await?;
+    if let ReceiverMessage::Check { files } = answer {
+        offer::check_lengths(entries, &files)
+            .map_err(|e| TransferError::Protocol(e.to_string()))?;
+        let sources = files
+            .iter()
+            .map(|file| (outgoing.sources[file.id as usize].clone(), file.len))
+            .collect();
+        let hashes = fingerprints(sources).await?;
+        control.send(&SenderMessage::Hashes { hashes }).await?;
+        answer = control.recv().await?;
+    }
+    let files = match answer {
         ReceiverMessage::Accept { files } => files,
         ReceiverMessage::Reject { reason } => return Err(TransferError::PeerDeclined(reason)),
         other => return Err(other.unexpected()),
     };
-    let entries = &outgoing.entries;
     offer::check_accept(entries, &files).map_err(|e| TransferError::Protocol(e.to_string()))?;
     let (tops, top_of) = offer::top_entries(entries);
     on_event(Event::Started {
@@ -631,15 +671,15 @@ impl Window {
 
 pub async fn receive_files(
     transport: &mut dyn Transport,
-    args: ReceiveArgs,
     accept: AcceptCb<'_>,
+    on_conflict: ConflictCb<'_>,
     on_event: EventCb<'_>,
 ) -> Result<(), TransferError> {
     // Over iroh the stream only shows up once the sender has written to it.
     let result = match timeout(HELLO_TIMEOUT, transport.control()).await {
         Ok(Ok(stream)) => {
             let mut control = Control::new(stream);
-            let result = receive(transport, &mut control, args, accept, on_event).await;
+            let result = receive(transport, &mut control, accept, on_conflict, on_event).await;
             explain(transport, &mut control, result, ReceiverMessage::Error).await
         }
         Ok(Err(e)) => Err(e),
@@ -652,8 +692,8 @@ pub async fn receive_files(
 async fn receive(
     transport: &mut dyn Transport,
     control: &mut ReceiverControl,
-    args: ReceiveArgs,
     accept: AcceptCb<'_>,
+    on_conflict: ConflictCb<'_>,
     on_event: EventCb<'_>,
 ) -> Result<(), TransferError> {
     control
@@ -685,12 +725,19 @@ async fn receive(
         .iter()
         .map(|entry| local_path(&out, entry.path()))
         .collect::<io::Result<Vec<_>>>()?;
-    let local = if args.resume {
-        local_sizes(&entries, &paths).await
+    let local = local_entries(&paths).await;
+    let checked = resume::to_check(&entries, &local);
+    let verified = if checked.is_empty() {
+        Vec::new()
     } else {
-        vec![None; entries.len()]
+        verify(control, &paths, checked).await?
     };
-    let files = offer::accept(&entries, &local);
+    let plan = resume::plan(&entries, &local, &verified);
+    let policy = match plan.conflicts.is_empty() {
+        true => ConflictPolicy::Skip,
+        false => on_conflict(&entries, &plan.conflicts),
+    };
+    let files = plan.accept(policy);
     control
         .send(&ReceiverMessage::Accept {
             files: files.clone(),
@@ -701,10 +748,8 @@ async fn receive(
         present: &offer::present(&entries, &files),
     });
 
-    for (entry, path) in entries.iter().zip(&paths) {
-        if entry.is_dir() {
-            tokio::fs::create_dir_all(path).await?;
-        }
+    for &id in &plan.dirs {
+        tokio::fs::create_dir_all(&paths[id as usize]).await?;
     }
     let mut incoming = if remaining(&entries, &files) > 0 {
         let stream = tokio::select! {
@@ -746,17 +791,53 @@ async fn receive(
     Ok(())
 }
 
-/// The size of the file already at each entry's path, if there is one.
-async fn local_sizes(entries: &[Entry], paths: &[PathBuf]) -> Vec<Option<u64>> {
-    let mut sizes = Vec::with_capacity(entries.len());
-    for (entry, path) in entries.iter().zip(paths) {
-        let metadata = match entry {
-            Entry::File { .. } => tokio::fs::metadata(path).await.ok(),
-            Entry::Dir { .. } => None,
-        };
-        sizes.push(metadata.filter(|m| m.is_file()).map(|m| m.len()));
+/// What is already at each path.
+async fn local_entries(paths: &[PathBuf]) -> Vec<Local> {
+    let mut local = Vec::with_capacity(paths.len());
+    for path in paths {
+        local.push(match tokio::fs::metadata(path).await {
+            Err(_) => Local::Missing,
+            Ok(m) if m.is_file() => Local::File { size: m.len() },
+            Ok(m) if m.is_dir() => Local::Dir,
+            Ok(_) => Local::Other,
+        });
     }
-    sizes
+    local
+}
+
+/// Asks the sender for fingerprints of the `checked` files; returns the ids of those that match ours.
+async fn verify(
+    control: &mut ReceiverControl,
+    paths: &[PathBuf],
+    checked: Vec<CheckedFile>,
+) -> Result<Vec<u32>, TransferError> {
+    control
+        .send(&ReceiverMessage::Check {
+            files: checked.clone(),
+        })
+        .await?;
+    let hashes = match control.recv().await? {
+        SenderMessage::Hashes { hashes } if hashes.len() == checked.len() => hashes,
+        SenderMessage::Hashes { .. } => {
+            return Err(TransferError::Protocol(
+                "the hashes do not match the check".into(),
+            ));
+        }
+        other => return Err(other.unexpected()),
+    };
+    let ours = fingerprints(
+        checked
+            .iter()
+            .map(|file| (paths[file.id as usize].clone(), file.len))
+            .collect(),
+    )
+    .await?;
+    Ok(checked
+        .iter()
+        .zip(ours.iter().zip(&hashes))
+        .filter(|(_, (ours, theirs))| ours == theirs)
+        .map(|(file, _)| file.id)
+        .collect())
 }
 
 /// The receiving end of the data stream, acking what it wrote.

@@ -38,9 +38,10 @@ pub enum Mode {
     /// Receive files or folders using a share code.
     #[clap(name = "receive", aliases = &["r"])]
     Receive {
-        /// Overwrite existing files instead of resuming them.
-        #[clap(long, short = 'f')]
-        overwrite: bool,
+        /// What to do with existing files that differ from the offered ones.
+        /// Partial copies are always resumed. Defaults to `ask`, or `skip` with `-y`.
+        #[clap(long, value_enum)]
+        on_conflict: Option<OnConflict>,
 
         /// Directory to write the received files into.
         #[clap(long, short, default_value = ".")]
@@ -56,4 +57,11 @@ pub enum Mode {
     /// Print the CLI and protocol versions.
     #[clap(name = "version", aliases = &["v"])]
     Version,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum OnConflict {
+    Ask,
+    Skip,
+    Replace,
 }

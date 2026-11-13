@@ -7,7 +7,7 @@ import {
 } from "../lib/files/storage";
 import { createDiskSink, createDownloadSink } from "../lib/transfer/sinks";
 import { createTransferRun, stepOf } from "./createTransferRun";
-import { CODE_LENGTH, type TopEntry } from "../lib/proto";
+import { CODE_LENGTH, type ConflictPolicy, type TopEntry } from "../lib/proto";
 
 export type ReceiveState =
   | "input"
@@ -33,7 +33,9 @@ export function createReceiveSession() {
   const [folder, setFolder] = createSignal<FileSystemDirectoryHandle | null>(
     null,
   );
-  const [resume, setResume] = createSignal(false);
+  const [policy, setPolicy] = createSignal<ConflictPolicy>("skip");
+  /// Existing files that differed from the offer, once the transfer started.
+  const [conflicts, setConflicts] = createSignal({ replaced: 0, skipped: 0 });
   /// 0-100 while the sink packs a zip, null when there is nothing to pack.
   const [packing, setPacking] = createSignal<number | null>(null);
 
@@ -58,6 +60,7 @@ export function createReceiveSession() {
     if (!isReady()) return;
     const signal = run.beginAttempt();
     setState("connecting");
+    setConflicts({ replaced: 0, skipped: 0 });
 
     const sink =
       mode() === "disk" ? createDiskSink(folder()!) : createDownloadSink();
@@ -65,7 +68,7 @@ export function createReceiveSession() {
     runReceive(
       code(),
       sink,
-      resume(),
+      policy(),
       (event) => {
         switch (event.type) {
           case "connecting":
@@ -83,6 +86,9 @@ export function createReceiveSession() {
           case "transferring":
             run.tracker.initialize(event.entries);
             setState("transferring");
+            break;
+          case "conflicts":
+            setConflicts({ replaced: event.replaced, skipped: event.skipped });
             break;
           case "progress":
             run.tracker.recordBytes(event.entry, event.bytes);
@@ -133,8 +139,9 @@ export function createReceiveSession() {
     setCode: setCodeRaw,
     offered,
     folder,
-    resume,
-    setResume,
+    policy,
+    setPolicy,
+    conflicts,
     packing,
     isReady,
     chooseFolder,

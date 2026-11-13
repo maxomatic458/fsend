@@ -160,6 +160,7 @@ export function makeRecorder({ onOffered } = {}) {
     /// Bytes present per entry by the end.
     present: null,
     connectionType: null,
+    conflicts: null,
   };
 
   const emit = (event) => {
@@ -183,6 +184,9 @@ export function makeRecorder({ onOffered } = {}) {
         break;
       case "connectionType":
         record.connectionType = event.kind;
+        break;
+      case "conflicts":
+        record.conflicts = { replaced: event.replaced, skipped: event.skipped };
         break;
       case "complete":
         record.complete = true;
