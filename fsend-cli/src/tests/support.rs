@@ -22,6 +22,24 @@ pub fn bytes(size: usize, seed: u8) -> Vec<u8> {
         .collect()
 }
 
+/// Deterministic lorem ipsum in random order, which zstd shrinks a few times.
+pub fn text(size: usize) -> Vec<u8> {
+    let words: Vec<_> = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua enim ad minim veniam quis nostrud exercitation ullamco laboris nisi aliquip ex ea commodo consequat duis aute irure in reprehenderit voluptate velit esse cillum fugiat nulla pariatur excepteur sint occaecat cupidatat non proident sunt culpa qui officia deserunt mollit anim id est laborum"
+        .split(' ')
+        .collect();
+    let mut state = 0x2545_F491u32;
+    let mut out = Vec::with_capacity(size + 16);
+    while out.len() < size {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        out.extend_from_slice(words[state as usize % words.len()].as_bytes());
+        out.push(b' ');
+    }
+    out.truncate(size);
+    out
+}
+
 pub fn write(path: &Path, data: &[u8]) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).unwrap();
@@ -585,6 +603,35 @@ pub mod suite {
             );
             assert_eq!(side.moved, 3 * MAX_BLOCK_BYTES as u64);
         }
+    }
+
+    /// Sending compressible data must not be slower than sending incompressible data.
+    pub async fn compression_is_no_bottleneck(pair: PairFn) {
+        const SIZE: usize = 256 << 20;
+        let mut secs = Vec::new();
+        for (name, data) in [("noise.bin", bytes(SIZE, 9)), ("text.txt", text(SIZE))] {
+            let f = fixture();
+            write(&f.src.join(name), &data);
+            drop(data);
+            let start = std::time::Instant::now();
+            let o = run(
+                pair().await,
+                vec![f.src.join(name)],
+                &f.out,
+                RunOptions::default(),
+            )
+            .await;
+            o.unwrap();
+            let took = start.elapsed().as_secs_f64();
+            println!("{name}: {:.0} MiB/s", SIZE as f64 / (1 << 20) as f64 / took);
+            secs.push(took);
+        }
+        assert!(
+            secs[1] <= secs[0] * 1.1,
+            "text took {:.2} s, noise {:.2} s",
+            secs[1],
+            secs[0]
+        );
     }
 
     pub async fn resumes_a_partial_file(pair: PairFn) {

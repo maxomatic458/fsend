@@ -17,8 +17,8 @@ export type FolderKind = "picked" | "browser";
 export function hasFileSystemAccess(): boolean {
   return (
     typeof window !== "undefined" &&
-    "showOpenFilePicker" in window &&
-    "showDirectoryPicker" in window
+    typeof window.showOpenFilePicker === "function" &&
+    typeof window.showDirectoryPicker === "function"
   );
 }
 

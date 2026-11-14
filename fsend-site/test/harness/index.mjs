@@ -2,14 +2,14 @@
  * Installs the fake browser environment and provides the helpers the scenarios
  * are written against.
  */
-import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { installWebRtc, resetWebRtc } from "./webrtc.mjs";
 import { installRelay, resetRelay } from "./relay.mjs";
 import { installDom, resetDom, getDownloads } from "./dom.mjs";
 import { MemoryDirectoryHandle } from "./fs-access.mjs";
+import { unzip } from "./zip.mjs";
 
-export { MemoryDirectoryHandle, getDownloads };
+export { MemoryDirectoryHandle, getDownloads, unzip };
 
 // The app loads its wasm with fetch(); hand it the bytes up front instead.
 const { initSync } = await import("../.build/app.mjs");
@@ -236,34 +236,4 @@ export function jsonFrame(json) {
   new DataView(frame.buffer).setUint32(0, payload.length + 1);
   frame.set(payload, 5);
   return frame;
-}
-
-/** The files of a stored (uncompressed) zip, as `{ "path/to/file": Uint8Array }`; folders are left out. */
-export async function unzip(blob) {
-  const bytes = new Uint8Array(await blob.arrayBuffer());
-  const view = new DataView(bytes.buffer);
-  let end = bytes.length - 22;
-  while (view.getUint32(end, true) !== 0x06054b50) end--;
-  const count = view.getUint16(end + 10, true);
-  let at = view.getUint32(end + 16, true);
-  const files = {};
-  for (let i = 0; i < count; i++) {
-    assert.equal(view.getUint32(at, true), 0x02014b50, "central header");
-    const size = view.getUint32(at + 20, true);
-    const nameLen = view.getUint16(at + 28, true);
-    const skip =
-      nameLen + view.getUint16(at + 30, true) + view.getUint16(at + 32, true);
-    const local = view.getUint32(at + 42, true);
-    const name = new TextDecoder().decode(
-      bytes.subarray(at + 46, at + 46 + nameLen),
-    );
-    const data =
-      local +
-      30 +
-      view.getUint16(local + 26, true) +
-      view.getUint16(local + 28, true);
-    if (!name.endsWith("/")) files[name] = bytes.slice(data, data + size);
-    at += 46 + skip;
-  }
-  return files;
 }

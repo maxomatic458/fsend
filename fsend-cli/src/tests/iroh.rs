@@ -57,6 +57,12 @@ fn pair() -> Pin<Box<dyn Future<Output = Peers> + Send>> {
     })
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "timing: cargo test --release -p fsend-cli -- --ignored"]
+async fn compression_is_no_bottleneck() {
+    crate::transfer::test_support::suite::compression_is_no_bottleneck(pair).await
+}
+
 // The behaviour every transport must have.
 transport_suite!();
 

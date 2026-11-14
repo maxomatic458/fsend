@@ -313,3 +313,86 @@ mod tests {
         encode(&[], true);
     }
 }
+
+#[cfg(test)]
+mod speed {
+    use std::time::Instant;
+
+    use super::*;
+
+    const MIB: f64 = 1024.0 * 1024.0;
+    /// On one core, more than browsers send over WebRTC; the CLI compresses
+    /// on four, which beats iroh on a 2.5 Gbit/s link.
+    const MIN_MIB_PER_SEC: f64 = 150.0;
+
+    /// Lorem ipsum in random order, which zstd shrinks a few times.
+    fn text(len: usize) -> Vec<u8> {
+        let words: Vec<_> = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua enim ad minim veniam quis nostrud exercitation ullamco laboris nisi aliquip ex ea commodo consequat duis aute irure in reprehenderit voluptate velit esse cillum fugiat nulla pariatur excepteur sint occaecat cupidatat non proident sunt culpa qui officia deserunt mollit anim id est laborum"
+            .split(' ')
+            .collect();
+        let mut state = 0x2545_F491u32;
+        let mut out = Vec::with_capacity(len + 16);
+        while out.len() < len {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            out.extend_from_slice(words[state as usize % words.len()].as_bytes());
+            out.push(b' ');
+        }
+        out.truncate(len);
+        out
+    }
+
+    fn noise(len: usize) -> Vec<u8> {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        (0..len / 8)
+            .flat_map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()
+            })
+            .collect()
+    }
+
+    /// MiB/s of encoding then decoding `data` a block at a time.
+    fn rates(data: &[u8]) -> (f64, f64, f64) {
+        let start = Instant::now();
+        let blocks: Vec<_> = data
+            .chunks(MAX_BLOCK_BYTES)
+            .map(|block| encode(block, true))
+            .collect();
+        let encode_rate = data.len() as f64 / MIB / start.elapsed().as_secs_f64();
+        let wire: usize = blocks.iter().map(Vec::len).sum();
+
+        let start = Instant::now();
+        let mut decoder = BlockDecoder::default();
+        let mut out = 0;
+        for block in &blocks {
+            decoder.push(block);
+            out += decoder.next_block().unwrap().unwrap().len();
+        }
+        let decode_rate = data.len() as f64 / MIB / start.elapsed().as_secs_f64();
+        assert_eq!(out, data.len());
+        (encode_rate, decode_rate, data.len() as f64 / wire as f64)
+    }
+
+    #[test]
+    #[ignore = "timing: cargo test --release -p fsend-proto -- --ignored"]
+    fn compression_keeps_up_with_fast_links() {
+        for (name, data) in [("text", text(256 << 20)), ("noise", noise(256 << 20))] {
+            let (encode, decode, ratio) = rates(&data);
+            println!(
+                "{name}: encode {encode:.0} MiB/s, decode {decode:.0} MiB/s, ratio {ratio:.2}"
+            );
+            assert!(
+                encode >= MIN_MIB_PER_SEC,
+                "{name}: encode {encode:.0} MiB/s"
+            );
+            assert!(
+                decode >= MIN_MIB_PER_SEC,
+                "{name}: decode {decode:.0} MiB/s"
+            );
+        }
+    }
+}

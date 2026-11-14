@@ -252,6 +252,17 @@ impl Progress {
         match event {
             Event::Offered => println!("Waiting for peer to accept files..."),
             Event::Started { entries, present } => {
+                let (here, total) = (
+                    present.iter().sum::<u64>(),
+                    entries.iter().map(|e| e.size).sum(),
+                );
+                if here > 0 {
+                    println!(
+                        "Already there: {} of {}",
+                        HumanBytes(here),
+                        HumanBytes(total)
+                    );
+                }
                 let initial: Vec<_> = entries
                     .iter()
                     .zip(present)

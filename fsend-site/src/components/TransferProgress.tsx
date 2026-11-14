@@ -78,7 +78,14 @@ export function TransferProgress(props: TransferProgressProps) {
         </div>
       </div>
 
-      <div class="h-2 rounded bg-track overflow-hidden">
+      <div
+        role="progressbar"
+        aria-label="Transfer Progress"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={Math.floor(pct())}
+        class="h-2 rounded bg-track overflow-hidden"
+      >
         <div
           class="h-full bg-gradient-to-r from-azure/40 to-azure"
           style={{ width: `${pct()}%` }}

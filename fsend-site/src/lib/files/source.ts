@@ -31,8 +31,16 @@ function pickViaInput(opts: {
     input.type = "file";
     if (opts.multiple) input.multiple = true;
     if (opts.directory) input.webkitdirectory = true;
+    // Some browsers only report the choice for an input in the document.
+    input.hidden = true;
+    document.body.append(input);
+    input.oncancel = () => {
+      input.remove();
+      resolve([]);
+    };
 
     input.onchange = () => {
+      input.remove();
       const picked = Array.from(input.files ?? []);
       if (picked.length === 0) return resolve([]);
 
