@@ -1,4 +1,4 @@
-import { createEffect, Show } from "solid-js";
+import { createEffect, on, Show } from "solid-js";
 import { useLocation, useNavigate } from "@solidjs/router";
 import { Title, Meta, Link } from "@solidjs/meta";
 import { FiFolder } from "solid-icons/fi";
@@ -32,9 +32,19 @@ export function ReceivePage() {
   const exitGuard = createExitGuard(receive.isTransferring);
 
   // Share links carry the code in the fragment, which never reaches a server.
-  createEffect(() => {
-    if (location.hash) receive.setCode(location.hash.slice(1));
-  });
+  // Once read it is dropped, so opening the same link again counts as new.
+  createEffect(
+    on(
+      () => location.hash,
+      (hash) => {
+        if (!hash) return;
+        receive.openLink(hash.slice(1));
+        exitGuard.withoutPrompt(() =>
+          navigate(location.pathname, { replace: true, scroll: false }),
+        );
+      },
+    ),
+  );
 
   const goBack = () => navigate("/");
   const cancelTransfer = () => exitGuard.withoutPrompt(goBack);
@@ -49,6 +59,20 @@ export function ReceivePage() {
         cancelLabel="Keep downloading"
         onConfirm={exitGuard.confirm}
         onCancel={exitGuard.cancel}
+      />
+
+      <ConfirmDialog
+        open={receive.pendingLink() !== null}
+        title="Receive From the New Link?"
+        message={
+          toFs()
+            ? "This cancels the current transfer. What has arrived so far stays, so it can resume later."
+            : "This cancels the current transfer."
+        }
+        confirmLabel="Cancel and Switch"
+        cancelLabel="Keep Transfer"
+        onConfirm={receive.switchToLink}
+        onCancel={receive.keepTransfer}
       />
 
       <Title>Receive Files — fsend</Title>

@@ -10,6 +10,7 @@ export { BrowserStorage } from "../src/lib/files/storage";
 export { watchDisconnect } from "../src/lib/transport/webrtc";
 export { DATA_CHUNK_BYTES, MAX_BUFFERED_BYTES } from "../src/config";
 export { createSendSession } from "../src/primitives/createSendSession";
+export { createReceiveSession } from "../src/primitives/createReceiveSession";
 export { createProgressTracker } from "../src/primitives/createProgressTracker";
 export { summarize } from "../src/lib/stats";
 export { createRoot } from "solid-js";

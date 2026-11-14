@@ -72,6 +72,11 @@ export function createReceiveSession() {
 
   let accept: (() => void) | null = null;
   let reject: (() => void) | null = null;
+  /// Events of earlier attempts are ignored; one may still be winding down.
+  let attempt = 0;
+  let previous: Promise<unknown> = Promise.resolve();
+  /// A share link opened while a transfer runs, until the user decides.
+  const [pendingLink, setPendingLink] = createSignal<string | null>(null);
 
   const chooseFolder = async () => {
     if (mode() !== "fs" || kind() !== "picked") return;
@@ -91,6 +96,10 @@ export function createReceiveSession() {
   const start = () => {
     if (!isReady()) return;
     const signal = run.beginAttempt();
+    const current = ++attempt;
+    const onEvent = (event: TransferEvent) => {
+      if (current === attempt) handle(event);
+    };
     setState("connecting");
     setConflicts({ replaced: 0, skipped: 0 });
 
@@ -112,19 +121,56 @@ export function createReceiveSession() {
         signal,
       );
     if (!staging) {
-      void receive();
+      previous = receive();
       return;
     }
-    void staging.exclusive(receive).then((ran) => {
-      if (ran) return;
-      run.setError(
-        "Another tab is receiving into browser storage. Finish that transfer first, or choose Download as Zip.",
-      );
-      setState("error");
-    });
+    // A cancelled attempt holds the storage until it has wound down.
+    previous = previous
+      .then(() => staging.exclusive(receive))
+      .then((ran) => {
+        if (ran || current !== attempt) return;
+        run.setError(
+          "Another tab is receiving into browser storage. Finish that transfer first, or choose Download as Zip.",
+        );
+        setState("error");
+      });
   };
 
-  const onEvent = (event: TransferEvent) => {
+  /// Back to entering a code, cancelling whatever attempt is running.
+  const reset = () => {
+    attempt++;
+    run.abort();
+    run.setError("");
+    accept = reject = null;
+    setOffered([]);
+    setConflicts({ replaced: 0, skipped: 0 });
+    setPacking(null);
+    setState("input");
+  };
+
+  /// Whether an attempt is underway, so a new link would cancel it.
+  const isBusy = () => !["input", "completed", "error"].includes(state());
+
+  /// A share link opened on this page: its code replaces the last session,
+  /// unless a transfer is running, which the user is asked about first.
+  const openLink = (link: string) => {
+    if (isBusy()) {
+      setPendingLink(link);
+      return;
+    }
+    if (state() !== "input") reset();
+    setCodeRaw(link);
+  };
+
+  const switchToLink = () => {
+    const link = pendingLink();
+    setPendingLink(null);
+    if (link === null) return;
+    reset();
+    setCodeRaw(link);
+  };
+
+  const handle = (event: TransferEvent) => {
     switch (event.type) {
       case "connecting":
         setState("connecting");
@@ -191,6 +237,10 @@ export function createReceiveSession() {
     step: () => stepOf(state(), "input"),
     code,
     setCode: setCodeRaw,
+    openLink,
+    pendingLink,
+    switchToLink,
+    keepTransfer: () => setPendingLink(null),
     offered,
     folder,
     policy,
@@ -204,9 +254,6 @@ export function createReceiveSession() {
     start,
     acceptOffer,
     rejectOffer: () => reject?.(),
-    retry: () => {
-      run.setError("");
-      setState("input");
-    },
+    retry: reset,
   };
 }

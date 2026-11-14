@@ -20,6 +20,14 @@ export function createExitGuard(isBlocking: () => boolean) {
       return;
     }
     if (!isBlocking()) return;
+    // Staying on this page with a new fragment, such as another share link,
+    // is the page's own business. Back and forward give only a step count;
+    // the browser is already at the new entry by then.
+    const to =
+      typeof e.to === "string"
+        ? new URL(e.to, window.location.href).pathname
+        : window.location.pathname;
+    if (to === e.from.pathname) return;
     e.preventDefault();
     setPendingRetry(() => () => e.retry(true));
   });

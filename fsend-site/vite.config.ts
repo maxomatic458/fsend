@@ -23,6 +23,9 @@ export default defineConfig(({ isSsrBuild }) => ({
   server: {
     port: 3000,
   },
+  optimizeDeps: {
+    include: ["solid-devtools/setup"],
+  },
   build: {
     target: "esnext",
   },
