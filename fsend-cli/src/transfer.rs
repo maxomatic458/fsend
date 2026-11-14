@@ -343,7 +343,6 @@ fn fingerprint(path: &Path, len: u64) -> io::Result<Fingerprint> {
 /// Finishes a received file.
 pub async fn finish_received_file(file: &mut File, size: u64) -> io::Result<()> {
     file.set_len(size).await?;
-    file.sync_all().await?;
     file.shutdown().await
 }
 
