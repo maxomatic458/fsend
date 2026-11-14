@@ -29,4 +29,8 @@ export default defineConfig(({ isSsrBuild }) => ({
   build: {
     target: "esnext",
   },
+  // Workers are started as modules.
+  worker: {
+    format: "es",
+  },
 }));

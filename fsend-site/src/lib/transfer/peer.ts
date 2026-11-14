@@ -83,6 +83,12 @@ class Inbox<T> {
     this.waiting = undefined;
   }
 
+  /** The next item, if it has already arrived and `take` wants it. */
+  pollIf(take: (item: T) => boolean): T | undefined {
+    if (this.items.length > 0 && take(this.items[0])) return this.items.shift();
+    return undefined;
+  }
+
   /** An item that has already arrived, if any. */
   poll(): T | undefined {
     if (this.items.length > 0) return this.items.shift();
@@ -192,6 +198,12 @@ export class Peer<Out extends PeerMessage, In extends PeerMessage> {
   /** The next message; data is not allowed here. */
   async next(timeoutMs?: number, what?: string): Promise<In> {
     return message(await this.inbox.next(timeoutMs, what));
+  }
+
+  /** A data chunk that has already arrived, if it is next. */
+  pollData(): Uint8Array | undefined {
+    return this.inbox.pollIf((item) => item instanceof Uint8Array) as
+      Uint8Array | undefined;
   }
 
   /** A message that has already arrived, if any. */

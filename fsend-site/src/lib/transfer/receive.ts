@@ -7,7 +7,6 @@ import {
   HELLO_TIMEOUT_MS,
   IDLE_TIMEOUT_MS,
   RECV_WINDOW,
-  BlockDecoder,
   Progress,
   acceptPlan,
   filesToCheck,
@@ -15,6 +14,7 @@ import {
   presentBytes,
   topEntries,
   validateOffer,
+  type AcceptedFile,
   type CheckedFile,
   type ConflictPolicy,
   type Entry,
@@ -32,6 +32,7 @@ import {
 } from "./peer";
 import type { TransferSink } from "./sinks";
 import type { TransferListener } from "./events";
+import { createCodec, type BlockCodec } from "./codec";
 
 const SENDER_IDLE = "the sender stopped sending";
 
@@ -146,41 +147,66 @@ async function receive(
   }
 
   for (const id of plan.dirs) await sink.createDir(entries[id].path);
+  const codec = files.some(({ id, offset }) => entrySize(entries[id]) > offset)
+    ? await createCodec()
+    : undefined;
+  try {
+    await receiveData(peer, sink, entries, files, topOf, codec, emit);
+  } finally {
+    codec?.close();
+  }
+
+  peer.send({ type: "done" });
+  await peer.goodbye();
+  return { entries, tops };
+}
+
+/** Writes the accepted files from the data stream into `sink`, acking as it goes. */
+async function receiveData(
+  peer: ReceiverPeer,
+  sink: TransferSink,
+  entries: Entry[],
+  files: AcceptedFile[],
+  topOf: number[],
+  codec: BlockCodec | undefined,
+  emit: TransferListener,
+): Promise<void> {
   let written = 0;
   let acked = 0;
   let ackedAt = performance.now();
-  const decoder = new BlockDecoder();
   // File bytes count as their blocks arrive, in proportion.
   const progress = new Progress(entries, files, topOf);
   let decoded = 0;
   let arrived = 0;
-  const countArrived = () => {
-    const now = decoded + decoder.partial();
-    if (now <= arrived) return;
-    for (const [entry, n] of progress.advance(now - arrived)) {
-      emit({ type: "progress", entry, bytes: n });
-    }
-    arrived = now;
-  };
+  const blocks: Uint8Array[] = [];
+  let empty = true;
   const nextBlock = async () => {
-    for (;;) {
-      let block;
+    while (blocks.length === 0) {
+      const first = await peer.receive(IDLE_TIMEOUT_MS, SENDER_IDLE);
+      // The sender says nothing while it sends.
+      if (!(first instanceof Uint8Array)) throw unexpected(first);
+      const chunks = [first];
+      for (let more = peer.pollData(); more; more = peer.pollData()) {
+        chunks.push(more);
+      }
+      let batch;
       try {
-        block = decoder.next();
+        batch = await codec!.decode(chunks);
       } catch (err) {
         throw protocolError(messageOf(err));
       }
-      if (block) {
-        decoded += block.length;
-        countArrived();
-        return block;
+      blocks.push(...batch.blocks);
+      empty = batch.empty;
+      decoded += batch.blocks.reduce((n, block) => n + block.length, 0);
+      const now = decoded + batch.partial;
+      if (now > arrived) {
+        for (const [entry, n] of progress.advance(now - arrived)) {
+          emit({ type: "progress", entry, bytes: n });
+        }
+        arrived = now;
       }
-      const chunk = await peer.receive(IDLE_TIMEOUT_MS, SENDER_IDLE);
-      // The sender says nothing while it sends.
-      if (!(chunk instanceof Uint8Array)) throw unexpected(chunk);
-      decoder.push(chunk);
-      countArrived();
     }
+    return blocks.shift()!;
   };
   // The rest of a block that ends one file and starts the next.
   let pending: Uint8Array | undefined;
@@ -206,13 +232,9 @@ async function receive(
     }
     await sink.closeFile();
   }
-  if (pending || !decoder.isEmpty()) {
+  if (pending || blocks.length > 0 || !empty) {
     throw protocolError("the sender sent more bytes than accepted");
   }
-
-  peer.send({ type: "done" });
-  await peer.goodbye();
-  return { entries, tops };
 }
 
 /** Asks the sender for fingerprints of the `checked` files; returns the ids of those that match ours. */

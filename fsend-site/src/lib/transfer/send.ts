@@ -14,7 +14,6 @@ import {
   MIN_RECV_WINDOW,
   checkAccept,
   checkLengths,
-  encodeBlock,
   Progress,
   encodeOffer,
   loadProto,
@@ -34,9 +33,12 @@ import {
   unexpected,
 } from "./peer";
 import type { TransferListener } from "./events";
+import { createCodec } from "./codec";
 import type { SelectedEntry } from "../types";
 
 const RECEIVER_IDLE = "the receiver stopped responding";
+/// Blocks compressing while one is sent.
+const ENCODING_AHEAD = 3;
 
 export async function runSend(
   entries: SelectedEntry[],
@@ -133,16 +135,35 @@ async function send(
   channel.bufferedAmountLowThreshold = MAX_BUFFERED_BYTES / 2;
   const reader = new BlockReader(entries, sources, files);
   const progress = new Progress(entries, files, topOf);
-  while (!reader.done) {
-    // Also notices a peer that is gone.
-    for (let m = peer.poll(); m; m = peer.poll()) ack(m);
-    while (sent - acked >= window) {
-      ack(await peer.next(IDLE_TIMEOUT_MS, RECEIVER_IDLE));
+  const codec = reader.done ? undefined : await createCodec();
+  try {
+    const encoding: { size: number; frame: Promise<Uint8Array> }[] = [];
+    while (!reader.done || encoding.length > 0) {
+      for (let m = peer.poll(); m; m = peer.poll()) ack(m);
+      while (
+        encoding.length < ENCODING_AHEAD &&
+        !reader.done &&
+        sent - acked < window
+      ) {
+        const bytes = await reader.read(window - (sent - acked));
+        sent += bytes.length;
+        const frame = codec!.encode(bytes);
+        frame.catch(() => {});
+        encoding.push({ size: bytes.length, frame });
+      }
+      const next = encoding.shift();
+      if (!next) {
+        ack(await peer.next(IDLE_TIMEOUT_MS, RECEIVER_IDLE));
+        continue;
+      }
+      await sendBlock(next.size, await next.frame);
     }
-    const bytes = await reader.read(window - (sent - acked));
-    const block = encodeBlock(bytes);
-    sent += bytes.length;
-    // The block's file bytes count in proportion to its bytes sent.
+  } finally {
+    codec?.close();
+  }
+
+  /** Sends a block of `size` file bytes, which count in proportion to its bytes sent. */
+  async function sendBlock(size: number, block: Uint8Array) {
     let counted = 0;
     for (let offset = 0; offset < block.length; offset += DATA_CHUNK_BYTES) {
       if (channel.bufferedAmount > MAX_BUFFERED_BYTES) {
@@ -153,7 +174,7 @@ async function send(
       }
       const end = Math.min(offset + DATA_CHUNK_BYTES, block.length);
       channel.send(block.slice(offset, end));
-      const now = Math.floor((bytes.length * end) / block.length);
+      const now = Math.floor((size * end) / block.length);
       for (const [entry, n] of progress.advance(now - counted)) {
         emit({ type: "progress", entry, bytes: n });
       }
