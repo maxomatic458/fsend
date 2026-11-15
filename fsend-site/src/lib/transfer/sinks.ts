@@ -21,6 +21,8 @@ export interface TransferSink {
   /// Throws unless `remaining` more bytes fit, of an offer of `total`.
   reserve(remaining: number, total: number): Promise<void>;
   createDir(path: string[]): Promise<void>;
+  /// Writes the rest of a file, from `offset` on, in one go; several may run at once.
+  writeFile(path: string[], offset: number, data: Uint8Array): Promise<void>;
   /// Opens a file to write from `offset` on; at 0 whatever was there is dropped.
   open(path: string[], offset: number): Promise<void>;
   write(chunk: Uint8Array): Promise<void>;
@@ -44,11 +46,19 @@ export function createFolderSink(
   let writable: FileSystemWritableFileStream | null = null;
   let tops: TopEntry[] = [];
 
-  const dirOf = async (path: string[], create: boolean) => {
-    let dir = dirHandle;
-    for (const name of path) {
-      dir = await dir.getDirectoryHandle(name, { create });
-    }
+  // Handles of the directories reached so far, by path.
+  const dirs = new Map<string, FileSystemDirectoryHandle>([["", dirHandle]]);
+  const dirOf = async (
+    path: string[],
+    create: boolean,
+  ): Promise<FileSystemDirectoryHandle> => {
+    const cached = dirs.get(path.join("/"));
+    if (cached) return cached;
+    const parent = await dirOf(path.slice(0, -1), create);
+    const dir = await parent.getDirectoryHandle(path[path.length - 1], {
+      create,
+    });
+    dirs.set(path.join("/"), dir);
     return dir;
   };
 
@@ -57,15 +67,31 @@ export function createFolderSink(
     return dir.getFileHandle(path[path.length - 1]);
   };
 
-  const probe = async (dir: FileSystemDirectoryHandle, name: string) => {
-    try {
-      const file = await dir.getFileHandle(name);
-      return { kind: "file", size: (await file.getFile()).size } as const;
-    } catch (err) {
-      return (err as DOMException).name === "TypeMismatchError"
-        ? ({ kind: "dir" } as const)
-        : ({ kind: "missing" } as const);
+  // What each directory held when first probed, so a path costs no call of its own.
+  const listings = new Map<
+    string,
+    Promise<Map<string, FileSystemHandle> | null>
+  >();
+  const listingOf = (path: string[]) => {
+    const key = path.join("/");
+    let listing = listings.get(key);
+    if (!listing) {
+      listing = (async () => {
+        let dir: FileSystemDirectoryHandle;
+        try {
+          dir = await dirOf(path, false);
+        } catch {
+          return null;
+        }
+        const children = new Map<string, FileSystemHandle>();
+        for await (const [name, handle] of dir.entries()) {
+          children.set(name, handle);
+        }
+        return children;
+      })();
+      listings.set(key, listing);
     }
+    return listing;
   };
 
   return {
@@ -75,20 +101,29 @@ export function createFolderSink(
     },
 
     async probe(entry) {
-      let dir: FileSystemDirectoryHandle;
-      try {
-        dir = await dirOf(entry.path.slice(0, -1), false);
-      } catch {
-        return { kind: "missing" };
-      }
+      const parent = entry.path.slice(0, -1);
       const name = entry.path[entry.path.length - 1];
-      const local = await probe(dir, name);
+      const handle = (await listingOf(parent))?.get(name);
+      if (!handle) return { kind: "missing" };
+      const kind = handle.kind === "directory" ? "dir" : "file";
       // Browser storage only holds earlier transfers, so whatever is in the way is stale.
-      if (storage && local.kind !== "missing" && local.kind !== entry.kind) {
-        await dir.removeEntry(name, { recursive: true });
+      if (storage && kind !== entry.kind) {
+        await (
+          await dirOf(parent, false)
+        ).removeEntry(name, {
+          recursive: true,
+        });
+        const path = entry.path.join("/");
+        for (const key of dirs.keys()) {
+          if (key === path || key.startsWith(`${path}/`)) dirs.delete(key);
+        }
         return { kind: "missing" };
       }
-      return local;
+      if (kind === "dir") return { kind };
+      return {
+        kind,
+        size: (await (handle as FileSystemFileHandle).getFile()).size,
+      };
     },
 
     async read(path) {
@@ -111,6 +146,19 @@ export function createFolderSink(
 
     async createDir(path) {
       await dirOf(path, true);
+    },
+
+    async writeFile(path, offset, data) {
+      const dir = await dirOf(path.slice(0, -1), true);
+      const file = await dir.getFileHandle(path[path.length - 1], {
+        create: true,
+      });
+      const writable = await file.createWritable({
+        keepExistingData: offset > 0,
+      });
+      if (offset > 0) await writable.seek(offset);
+      await writable.write(data as unknown as BufferSource);
+      await writable.close();
     },
 
     async open(path, offset) {
@@ -170,6 +218,10 @@ export function createZipSink(): TransferSink {
 
     async createDir(path) {
       dirs.push(path.join("/"));
+    },
+
+    async writeFile(path, _, data) {
+      files.set(path.join("/"), new Blob([data as BlobPart]));
     },
 
     async open(path) {

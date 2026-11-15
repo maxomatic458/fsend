@@ -35,6 +35,8 @@ import type { TransferListener } from "./events";
 import { createCodec, type BlockCodec } from "./codec";
 
 const SENDER_IDLE = "the sender stopped sending";
+/// How many files can be written at once.
+const CONCURRENT_WRITES = 8;
 
 /// Receives a transfer into `sink`; files there that differ from the offer are handled by `policy`.
 export async function runReceive(
@@ -208,11 +210,45 @@ async function receiveData(
     }
     return blocks.shift()!;
   };
+  const wrote = (n: number) => {
+    written += n;
+    if (
+      written - acked >= ACK_STEP ||
+      performance.now() - ackedAt >= ACK_INTERVAL_MS
+    ) {
+      peer.send({ type: "ack", bytes: written });
+      acked = written;
+      ackedAt = performance.now();
+    }
+  };
+  // Whole files being written.
+  const writing: { bytes: number; done: Promise<void> }[] = [];
+  const settle = async () => {
+    const { bytes, done } = writing.shift()!;
+    await done;
+    wrote(bytes);
+  };
   // The rest of a block that ends one file and starts the next.
   let pending: Uint8Array | undefined;
   for (const { id, offset } of files) {
     const entry = entries[id];
     const size = entrySize(entry);
+    const rest = size - offset;
+    if (rest > 0 && !pending) pending = await nextBlock();
+    // A file that has arrived in full
+    if (rest <= (pending?.length ?? 0)) {
+      const data = pending?.subarray(0, rest) ?? new Uint8Array(0);
+      if (pending) {
+        pending = rest < pending.length ? pending.subarray(rest) : undefined;
+      }
+      const done = sink.writeFile(entry.path, offset, data);
+      done.catch(() => {});
+      writing.push({ bytes: rest, done });
+      if (writing.length >= CONCURRENT_WRITES) await settle();
+      continue;
+    }
+    // Written as it arrives, once the files before it are done.
+    while (writing.length > 0) await settle();
     await sink.open(entry.path, offset);
     for (let position = offset; position < size;) {
       const block = pending ?? (await nextBlock());
@@ -220,18 +256,11 @@ async function receiveData(
       await sink.write(block.subarray(0, n));
       pending = n < block.length ? block.subarray(n) : undefined;
       position += n;
-      written += n;
-      if (
-        written - acked >= ACK_STEP ||
-        performance.now() - ackedAt >= ACK_INTERVAL_MS
-      ) {
-        peer.send({ type: "ack", bytes: written });
-        acked = written;
-        ackedAt = performance.now();
-      }
+      wrote(n);
     }
     await sink.closeFile();
   }
+  while (writing.length > 0) await settle();
   if (pending || blocks.length > 0 || !empty) {
     throw protocolError("the sender sent more bytes than accepted");
   }

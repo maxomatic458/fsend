@@ -12,6 +12,7 @@ import {
   bytes,
   waitFor,
   jsonFrame,
+  sleep,
   unzip,
 } from "./harness/index.mjs";
 
@@ -52,7 +53,10 @@ function assertFiles(actual, expected) {
  * Runs a sender and a native-FS receiver against each other.
  * Returns once both have settled.
  */
-async function transfer(spec, { mode = "file", policy = "skip", dir } = {}) {
+async function transfer(
+  spec,
+  { mode = "file", policy = "skip", dir, sink } = {},
+) {
   const dirHandle = dir ?? new MemoryDirectoryHandle();
   const send = makeRecorder();
   const recv = makeRecorder();
@@ -66,7 +70,7 @@ async function transfer(spec, { mode = "file", policy = "skip", dir } = {}) {
   const code = await waitFor(() => send.record.code, { label: "share code" });
   const receiverDone = runReceive(
     code,
-    createFolderSink(dirHandle),
+    sink ?? createFolderSink(dirHandle),
     policy,
     recv.emit,
     new AbortController().signal,
@@ -75,6 +79,55 @@ async function transfer(spec, { mode = "file", policy = "skip", dir } = {}) {
   await Promise.all([senderDone, receiverDone]);
   return { dirHandle, send: send.record, recv: recv.record };
 }
+
+/** Many small files around one larger than a block, in nested folders. */
+function manyFiles() {
+  const small = (seed) =>
+    Object.fromEntries(
+      Array.from({ length: 150 }, (_, i) => [
+        `f${i}.bin`,
+        bytes(i * 37, seed + i),
+      ]),
+    );
+  return {
+    a: small(1000),
+    "big.bin": bytes(1_500_000, 7),
+    b: { c: small(2000), "empty.txt": new Uint8Array(0) },
+  };
+}
+
+describe("many small files", () => {
+  test("arrive intact in a folder", async () => {
+    const spec = manyFiles();
+    const { dirHandle, recv } = await transfer(spec);
+    assert.equal(recv.error, null);
+    assertFiles(dirHandle.snapshot(), expectedSnapshot(spec));
+  });
+
+  test("arrive intact in a zip", async () => {
+    const spec = manyFiles();
+    const { recv } = await transfer(spec, { sink: createZipSink() });
+    assert.equal(recv.error, null);
+    assertFiles(await unzip(getDownloads()[0].blob), expectedSnapshot(spec));
+  });
+
+  test("arrive intact when writes finish slowly and out of order", async () => {
+    const spec = manyFiles();
+    const dirHandle = new MemoryDirectoryHandle();
+    const folder = createFolderSink(dirHandle);
+    let n = 0;
+    const sink = {
+      ...folder,
+      writeFile: async (...args) => {
+        await sleep((n++ % 4) * 3);
+        return folder.writeFile(...args);
+      },
+    };
+    const { recv } = await transfer(spec, { dir: dirHandle, sink });
+    assert.equal(recv.error, null);
+    assertFiles(dirHandle.snapshot(), expectedSnapshot(spec));
+  });
+});
 
 describe("complete transfers (File System Access API)", () => {
   test("a single file arrives byte-for-byte", async () => {
