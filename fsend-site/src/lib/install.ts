@@ -47,7 +47,7 @@ export const OSES: Os[] = [
       {
         key: "apt",
         label: "Debian / Ubuntu (APT)",
-        title: "APT repository",
+        title: "APT Repository",
         note: "Recommended on Debian and Ubuntu. Covers both x86_64 and aarch64.",
         scriptNote:
           "Adds the signed repository, then installs the package. Updates come with your normal apt upgrade.",
@@ -59,7 +59,7 @@ export const OSES: Os[] = [
       {
         key: "linux-x86_64",
         label: "x86_64",
-        title: "Static binary — x86_64",
+        title: "Static Binary — x86_64",
         note: "Works on any distribution. Statically linked against musl.",
         scriptNote: TARBALL_NOTE,
         shell: "bash",
@@ -70,7 +70,7 @@ export const OSES: Os[] = [
       {
         key: "linux-aarch64",
         label: "aarch64",
-        title: "Static binary — aarch64",
+        title: "Static Binary — aarch64",
         note: "For 64-bit ARM machines e.g. Raspberry Pi, ARM server. Statically linked against musl.",
         scriptNote: TARBALL_NOTE,
         shell: "bash",
@@ -86,8 +86,8 @@ export const OSES: Os[] = [
     variants: [
       {
         key: "macos-aarch64",
-        label: "Apple silicon",
-        title: "Static binary — Apple silicon",
+        label: "Apple Silicon",
+        title: "Static Binary — Apple Silicon",
         note: "For M-series Macs.",
         scriptNote: TARBALL_NOTE,
         shell: "zsh",
@@ -98,7 +98,7 @@ export const OSES: Os[] = [
       {
         key: "macos-x86_64",
         label: "Intel",
-        title: "Static binary — Intel",
+        title: "Static Binary — Intel",
         note: "For Intel Macs.",
         scriptNote: TARBALL_NOTE,
         shell: "zsh",
@@ -128,7 +128,7 @@ export const OSES: Os[] = [
   },
   {
     id: "source",
-    label: "From source",
+    label: "From Source",
     variants: [
       {
         key: "source",

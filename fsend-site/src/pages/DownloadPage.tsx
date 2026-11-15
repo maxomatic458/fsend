@@ -9,7 +9,7 @@ import {
 import { A } from "@solidjs/router";
 import { Title, Meta, Link } from "@solidjs/meta";
 import { OcCopy2, OcCheck2 } from "solid-icons/oc";
-import { FiChevronRight } from "solid-icons/fi";
+import { FiArrowLeft, FiChevronRight } from "solid-icons/fi";
 import {
   OSES,
   USAGE,
@@ -109,15 +109,16 @@ export function DownloadPage() {
       <div class="w-full max-w-[660px]">
         <A
           href="/"
-          class="text-[13px] text-azure hover:text-azure-hi transition-colors cursor-pointer"
+          class="inline-flex items-center gap-1 text-[13px] text-azure hover:text-azure-hi transition-colors cursor-pointer"
         >
-          ← Back
+          <FiArrowLeft class="w-3.5 h-3.5" />
+          Back
         </A>
       </div>
 
       <div class="flex flex-col items-center gap-3.5">
         <h1 class="text-[32px] font-bold tracking-[-0.02em] text-center">
-          Install fsend CLI
+          Install the fsend CLI
         </h1>
         <div class="font-mono text-[12.5px] text-ink-faint">
           Use fsend from your command line
@@ -238,7 +239,7 @@ export function DownloadPage() {
               rel="noopener noreferrer"
               class="text-azure underline underline-offset-2 decoration-azure/40 hover:text-azure-hi hover:decoration-azure-hi transition-colors"
             >
-              GitHub releases
+              GitHub Releases
             </a>
             .
           </p>

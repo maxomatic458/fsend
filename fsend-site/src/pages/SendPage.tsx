@@ -55,10 +55,10 @@ export function SendPage() {
     <div class="theme-flame flex-1 bg-canvas py-8 px-4">
       <ConfirmDialog
         open={exitGuard.isPrompting()}
-        title="Leave while sending?"
+        title="Leave While Sending?"
         message="The transfer is still running. Leaving this page cancels it, and the receiver will have to start over."
-        confirmLabel="Leave and cancel"
-        cancelLabel="Keep sending"
+        confirmLabel="Leave and Cancel"
+        cancelLabel="Keep Sending"
         onConfirm={exitGuard.confirm}
         onCancel={exitGuard.cancel}
       />
@@ -73,7 +73,7 @@ export function SendPage() {
       <div class="max-w-2xl mx-auto flex flex-col gap-6">
         <TransferHeader
           title="Send Files"
-          steps={["Choose", "Share code", "Transfer"]}
+          steps={["Choose", "Share Code", "Transfer"]}
           current={send.step()}
           onBack={goBack}
         />
@@ -122,14 +122,14 @@ export function SendPage() {
 
             <div class="flex flex-wrap justify-center gap-2.5 mt-4">
               {/* The first selection is the primary action; once there is one,
-                  Generate share code takes over and this steps back. */}
+                  Generate Share Code takes over and this steps back. */}
               <Button
                 tone={send.entries().length === 0 ? "accent" : "neutral"}
                 onClick={addFiles}
               >
-                Browse files
+                Browse Files
               </Button>
-              <Button onClick={addFolder}>Browse folder</Button>
+              <Button onClick={addFolder}>Browse Folder</Button>
             </div>
 
             <Show when={send.entries().length > 0}>
@@ -141,7 +141,7 @@ export function SendPage() {
               >
                 <span class="flex items-center justify-center gap-2">
                   <FiSend class="w-5 h-5" />
-                  Generate share code
+                  Generate Share Code
                 </span>
               </Button>
             </Show>

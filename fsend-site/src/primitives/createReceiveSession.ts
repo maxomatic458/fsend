@@ -233,7 +233,7 @@ export function createReceiveSession() {
     connection: run.connection,
     progress: run.progress,
     isTransferring: () => state() === "transferring",
-    /** Which of Enter code / Connect / Receive is in progress. */
+    /** Which of Enter Code / Connect / Receive is in progress. */
     step: () => stepOf(state(), "input"),
     code,
     setCode: setCodeRaw,

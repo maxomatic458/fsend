@@ -29,7 +29,9 @@ export function FileList(props: FileListProps) {
               </div>
               <div class="flex items-center gap-2 shrink-0">
                 <span class="font-mono text-[13px] text-ink-dim">
-                  {item.sizeBytes === null ? "…" : formatBytes(item.sizeBytes)}
+                  {item.sizeBytes === null
+                    ? "..."
+                    : formatBytes(item.sizeBytes)}
                 </span>
                 <button
                   onClick={() => props.onRemove(i())}

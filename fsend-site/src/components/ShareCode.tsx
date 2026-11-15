@@ -73,7 +73,7 @@ export function ShareCode(props: ShareCodeProps) {
               <span
                 class={`col-start-1 row-start-1 ${copied() ? "invisible" : ""}`}
               >
-                Copy link
+                Copy Link
               </span>
               <span
                 class={`col-start-1 row-start-1 ${copied() ? "" : "invisible"}`}

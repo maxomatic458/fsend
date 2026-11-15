@@ -52,10 +52,10 @@ export function ReceivePage() {
     <div class="theme-azure flex-1 bg-canvas py-8 px-4">
       <ConfirmDialog
         open={exitGuard.isPrompting()}
-        title="Leave while downloading?"
+        title="Leave While Downloading?"
         message="The download is still running. Leaving this page cancels it."
-        confirmLabel="Leave and cancel"
-        cancelLabel="Keep downloading"
+        confirmLabel="Leave and Cancel"
+        cancelLabel="Keep Downloading"
         onConfirm={exitGuard.confirm}
         onCancel={exitGuard.cancel}
       />
@@ -84,7 +84,7 @@ export function ReceivePage() {
       <div class="max-w-2xl mx-auto flex flex-col gap-6">
         <TransferHeader
           title="Receive Files"
-          steps={["Enter code", "Connect", "Receive"]}
+          steps={["Enter Code", "Connect", "Receive"]}
           current={receive.step()}
           onBack={goBack}
         />
@@ -141,7 +141,7 @@ export function ReceivePage() {
                   >
                     <span class="flex items-center gap-2">
                       <FiFolder class="w-4 h-4" />
-                      Choose folder
+                      Choose Folder
                     </span>
                   </Button>
                 </div>
@@ -172,7 +172,7 @@ export function ReceivePage() {
               disabled={!receive.isReady()}
               onClick={receive.start}
             >
-              Connect &amp; receive
+              Connect &amp; Receive
             </Button>
 
             <p class="text-[13px] text-ink-faint text-center leading-relaxed max-w-[460px]">

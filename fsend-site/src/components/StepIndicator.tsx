@@ -1,4 +1,5 @@
 import { For } from "solid-js";
+import { FiArrowLeft } from "solid-icons/fi";
 
 function StepIndicator(props: {
   steps: string[];
@@ -34,9 +35,10 @@ export function TransferHeader(props: {
     <div class="flex flex-col items-center gap-4.5">
       <button
         onClick={props.onBack}
-        class="self-start text-[13px] text-azure hover:text-azure-hi transition-colors cursor-pointer"
+        class="self-start flex items-center gap-1 text-[13px] text-azure hover:text-azure-hi transition-colors cursor-pointer"
       >
-        ← Back
+        <FiArrowLeft class="w-3.5 h-3.5" />
+        Back
       </button>
       <div class="flex flex-col items-center gap-3">
         <h1 class="text-3xl font-bold tracking-[-0.02em]">{props.title}</h1>

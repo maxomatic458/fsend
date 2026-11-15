@@ -26,7 +26,7 @@ const STEPS = [
   {
     n: "01",
     accent: "text-flame",
-    title: "Pick your files",
+    title: "Pick Your Files",
     body: (
       <>
         Select individual files and folders or drag and drop them anywhere on
@@ -37,13 +37,13 @@ const STEPS = [
   {
     n: "02",
     accent: "text-flame",
-    title: "Share the code",
+    title: "Share the Code",
     body: <>Share the one-time code with the receiver</>,
   },
   {
     n: "03",
     accent: "text-azure",
-    title: "Direct transfer",
+    title: "Direct Transfer",
     body: (
       <>
         Both browsers connect over <Ext href={MDN_WEBRTC}>WebRTC</Ext> and the
@@ -167,9 +167,9 @@ export function HomePage() {
         </p>
 
         <div class="flex flex-wrap items-center justify-center gap-x-2.5 gap-y-1 mt-4 font-mono text-[12.5px] text-ink-dim">
-          <span>No filesize limits</span>
+          <span>No File Size Limits</span>
           <span class="text-ink-faint">·</span>
-          <span>End-to-end encrypted</span>
+          <span>End-to-End Encrypted</span>
           <span class="text-ink-faint">·</span>
           <span>Free</span>
         </div>
@@ -274,7 +274,7 @@ export function HomePage() {
         class="border-t border-line-soft px-5 sm:px-10 py-16 sm:py-18 flex flex-col items-center gap-10"
       >
         <div class="flex flex-col items-center gap-2 text-center">
-          <Eyebrow>How it works</Eyebrow>
+          <Eyebrow>How It Works</Eyebrow>
         </div>
 
         <ol class="grid sm:grid-cols-3 gap-4.5 max-w-[1000px] w-full">

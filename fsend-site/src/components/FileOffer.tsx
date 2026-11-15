@@ -75,7 +75,7 @@ export function FileOffer(props: FileOfferProps) {
 
       <div class="flex gap-2.5">
         <Button tone="accent" size="lg" class="flex-1" onClick={props.onAccept}>
-          Accept &amp; receive
+          Accept &amp; Receive
         </Button>
         <Button tone="ghost" size="lg" onClick={props.onReject}>
           Reject

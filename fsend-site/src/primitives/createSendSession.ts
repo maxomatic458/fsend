@@ -115,7 +115,7 @@ export function createSendSession() {
     connection: run.connection,
     progress: run.progress,
     isTransferring: () => state() === "transferring",
-    /** Which of Choose / Share code / Transfer is in progress. */
+    /** Which of Choose / Share Code / Transfer is in progress. */
     step: () => stepOf(state(), "selecting"),
     entries,
     shareCode,
