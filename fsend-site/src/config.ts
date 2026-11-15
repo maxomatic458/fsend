@@ -13,3 +13,4 @@ export const CONNECT_TIMEOUT_MS = 30_000;
 export const MAX_MESSAGE_BYTES = 16 * 1024;
 export const DATA_CHUNK_BYTES = 16383;
 export const MAX_BUFFERED_BYTES = 1_048_576;
+export const CONCURRENT_FILES = 8;

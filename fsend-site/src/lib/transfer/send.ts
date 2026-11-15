@@ -1,4 +1,8 @@
-import { DATA_CHUNK_BYTES, MAX_BUFFERED_BYTES } from "../../config";
+import {
+  DATA_CHUNK_BYTES,
+  CONCURRENT_FILES,
+  MAX_BUFFERED_BYTES,
+} from "../../config";
 import { openSenderSession, type Link } from "../transport/session";
 import { getConnectionType } from "../transport/webrtc";
 import {
@@ -212,11 +216,13 @@ class BlockReader {
     return this.left === 0;
   }
 
-  /** Up to `max` (and a block's worth of) bytes. */
+  /** Up to `max` (and a block's worth of) bytes, reading a few files at once. */
   async read(max: number): Promise<Uint8Array> {
     const bytes = new Uint8Array(Math.min(max, this.left, MAX_BLOCK_BYTES));
-    let filled = 0;
-    while (filled < bytes.length) {
+    // Where each file's part of the block comes from and goes.
+    const slices: { source: Source; start: number; end: number; at: number }[] =
+      [];
+    for (let filled = 0; filled < bytes.length;) {
       const { id } = this.files[this.file];
       const size = entrySize(this.entries[id]);
       if (this.position === size) {
@@ -224,12 +230,33 @@ class BlockReader {
         continue;
       }
       const n = Math.min(size - this.position, bytes.length - filled);
-      const slice = this.sources[id]!.slice(this.position, this.position + n);
-      bytes.set(new Uint8Array(await slice.arrayBuffer()), filled);
+      const start = this.position;
+      slices.push({
+        source: this.sources[id]!,
+        start,
+        end: start + n,
+        at: filled,
+      });
       filled += n;
       this.position += n;
     }
-    this.left -= filled;
+    let next = 0;
+    const readSlices = async () => {
+      while (next < slices.length) {
+        const { source, start, end, at } = slices[next++];
+        bytes.set(
+          new Uint8Array(await source.slice(start, end).arrayBuffer()),
+          at,
+        );
+      }
+    };
+    await Promise.all(
+      Array.from(
+        { length: Math.min(CONCURRENT_FILES, slices.length) },
+        readSlices,
+      ),
+    );
+    this.left -= bytes.length;
     return bytes;
   }
 }

@@ -1,3 +1,4 @@
+import { CONCURRENT_FILES } from "../../config";
 import { openReceiverSession, type Link } from "../transport/session";
 import { getConnectionType } from "../transport/webrtc";
 import { entrySize, fingerprintOf, offerSizeBytes } from "../files/tree";
@@ -36,8 +37,6 @@ import type { TransferListener } from "./events";
 import { createCodec, type BlockCodec } from "./codec";
 
 const SENDER_IDLE = "the sender stopped sending";
-/// How many files can be written at once.
-const CONCURRENT_WRITES = 8;
 
 /// Receives a transfer into `sink`; files there that differ from the offer are handled by `policy`.
 export async function runReceive(
@@ -245,7 +244,7 @@ async function receiveData(
       const done = sink.writeFile(entry.path, offset, data);
       done.catch(() => {});
       writing.push({ bytes: rest, done });
-      if (writing.length >= CONCURRENT_WRITES) await settle();
+      if (writing.length >= CONCURRENT_FILES) await settle();
       continue;
     }
     // Written as it arrives, once the files before it are done.
