@@ -30,7 +30,7 @@ tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
-webrtc = "0.20"
+webrtc = "0.21.1"
 
 [dev-dependencies]
 fsend-relay = { path = "../fsend-relay" }
