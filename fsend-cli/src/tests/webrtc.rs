@@ -7,7 +7,7 @@ use crate::transfer::test_support::{Peers, transport_suite};
 fn local_config() -> WebRtcConfig {
     WebRtcConfig {
         stun_servers: vec![],
-        bind_addrs: vec!["127.0.0.1:0".into()],
+        bind_addrs: vec!["127.0.0.1:0".parse().unwrap()],
         loopback: true,
         ice_timeouts: Some((
             Duration::from_secs(1),
@@ -75,7 +75,7 @@ async fn a_lost_link_fails_the_streams_instead_of_hanging() {
 
     let (mut sender, mut receiver) = connected_pair().await;
     assert_eq!(*sender.link.borrow(), LinkState::Connected);
-    assert_eq!(sender.connection_type_name(), "WebRTC");
+    assert_eq!(sender.connection_kind(), ConnectionKind::WebRtc);
     let mut data = sender.data().await.unwrap();
 
     // The receiver hanging up reaches the sender as a lost connection.

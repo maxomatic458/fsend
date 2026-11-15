@@ -1,5 +1,5 @@
 use std::future::Future;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 
 use super::*;
@@ -20,12 +20,13 @@ fn loopback_info(endpoint: &Endpoint) -> ConnectionInfo {
             } else {
                 Ipv6Addr::LOCALHOST.into()
             };
-            SocketAddr::new(ip, bound.port()).to_string()
+            SocketAddr::new(ip, bound.port())
         })
         .collect();
     ConnectionInfo::Iroh {
         node_id: endpoint.id().to_string(),
         addrs,
+        relays: vec![],
     }
 }
 
@@ -71,8 +72,8 @@ transport_suite!();
 #[tokio::test]
 async fn connection_over_loopback_is_direct() {
     let (sender, receiver) = connected_pair().await;
-    assert_eq!(sender.connection_type_name(), "Direct");
-    assert_eq!(receiver.connection_type_name(), "Direct");
+    assert_eq!(sender.connection_kind(), ConnectionKind::Direct);
+    assert_eq!(receiver.connection_kind(), ConnectionKind::Direct);
 }
 
 #[tokio::test]
@@ -102,13 +103,17 @@ fn connection_info_round_trips_addresses_and_relays() {
     );
 
     let info = IrohTransfer::connection_info_from_addr(&addr);
-    let ConnectionInfo::Iroh { node_id, addrs } = &info else {
+    let ConnectionInfo::Iroh {
+        node_id,
+        addrs,
+        relays,
+    } = &info
+    else {
         panic!("expected iroh info");
     };
     assert_eq!(node_id, &id.to_string());
-    assert_eq!(addrs.len(), 2);
-    assert!(addrs.contains(&ip.to_string()));
-    assert!(addrs.contains(&relay.to_string()));
+    assert_eq!(addrs, &[ip]);
+    assert_eq!(relays, &[relay.to_string()]);
 
     let back = IrohTransfer::addr_from_connection_info(&info).unwrap();
     assert_eq!(back, addr);
@@ -119,30 +124,25 @@ fn connection_info_ignores_what_it_cannot_parse() {
     let id = iroh::SecretKey::generate().public();
     let info = ConnectionInfo::Iroh {
         node_id: id.to_string(),
-        addrs: vec![
-            "10.0.0.1:1".into(),
-            "not an address".into(),
-            "[::1]:2".into(),
-        ],
+        addrs: vec!["10.0.0.1:1".parse().unwrap(), "[::1]:2".parse().unwrap()],
+        relays: vec!["not a url".into(), "https://relay.example.org./".into()],
     };
     let addr = IrohTransfer::addr_from_connection_info(&info).unwrap();
     assert_eq!(addr.id, id);
     assert_eq!(addr.ip_addrs().count(), 2);
-    assert_eq!(addr.relay_urls().count(), 0);
+    assert_eq!(addr.relay_urls().count(), 1);
 
     let bad_id = ConnectionInfo::Iroh {
         node_id: "zzz".into(),
         addrs: vec![],
+        relays: vec![],
     };
     assert!(matches!(
         IrohTransfer::addr_from_connection_info(&bad_id),
         Err(TransferError::NodeId(_))
     ));
 
-    let webrtc = ConnectionInfo::WebRtc {
-        sdp: String::new(),
-        ice_candidates: vec![],
-    };
+    let webrtc = ConnectionInfo::WebRtc { sdp: String::new() };
     assert!(matches!(
         IrohTransfer::addr_from_connection_info(&webrtc),
         Err(TransferError::UnexpectedConnectionInfo)

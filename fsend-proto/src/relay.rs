@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::code::Nameplate;
+
 pub const VERSION: u32 = 1;
 pub const PATH: &str = "/relay";
 
@@ -22,7 +24,7 @@ pub enum ClientMessage {
     },
     Join {
         version: u32,
-        nameplate: String,
+        nameplate: Nameplate,
         transports: Vec<Transport>,
     },
 }
@@ -32,7 +34,7 @@ pub enum ClientMessage {
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum ServerMessage {
     Created {
-        nameplate: String,
+        nameplate: Nameplate,
         /// Seconds until an unjoined session expires.
         expires_in: u32,
     },
@@ -76,7 +78,7 @@ mod tests {
         pinned(
             ClientMessage::Join {
                 version: 1,
-                nameplate: "K7Q2".into(),
+                nameplate: "K7Q2".parse().unwrap(),
                 transports: vec![Transport::Webrtc],
             },
             r#"{"type":"join","version":1,"nameplate":"K7Q2","transports":["webrtc"]}"#,
@@ -87,7 +89,7 @@ mod tests {
     fn server_messages_keep_their_wire_format() {
         pinned(
             ServerMessage::Created {
-                nameplate: "K7Q2".into(),
+                nameplate: "K7Q2".parse().unwrap(),
                 expires_in: 300,
             },
             r#"{"type":"created","nameplate":"K7Q2","expires_in":300}"#,

@@ -1,5 +1,5 @@
 use fsend_proto::{
-    code::{Code, CodeError},
+    code::{Code, CodeError, Nameplate},
     pairing::{self, PairingError, Signal},
     peer::{
         self, ReceiverMessage, SenderMessage, block, frame, limits, offer,
@@ -41,7 +41,8 @@ pub fn code_link(site: &str, code: &str) -> Result<String, JsError> {
 /// A fresh code for the nameplate the relay assigned, if it is valid.
 #[wasm_bindgen(js_name = newCode)]
 pub fn new_code(nameplate: &str) -> Option<String> {
-    Code::with_random_password(nameplate).map(|code| code.to_string())
+    let nameplate: Nameplate = nameplate.parse().ok()?;
+    Some(Code::with_random_password(&nameplate).to_string())
 }
 
 /// The JSON `ServerMessage` in a relay text frame; throws on an invalid one.
@@ -361,6 +362,7 @@ mod bindings {
     fn typescript_bindings_are_fresh() {
         let cfg = Config::new().with_large_int("number");
         let decls = [
+            Nameplate::decl(&cfg),
             ClientMessage::decl(&cfg),
             ServerMessage::decl(&cfg),
             ErrorCode::decl(&cfg),

@@ -16,7 +16,6 @@ import { Button } from "../components/Button";
 import { Busy } from "../components/Busy";
 import { StorageUsage } from "../components/StorageUsage";
 import { formatBytes } from "../lib/format";
-import type { ConflictPolicy } from "../lib/proto";
 
 const count = (n: number, one: string, many: string) =>
   `${n} ${n === 1 ? one : many}`;
@@ -151,7 +150,11 @@ export function ReceivePage() {
                   <select
                     value={receive.policy()}
                     onChange={(e) =>
-                      receive.setPolicy(e.currentTarget.value as ConflictPolicy)
+                      receive.setPolicy(
+                        e.currentTarget.value === "replace"
+                          ? "replace"
+                          : "skip",
+                      )
                     }
                     class="px-3 py-2 border border-line rounded-lg bg-surface-2 text-ink cursor-pointer"
                   >

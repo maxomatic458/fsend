@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -28,7 +29,10 @@ pub const DEFAULT_STUN_SERVERS: &[&str] = &[
     "stun:stun1.l.google.com:19302",
 ];
 
-pub const DEFAULT_BIND_ADDRS: &[&str] = &["0.0.0.0:0", "[::]:0"];
+pub const DEFAULT_BIND_ADDRS: [SocketAddr; 2] = [
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+    SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+];
 pub const MAX_MESSAGE_BYTES: usize = 16384;
 
 /// Per-channel send buffer.
@@ -41,7 +45,7 @@ const ICE_GATHERING_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct WebRtcConfig {
     pub stun_servers: Vec<String>,
     /// Local UDP addresses to bind.
-    pub bind_addrs: Vec<String>,
+    pub bind_addrs: Vec<SocketAddr>,
     /// If loopback candidates are offered.
     pub loopback: bool,
     /// ICE `(disconnected, failed, keep-alive)` timeouts.
@@ -53,7 +57,7 @@ impl Default for WebRtcConfig {
     fn default() -> Self {
         Self {
             stun_servers: DEFAULT_STUN_SERVERS.iter().map(|s| s.to_string()).collect(),
-            bind_addrs: DEFAULT_BIND_ADDRS.iter().map(|s| s.to_string()).collect(),
+            bind_addrs: DEFAULT_BIND_ADDRS.to_vec(),
             loopback: false,
             ice_timeouts: None,
         }
@@ -455,8 +459,8 @@ impl WebRtcTransfer {
 
 #[async_trait]
 impl Transport for WebRtcTransfer {
-    fn connection_type_name(&self) -> String {
-        "WebRTC".into()
+    fn connection_kind(&self) -> ConnectionKind {
+        ConnectionKind::WebRtc
     }
 
     async fn control(&mut self) -> Result<Box<dyn ByteStream>, TransferError> {

@@ -20,24 +20,69 @@ pub enum CodeError {
     InvalidChar(char),
 }
 
+/// The relay's part of a code: [`NAMEPLATE_LEN`] symbols of [`ALPHABET`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(type = "string"))]
+#[serde(try_from = "String", into = "String")]
+pub struct Nameplate(String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("a nameplate is {NAMEPLATE_LEN} characters of 0-9 and A-Z")]
+pub struct InvalidNameplate;
+
+impl Nameplate {
+    pub fn random() -> Self {
+        Self(random_symbols(NAMEPLATE_LEN))
+    }
+}
+
+impl fmt::Display for Nameplate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for Nameplate {
+    type Err = InvalidNameplate;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        is_canonical(input, NAMEPLATE_LEN)
+            .then(|| Self(input.to_owned()))
+            .ok_or(InvalidNameplate)
+    }
+}
+
+impl TryFrom<String> for Nameplate {
+    type Error = InvalidNameplate;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<Nameplate> for String {
+    fn from(nameplate: Nameplate) -> Self {
+        nameplate.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Code(String);
 
 impl Code {
-    /// Joins a nameplate and a password, both already canonical.
-    pub fn new(nameplate: &str, password: &str) -> Option<Self> {
-        (is_canonical(nameplate, NAMEPLATE_LEN) && is_canonical(password, PASSWORD_LEN))
-            .then(|| Self(format!("{nameplate}{password}")))
+    /// Joins a nameplate and a password; `None` unless the password is canonical.
+    pub fn new(nameplate: &Nameplate, password: &str) -> Option<Self> {
+        is_canonical(password, PASSWORD_LEN).then(|| Self(format!("{nameplate}{password}")))
     }
 
     /// A fresh code for the nameplate the relay assigned.
-    pub fn with_random_password(nameplate: &str) -> Option<Self> {
-        Self::new(nameplate, &random_symbols(PASSWORD_LEN))
+    pub fn with_random_password(nameplate: &Nameplate) -> Self {
+        Self(format!("{nameplate}{}", random_symbols(PASSWORD_LEN)))
     }
 
-    pub fn nameplate(&self) -> &str {
-        &self.0[..NAMEPLATE_LEN]
+    pub fn nameplate(&self) -> Nameplate {
+        Nameplate(self.0[..NAMEPLATE_LEN].to_owned())
     }
 
     pub fn password(&self) -> &str {
@@ -144,21 +189,41 @@ mod tests {
         );
     }
 
+    fn nameplate(s: &str) -> Nameplate {
+        s.parse().unwrap()
+    }
+
     #[test]
     fn splits_into_nameplate_and_password() {
-        let code = Code::new("K7Q2", "9XMV4P").unwrap();
-        assert_eq!((code.nameplate(), code.password()), ("K7Q2", "9XMV4P"));
+        let code = Code::new(&nameplate("K7Q2"), "9XMV4P").unwrap();
+        assert_eq!(code.nameplate(), nameplate("K7Q2"));
+        assert_eq!(code.password(), "9XMV4P");
         assert_eq!(
             code.link("https://fsend.sh/"),
             "https://fsend.sh/receive#K7Q29XMV4P"
         );
-        assert_eq!(Code::new("K7Q", "29XMV4P"), None);
-        assert_eq!(Code::new("k7q2", "9XMV4P"), None);
+        assert_eq!(Code::new(&nameplate("K7Q2"), "9xmv4p"), None);
+        assert_eq!(Code::new(&nameplate("K7Q2"), "9XMV4"), None);
 
-        let fresh = Code::with_random_password("K7Q2").unwrap();
-        assert_eq!(fresh.nameplate(), "K7Q2");
+        let fresh = Code::with_random_password(&nameplate("K7Q2"));
+        assert_eq!(fresh.nameplate(), nameplate("K7Q2"));
         assert!(is_canonical(fresh.password(), PASSWORD_LEN));
-        assert_eq!(Code::with_random_password("k7-2"), None);
+    }
+
+    #[test]
+    fn nameplates_are_four_canonical_symbols() {
+        for bad in ["", "K7Q", "K7Q2X", "k7q2", "K7-2"] {
+            assert_eq!(bad.parse::<Nameplate>(), Err(InvalidNameplate), "{bad}");
+        }
+        assert!(is_canonical(
+            &Nameplate::random().to_string(),
+            NAMEPLATE_LEN
+        ));
+        assert_eq!(
+            serde_json::to_string(&nameplate("K7Q2")).unwrap(),
+            r#""K7Q2""#
+        );
+        assert!(serde_json::from_str::<Nameplate>(r#""k7q2""#).is_err());
     }
 
     #[test]
@@ -171,7 +236,7 @@ mod tests {
 
     #[test]
     fn serializes_as_a_string() {
-        let code = Code::new("K7Q2", "9XMV4P").unwrap();
+        let code = Code::new(&nameplate("K7Q2"), "9XMV4P").unwrap();
         assert_eq!(serde_json::to_string(&code).unwrap(), r#""K7Q29XMV4P""#);
         assert_eq!(
             serde_json::from_str::<Code>(r#""k7q29xmv4p""#).unwrap(),

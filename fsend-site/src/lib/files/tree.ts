@@ -40,13 +40,11 @@ export async function buildOffer(selected: SelectedEntry[]): Promise<Outgoing> {
 
   for (const entry of selected) {
     if (entry.kind === "file") {
-      const file = entry.handle
-        ? await (entry.handle as FileSystemFileHandle).getFile()
-        : entry.file;
-      if (file) addFile([entry.name], file);
-    } else if (entry.handle) {
-      await walk(entry.handle as FileSystemDirectoryHandle, [entry.name]);
-    } else if (entry.files) {
+      const file = "file" in entry ? entry.file : await entry.handle.getFile();
+      addFile([entry.name], file);
+    } else if ("handle" in entry) {
+      await walk(entry.handle, [entry.name]);
+    } else {
       addDir([entry.name]);
       const dirs = new Set<string>();
       for (const { relativePath, file } of entry.files) {

@@ -3,6 +3,8 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use fsend_proto::code::Code;
+use url::Url;
 
 pub const DEFAULT_RELAY_URL: &str = "wss://relay.fsend.sh";
 pub const DEFAULT_DOWNLOAD_URL: &str = "https://fsend.sh";
@@ -15,12 +17,12 @@ pub struct Args {
     pub log_level: tracing::Level,
 
     /// Relay server used to introduce the two peers. `/relay` is appended to it.
-    #[clap(long, default_value = DEFAULT_RELAY_URL)]
-    pub relay_url: String,
+    #[clap(long, default_value = DEFAULT_RELAY_URL, value_parser = websocket_url)]
+    pub relay_url: Url,
 
     /// Site the receiver opens. `/receive#<code>` is appended to it.
-    #[clap(long, default_value = DEFAULT_DOWNLOAD_URL)]
-    pub download_url: String,
+    #[clap(long, default_value = DEFAULT_DOWNLOAD_URL, value_parser = web_url)]
+    pub download_url: Url,
 
     #[clap(subcommand)]
     pub mode: Mode,
@@ -52,7 +54,7 @@ pub enum Mode {
         output_dir: PathBuf,
 
         /// Share code, e.g. K7Q29XMV4P
-        code: String,
+        code: Code,
 
         /// Accept the offer without prompting.
         #[clap(long, short = 'y')]
@@ -68,4 +70,20 @@ pub enum OnConflict {
     Ask,
     Skip,
     Replace,
+}
+
+fn url_with_scheme(input: &str, schemes: [&str; 2]) -> Result<Url, String> {
+    let url = Url::parse(input).map_err(|e| e.to_string())?;
+    if !schemes.contains(&url.scheme()) {
+        return Err(format!("expected a {} or {} URL", schemes[0], schemes[1]));
+    }
+    Ok(url)
+}
+
+fn websocket_url(input: &str) -> Result<Url, String> {
+    url_with_scheme(input, ["wss", "ws"])
+}
+
+fn web_url(input: &str) -> Result<Url, String> {
+    url_with_scheme(input, ["https", "http"])
 }

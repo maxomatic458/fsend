@@ -14,9 +14,11 @@ export const IDLE_TIMEOUT_MS = 60000;
 export const GOODBYE_TIMEOUT_MS = 5000;
 export const MAX_BLOCK_BYTES = 1048576;
 
-export type ClientMessage = { "type": "create", version: number, transports: Array<Transport>, } | { "type": "join", version: number, nameplate: string, transports: Array<Transport>, };
+export type Nameplate = string;
 
-export type ServerMessage = { "type": "created", nameplate: string, 
+export type ClientMessage = { "type": "create", version: number, transports: Array<Transport>, } | { "type": "join", version: number, nameplate: Nameplate, transports: Array<Transport>, };
+
+export type ServerMessage = { "type": "created", nameplate: Nameplate, 
 /**
  * Seconds until an unjoined session expires.
  */
@@ -28,7 +30,15 @@ export type Transport = "iroh" | "webrtc";
 
 export type Sealed = { "type": "confirm", app: string, } | { "type": "connection", info: ConnectionInfo, };
 
-export type ConnectionInfo = { "type": "web_rtc", sdp: string, ice_candidates: Array<string>, } | { "type": "iroh", node_id: string, addrs: Array<string>, };
+export type ConnectionInfo = { "type": "web_rtc", sdp: string, } | { "type": "iroh", 
+/**
+ * iroh's own encoding of the endpoint's public key.
+ */
+node_id: string, addrs: Array<string>, 
+/**
+ * URLs of the iroh relays it is reachable through.
+ */
+relays: Array<string>, };
 
 export type PairingError = "wrong_code" | "invalid_pake" | "tampered" | "malformed" | "unexpected_signal";
 

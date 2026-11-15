@@ -15,6 +15,7 @@ import {
   topEntries,
   validateOffer,
   type AcceptedFile,
+  type Bytes,
   type CheckedFile,
   type ConflictPolicy,
   type Entry,
@@ -180,7 +181,7 @@ async function receiveData(
   const progress = new Progress(entries, files, topOf);
   let decoded = 0;
   let arrived = 0;
-  const blocks: Uint8Array[] = [];
+  const blocks: Bytes[] = [];
   let empty = true;
   const nextBlock = async () => {
     while (blocks.length === 0) {
@@ -229,7 +230,7 @@ async function receiveData(
     wrote(bytes);
   };
   // The rest of a block that ends one file and starts the next.
-  let pending: Uint8Array | undefined;
+  let pending: Bytes | undefined;
   for (const { id, offset } of files) {
     const entry = entries[id];
     const size = entrySize(entry);

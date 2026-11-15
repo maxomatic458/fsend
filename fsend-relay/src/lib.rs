@@ -19,7 +19,7 @@ use axum::{
     routing::get,
 };
 use fsend_proto::{
-    code::{self, NAMEPLATE_LEN},
+    code::Nameplate,
     relay::{ClientMessage, ErrorCode, PATH, ServerMessage, Transport, VERSION},
 };
 use serde::Deserialize;
@@ -76,7 +76,7 @@ pub async fn serve(listener: TcpListener, config: Config) -> io::Result<()> {
 
 struct Relay {
     config: Config,
-    slots: Mutex<HashMap<String, Slot>>,
+    slots: Mutex<HashMap<Nameplate, Slot>>,
     active: AtomicUsize,
 }
 
@@ -134,12 +134,12 @@ impl Drop for Active {
 }
 
 impl Relay {
-    fn slots(&self) -> std::sync::MutexGuard<'_, HashMap<String, Slot>> {
+    fn slots(&self) -> std::sync::MutexGuard<'_, HashMap<Nameplate, Slot>> {
         self.slots.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Opens a session under a fresh nameplate, or `None` when at capacity.
-    fn open(self: &Arc<Self>, transports: Vec<Transport>) -> Option<(String, Joined, Active)> {
+    fn open(self: &Arc<Self>, transports: Vec<Transport>) -> Option<(Nameplate, Joined, Active)> {
         if self.active.fetch_add(1, Ordering::Relaxed) >= self.config.max_sessions {
             self.active.fetch_sub(1, Ordering::Relaxed);
             return None;
@@ -150,7 +150,7 @@ impl Relay {
         let mut slots = self.slots();
         slots.retain(|_, slot| !matches!(slot, Slot::Expired { until } if *until <= now));
         let nameplate = loop {
-            let nameplate = code::random_symbols(NAMEPLATE_LEN);
+            let nameplate = Nameplate::random();
             if !slots.contains_key(&nameplate) {
                 break nameplate;
             }
@@ -167,14 +167,14 @@ impl Relay {
     }
 
     /// Drops a session nobody joined; false if it was joined meanwhile.
-    fn close(&self, nameplate: &str, expired: bool) -> bool {
+    fn close(&self, nameplate: &Nameplate, expired: bool) -> bool {
         let mut slots = self.slots();
         if !matches!(slots.get(nameplate), Some(Slot::Open { .. })) {
             return false;
         }
         if expired {
             let until = Instant::now() + self.config.session_ttl;
-            slots.insert(nameplate.to_owned(), Slot::Expired { until });
+            slots.insert(nameplate.clone(), Slot::Expired { until });
         } else {
             slots.remove(nameplate);
         }
@@ -268,7 +268,7 @@ async fn create(mut ws: Socket, relay: Arc<Relay>, transports: Vec<Transport>) {
     }
 }
 
-async fn join(ws: Socket, relay: Arc<Relay>, nameplate: String, transports: Vec<Transport>) {
+async fn join(ws: Socket, relay: Arc<Relay>, nameplate: Nameplate, transports: Vec<Transport>) {
     // Consumed by the first attempt, whatever happens next.
     let slot = relay.slots().remove(&nameplate);
     let (offered, join) = match slot {

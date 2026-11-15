@@ -1,8 +1,8 @@
-import { BlockDecoder, encodeBlock } from "../proto";
+import { BlockDecoder, encodeBlock, type Bytes } from "../proto";
 
 /** What a batch of data stream bytes completed. */
 export interface Decoded {
-  blocks: Uint8Array[];
+  blocks: Bytes[];
   /** File bytes of the block still arriving, in proportion to how much of it did. */
   partial: number;
   /** Whether no partial block is buffered. */
@@ -12,7 +12,7 @@ export interface Decoded {
 /** The data stream's block codec: a worker where there is one, else this thread. */
 export interface BlockCodec {
   /** The block frame of `bytes`, which are handed over and unusable afterwards. */
-  encode(bytes: Uint8Array): Promise<Uint8Array>;
+  encode(bytes: Uint8Array): Promise<Bytes>;
   /** Takes `chunks` of the data stream, in order, handing them over too; throws on a malformed block. */
   decode(chunks: Uint8Array[]): Promise<Decoded>;
   close(): void;
@@ -23,7 +23,7 @@ export type CodecRequest =
   | { id: number; type: "decode"; chunks: Uint8Array[] };
 
 export type CodecResponse =
-  | { id: number; frame: Uint8Array }
+  | { id: number; frame: Bytes }
   | ({ id: number } & Decoded)
   | { id: number; error: string };
 
@@ -88,7 +88,7 @@ function inThread(): BlockCodec {
   };
   return {
     encode: (bytes) =>
-      run<{ frame: Uint8Array }>({ id: ++id, type: "encode", bytes }).then(
+      run<{ frame: Bytes }>({ id: ++id, type: "encode", bytes }).then(
         (r) => r.frame,
       ),
     decode: (chunks) => run<Decoded>({ id: ++id, type: "decode", chunks }),
@@ -126,7 +126,7 @@ function inWorker(worker: Worker): BlockCodec {
     });
   return {
     encode: (bytes) =>
-      run<{ frame: Uint8Array }>({ id: ++id, type: "encode", bytes }, [
+      run<{ frame: Bytes }>({ id: ++id, type: "encode", bytes }, [
         bytes.buffer,
       ]).then((r) => r.frame),
     decode: (chunks) =>

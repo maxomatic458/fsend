@@ -125,9 +125,11 @@ export class FrameDecoder<M extends PeerMessage> {
   }
 }
 
+export type Bytes = Uint8Array<ArrayBuffer>;
+
 /** A data stream block of `data`, 1 to `MAX_BLOCK_BYTES` file bytes, compressed if that helps. */
-export const encodeBlock = (data: Uint8Array): Uint8Array =>
-  wasm.encodeBlock(data, true);
+export const encodeBlock = (data: Uint8Array): Bytes =>
+  wasm.encodeBlock(data, true) as Bytes;
 
 /** Reassembles the file bytes of blocks from data stream bytes split anywhere. */
 export class BlockDecoder {
@@ -148,8 +150,8 @@ export class BlockDecoder {
   }
 
   /** The file bytes of the next complete block; throws on a malformed one. */
-  next(): Uint8Array | undefined {
-    return this.inner.nextBlock();
+  next(): Bytes | undefined {
+    return this.inner.nextBlock() as Bytes | undefined;
   }
 }
 

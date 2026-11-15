@@ -196,13 +196,33 @@ pub type AcceptCb<'a> = &'a mut (dyn FnMut(&[TopEntry]) -> Option<PathBuf> + Sen
 /// What to do with the entries of the offer that conflict with local ones.
 pub type ConflictCb<'a> = &'a mut (dyn FnMut(&[Entry], &[Conflict]) -> ConflictPolicy + Send);
 
+/// How the peers are connected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionKind {
+    Direct,
+    Relay,
+    WebRtc,
+    Unknown,
+}
+
+impl std::fmt::Display for ConnectionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Direct => "Direct",
+            Self::Relay => "Relay",
+            Self::WebRtc => "WebRTC",
+            Self::Unknown => "Unknown",
+        })
+    }
+}
+
 /// A bidirectional bytestream.
 pub trait ByteStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + ?Sized> ByteStream for T {}
 
 #[async_trait]
 pub trait Transport: Send {
-    fn connection_type_name(&self) -> String;
+    fn connection_kind(&self) -> ConnectionKind;
     /// The control stream, carrying peer protocol frames.
     async fn control(&mut self) -> Result<Box<dyn ByteStream>, TransferError>;
     /// The data stream, opened once the offer has been accepted.

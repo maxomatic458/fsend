@@ -8,6 +8,8 @@ use sha2::Sha256;
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 use thiserror::Error;
 
+use std::net::SocketAddr;
+
 use crate::code::Code;
 
 /// How to reach a peer, carried in [`Sealed::Connection`].
@@ -15,13 +17,15 @@ use crate::code::Code;
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum ConnectionInfo {
-    WebRtc {
-        sdp: String,
-        ice_candidates: Vec<String>,
-    },
+    /// The session description, with every candidate gathered.
+    WebRtc { sdp: String },
     Iroh {
+        /// iroh's own encoding of the endpoint's public key.
         node_id: String,
-        addrs: Vec<String>,
+        #[cfg_attr(feature = "ts", ts(type = "Array<string>"))]
+        addrs: Vec<SocketAddr>,
+        /// URLs of the iroh relays it is reachable through.
+        relays: Vec<String>,
     },
 }
 
@@ -211,6 +215,7 @@ mod tests {
             info: ConnectionInfo::Iroh {
                 node_id: "n".into(),
                 addrs: vec![],
+                relays: vec![],
             },
         }
     }
@@ -313,21 +318,26 @@ mod tests {
         );
         pinned(
             Sealed::Connection {
-                info: ConnectionInfo::WebRtc {
-                    sdp: "v=0".into(),
-                    ice_candidates: vec![],
-                },
+                info: ConnectionInfo::WebRtc { sdp: "v=0".into() },
             },
-            r#"{"type":"connection","info":{"type":"web_rtc","sdp":"v=0","ice_candidates":[]}}"#,
+            r#"{"type":"connection","info":{"type":"web_rtc","sdp":"v=0"}}"#,
         );
         pinned(
             Sealed::Connection {
                 info: ConnectionInfo::Iroh {
                     node_id: "n".into(),
-                    addrs: vec!["10.0.0.1:1234".into()],
+                    addrs: vec!["10.0.0.1:1234".parse().unwrap(), "[::1]:5".parse().unwrap()],
+                    relays: vec!["https://relay.example/".into()],
                 },
             },
-            r#"{"type":"connection","info":{"type":"iroh","node_id":"n","addrs":["10.0.0.1:1234"]}}"#,
+            r#"{"type":"connection","info":{"type":"iroh","node_id":"n","addrs":["10.0.0.1:1234","[::1]:5"],"relays":["https://relay.example/"]}}"#,
+        );
+        // Addresses must be addresses.
+        assert!(
+            serde_json::from_str::<ConnectionInfo>(
+                r#"{"type":"iroh","node_id":"n","addrs":["somewhere"],"relays":[]}"#
+            )
+            .is_err()
         );
     }
 

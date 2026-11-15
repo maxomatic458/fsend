@@ -13,13 +13,14 @@ use tracing_subscriber::util::SubscriberInitExt;
 use fsend_cli::cli::{Args, Mode, OnConflict};
 use fsend_cli::iroh::IrohTransfer;
 use fsend_cli::relay::{Relay, RelayError, pair_as_receiver, pair_as_sender};
-use fsend_cli::transfer::{self, Event, TransferError, build_offer};
+use fsend_cli::transfer::{self, ConnectionKind, Event, TransferError, build_offer};
 use fsend_cli::webrtc::WebRtcTransfer;
 use fsend_proto::code::Code;
 use fsend_proto::pairing::ConnectionInfo;
 use fsend_proto::peer::resume::{Conflict, ConflictPolicy};
 use fsend_proto::peer::{self, Entry, offer::TopEntry};
 use fsend_proto::relay::Transport;
+use url::Url;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -112,16 +113,13 @@ async fn connect_as_sender(relay: &mut Relay) -> color_eyre::Result<Box<dyn tran
         }
         Transport::Webrtc => {
             let (mut wrt, offer_sdp) = WebRtcTransfer::create_offerer().await?;
-            let my_info = ConnectionInfo::WebRtc {
-                sdp: offer_sdp,
-                ice_candidates: vec![],
-            };
+            let my_info = ConnectionInfo::WebRtc { sdp: offer_sdp };
 
             relay.send_connection(my_info).await?;
             let peer_info = relay.connection().await?;
 
             let answer_sdp = match &peer_info {
-                ConnectionInfo::WebRtc { sdp, .. } => sdp.clone(),
+                ConnectionInfo::WebRtc { sdp } => sdp.clone(),
                 _ => return Err(TransferError::UnexpectedConnectionInfo.into()),
             };
             wrt.set_answer(&answer_sdp).await?;
@@ -147,15 +145,12 @@ async fn connect_as_receiver(
         Transport::Webrtc => {
             let peer_info = relay.connection().await?;
             let offer_sdp = match &peer_info {
-                ConnectionInfo::WebRtc { sdp, .. } => sdp.clone(),
+                ConnectionInfo::WebRtc { sdp } => sdp.clone(),
                 _ => return Err(TransferError::UnexpectedConnectionInfo.into()),
             };
 
             let (mut wrt, answer_sdp) = WebRtcTransfer::create_answerer(&offer_sdp).await?;
-            let my_info = ConnectionInfo::WebRtc {
-                sdp: answer_sdp,
-                ice_candidates: vec![],
-            };
+            let my_info = ConnectionInfo::WebRtc { sdp: answer_sdp };
             relay.send_connection(my_info).await?;
 
             wrt.wait_connected().await?;
@@ -165,8 +160,8 @@ async fn connect_as_receiver(
 }
 
 async fn run_send(
-    relay_url: &str,
-    download_url: &str,
+    relay_url: &Url,
+    download_url: &Url,
     files: Vec<PathBuf>,
     compress: bool,
 ) -> color_eyre::Result<()> {
@@ -178,7 +173,7 @@ async fn run_send(
     let outgoing = build_offer(&files)?;
 
     let mut relay = pair_as_sender(relay_url, |code| {
-        let link = code.link(download_url);
+        let link = code.link(download_url.as_str());
         let code = code.to_string();
         println!("Code: {}\n", code.bright_white());
         println!("On the other peer, run:\n");
@@ -203,14 +198,12 @@ async fn run_send(
 }
 
 async fn run_receive(
-    relay_url: &str,
-    code: String,
+    relay_url: &Url,
+    code: Code,
     output_dir: PathBuf,
     on_conflict: OnConflict,
     auto_accept: bool,
 ) -> color_eyre::Result<()> {
-    let code: Code = code.parse().map_err(RelayError::from)?;
-
     let mut relay = pair_as_receiver(relay_url, &code).await?;
     let mut transport = connect_as_receiver(&mut relay).await?;
     drop(relay);
@@ -240,8 +233,10 @@ async fn run_receive(
 
 async fn announce_connection(transport: &dyn transfer::Transport) {
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let conn_type = transport.connection_type_name();
-    println!("Connection type: {}", colorize_conn_type(&conn_type));
+    println!(
+        "Connection type: {}",
+        colorize_conn_type(transport.connection_kind())
+    );
 }
 
 #[derive(Default)]
@@ -432,12 +427,12 @@ impl CliProgressBars {
     }
 }
 
-fn colorize_conn_type(conn_type: &str) -> String {
-    match conn_type {
-        "Direct" => conn_type.green().to_string(),
-        "Relay" => conn_type.yellow().to_string(),
-        "WebRTC" => conn_type.green().to_string(),
-        _ => conn_type.red().to_string(),
+fn colorize_conn_type(kind: ConnectionKind) -> String {
+    let name = kind.to_string();
+    match kind {
+        ConnectionKind::Direct | ConnectionKind::WebRtc => name.green().to_string(),
+        ConnectionKind::Relay => name.yellow().to_string(),
+        ConnectionKind::Unknown => name.red().to_string(),
     }
 }
 
@@ -487,8 +482,13 @@ mod tests {
     #[test]
     fn connection_types_keep_their_names() {
         colored::control::set_override(false);
-        for kind in ["Direct", "Relay", "WebRTC", "None", "Unknown"] {
-            assert_eq!(colorize_conn_type(kind), kind);
+        for (kind, name) in [
+            (ConnectionKind::Direct, "Direct"),
+            (ConnectionKind::Relay, "Relay"),
+            (ConnectionKind::WebRtc, "WebRTC"),
+            (ConnectionKind::Unknown, "Unknown"),
+        ] {
+            assert_eq!(colorize_conn_type(kind), name);
         }
     }
 }

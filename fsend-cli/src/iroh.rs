@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -69,36 +68,41 @@ impl IrohTransfer {
 
     /// Convert the [`EndpointAddr`] into a [`ConnectionInfo`]
     pub fn connection_info_from_addr(addr: &EndpointAddr) -> ConnectionInfo {
-        let addrs = addr
-            .addrs
-            .iter()
-            .filter_map(|a| match a {
-                TransportAddr::Ip(addr) => Some(addr.to_string()),
-                TransportAddr::Relay(url) => Some(url.to_string()),
-                _ => None,
-            })
-            .collect();
+        let (mut addrs, mut relays) = (Vec::new(), Vec::new());
+        for a in &addr.addrs {
+            match a {
+                TransportAddr::Ip(ip) => addrs.push(*ip),
+                TransportAddr::Relay(url) => relays.push(url.to_string()),
+                _ => {}
+            }
+        }
         ConnectionInfo::Iroh {
             node_id: addr.id.to_string(),
             addrs,
+            relays,
         }
     }
 
     pub fn addr_from_connection_info(info: &ConnectionInfo) -> Result<EndpointAddr, TransferError> {
-        let ConnectionInfo::Iroh { node_id, addrs } = info else {
+        let ConnectionInfo::Iroh {
+            node_id,
+            addrs,
+            relays,
+        } = info
+        else {
             return Err(TransferError::UnexpectedConnectionInfo);
         };
         let id = node_id.parse::<EndpointId>()?;
-        let addrs = addrs.iter().filter_map(|a| {
-            if let Ok(addr) = a.parse::<SocketAddr>() {
-                Some(TransportAddr::Ip(addr))
-            } else if let Ok(url) = a.parse::<RelayUrl>() {
-                Some(TransportAddr::Relay(url))
-            } else {
-                tracing::warn!("ignoring unparsable peer address {a:?}");
-                None
-            }
-        });
+        let relays = relays
+            .iter()
+            .filter_map(|url| match url.parse::<RelayUrl>() {
+                Ok(url) => Some(TransportAddr::Relay(url)),
+                Err(_) => {
+                    tracing::warn!("ignoring an unparsable relay URL {url:?}");
+                    None
+                }
+            });
+        let addrs = addrs.iter().copied().map(TransportAddr::Ip).chain(relays);
         Ok(EndpointAddr::from_parts(id, addrs))
     }
 
@@ -148,15 +152,13 @@ impl IrohTransfer {
 
 #[async_trait]
 impl Transport for IrohTransfer {
-    fn connection_type_name(&self) -> String {
+    fn connection_kind(&self) -> ConnectionKind {
         let paths = self.conn.paths();
         match paths.iter().find(|p| p.is_selected()) {
-            Some(p) if p.is_ip() => "Direct",
-            Some(p) if p.is_relay() => "Relay",
-            Some(_) => "Unknown",
-            None => "None",
+            Some(p) if p.is_ip() => ConnectionKind::Direct,
+            Some(p) if p.is_relay() => ConnectionKind::Relay,
+            _ => ConnectionKind::Unknown,
         }
-        .into()
     }
 
     async fn control(&mut self) -> Result<Box<dyn ByteStream>, TransferError> {

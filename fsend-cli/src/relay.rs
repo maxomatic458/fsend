@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use colored::Colorize;
 use fsend_proto::{
-    code::{Code, CodeError},
+    code::Code,
     pairing::{Channel, ConnectionInfo, PairingError, Pake, Role, Sealed, Signal},
     relay::{ClientMessage, ErrorCode, PATH, ServerMessage, Transport, VERSION},
 };
@@ -10,6 +10,7 @@ use futures_util::{SinkExt, StreamExt};
 use thiserror::Error;
 use tokio::{net::TcpStream, time::timeout};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+use url::Url;
 
 /// For connecting and for each reply of the relay.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -21,8 +22,6 @@ pub const APP: &str = concat!("fsend-cli ", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Error)]
 pub enum RelayError {
-    #[error("invalid code: {0}")]
-    Code(#[from] CodeError),
     #[error("could not reach the relay: {0}")]
     Connect(tokio_tungstenite::tungstenite::Error),
     #[error("timed out connecting to the relay")]
@@ -45,7 +44,6 @@ impl RelayError {
     /// A message for the errors a user can act on.
     pub fn user_error(&self) -> Option<String> {
         let message = match self {
-            Self::Code(_) => format!("{self}. A code looks like K7Q29XMV4P."),
             Self::Connect(_) | Self::ConnectTimeout | Self::Timeout => self.to_string(),
             Self::Pairing(PairingError::WrongCode) => {
                 "the codes did not match. A code works only once, so start a new session and try again.".into()
@@ -85,7 +83,7 @@ pub struct Relay {
 /// Creates a session at the relay at `base_url` and pairs with whoever joins
 /// it; `show_code` gets the code for the receiver.
 pub async fn pair_as_sender(
-    base_url: &str,
+    base_url: &Url,
     show_code: impl FnOnce(&Code),
 ) -> Result<Relay, RelayError> {
     let mut ws = connect(base_url).await?;
@@ -104,9 +102,7 @@ pub async fn pair_as_sender(
     else {
         return Err(RelayError::Protocol("expected created"));
     };
-    let code = Code::with_random_password(&nameplate).ok_or(RelayError::Protocol(
-        "the relay assigned an invalid nameplate",
-    ))?;
+    let code = Code::with_random_password(&nameplate);
     show_code(&code);
 
     let wait = Duration::from_secs(expires_in.into()) + CONNECT_TIMEOUT;
@@ -115,13 +111,13 @@ pub async fn pair_as_sender(
 }
 
 /// Joins the session of `code` at the relay at `base_url`.
-pub async fn pair_as_receiver(base_url: &str, code: &Code) -> Result<Relay, RelayError> {
+pub async fn pair_as_receiver(base_url: &Url, code: &Code) -> Result<Relay, RelayError> {
     let mut ws = connect(base_url).await?;
     send(
         &mut ws,
         &ClientMessage::Join {
             version: VERSION,
-            nameplate: code.nameplate().to_owned(),
+            nameplate: code.nameplate(),
             transports: TRANSPORTS.to_vec(),
         },
     )
@@ -178,9 +174,10 @@ impl Relay {
 }
 
 /// Connects to the relay at `base_url` (`/relay` is appended).
-async fn connect(base_url: &str) -> Result<WsStream, RelayError> {
-    let url = format!("{}{PATH}", base_url.trim_end_matches('/'));
-    let (ws, _) = timeout(CONNECT_TIMEOUT, connect_async(url))
+async fn connect(base_url: &Url) -> Result<WsStream, RelayError> {
+    let mut url = base_url.clone();
+    url.set_path(&format!("{}{PATH}", url.path().trim_end_matches('/')));
+    let (ws, _) = timeout(CONNECT_TIMEOUT, connect_async(url.as_str()))
         .await
         .map_err(|_| RelayError::ConnectTimeout)?
         .map_err(RelayError::Connect)?;
@@ -253,9 +250,13 @@ mod tests {
     use fsend_relay::Config;
     use tokio::{net::TcpListener, sync::oneshot};
 
-    async fn start_relay() -> String {
+    fn ws(listener: &TcpListener) -> Url {
+        Url::parse(&format!("ws://{}", listener.local_addr().unwrap())).unwrap()
+    }
+
+    async fn start_relay() -> Url {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let url = ws(&listener);
         tokio::spawn(fsend_relay::serve(listener, Config::default()));
         url
     }
@@ -263,13 +264,14 @@ mod tests {
     fn iroh_info(id: &str) -> ConnectionInfo {
         ConnectionInfo::Iroh {
             node_id: id.into(),
-            addrs: vec!["10.0.0.1:1234".into()],
+            addrs: vec!["10.0.0.1:1234".parse().unwrap()],
+            relays: vec![],
         }
     }
 
     /// Pairs a sender with a receiver that uses `receiver_code(code)`.
     async fn pair(
-        url: &str,
+        url: &Url,
         receiver_code: impl FnOnce(Code) -> Code,
     ) -> (Result<Relay, RelayError>, Result<Relay, RelayError>) {
         let (code_tx, code_rx) = oneshot::channel();
@@ -312,7 +314,7 @@ mod tests {
     async fn a_wrong_code_fails_on_both_sides() {
         let url = start_relay().await;
         let (sender, receiver) =
-            pair(&url, |code| Code::new(code.nameplate(), "000000").unwrap()).await;
+            pair(&url, |code| Code::new(&code.nameplate(), "000000").unwrap()).await;
         for result in [sender, receiver] {
             let err = result.err().unwrap();
             assert!(
@@ -339,7 +341,7 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_relay_message_is_a_protocol_error() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let url = ws(&listener);
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
@@ -357,7 +359,7 @@ mod tests {
     #[tokio::test]
     async fn a_relay_that_hangs_up_is_a_closed_connection() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let url = ws(&listener);
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
@@ -371,7 +373,7 @@ mod tests {
     #[tokio::test]
     async fn an_unreachable_relay_is_reported() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let url = ws(&listener);
         drop(listener);
         let result = pair_as_sender(&url, |_| {}).await;
         assert!(matches!(result, Err(RelayError::Connect(_))));

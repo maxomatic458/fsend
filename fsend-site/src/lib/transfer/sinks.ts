@@ -1,4 +1,4 @@
-import type { Entry, Local, TopEntry } from "../proto";
+import type { Bytes, Entry, Local, TopEntry } from "../proto";
 import { formatBytes } from "../format";
 import {
   writeZip,
@@ -22,10 +22,10 @@ export interface TransferSink {
   reserve(remaining: number, total: number): Promise<void>;
   createDir(path: string[]): Promise<void>;
   /// Writes the rest of a file, from `offset` on, in one go; several may run at once.
-  writeFile(path: string[], offset: number, data: Uint8Array): Promise<void>;
+  writeFile(path: string[], offset: number, data: Bytes): Promise<void>;
   /// Opens a file to write from `offset` on; at 0 whatever was there is dropped.
   open(path: string[], offset: number): Promise<void>;
-  write(chunk: Uint8Array): Promise<void>;
+  write(chunk: Bytes): Promise<void>;
   closeFile(): Promise<void>;
   // Finish the transfer, by either flushing writes and closing files or by
   // zipping and downloading the received files.
@@ -157,7 +157,7 @@ export function createFolderSink(
         keepExistingData: offset > 0,
       });
       if (offset > 0) await writable.seek(offset);
-      await writable.write(data as unknown as BufferSource);
+      await writable.write(data);
       await writable.close();
     },
 
@@ -171,7 +171,7 @@ export function createFolderSink(
     },
 
     async write(chunk) {
-      await writable!.write(chunk as unknown as BufferSource);
+      await writable!.write(chunk);
     },
 
     async closeFile() {
@@ -198,7 +198,7 @@ export function createFolderSink(
 export function createZipSink(): TransferSink {
   const files = new Map<string, Blob>();
   const dirs: string[] = [];
-  let current: { path: string; chunks: Uint8Array[] } | null = null;
+  let current: { path: string; chunks: Bytes[] } | null = null;
 
   return {
     async prepare() {},
@@ -221,7 +221,7 @@ export function createZipSink(): TransferSink {
     },
 
     async writeFile(path, _, data) {
-      files.set(path.join("/"), new Blob([data as BlobPart]));
+      files.set(path.join("/"), new Blob([data]));
     },
 
     async open(path) {
@@ -234,8 +234,7 @@ export function createZipSink(): TransferSink {
 
     async closeFile() {
       // A blob lets the browser keep the bytes outside the JS heap.
-      if (current)
-        files.set(current.path, new Blob(current.chunks as BlobPart[]));
+      if (current) files.set(current.path, new Blob(current.chunks));
       current = null;
     },
 

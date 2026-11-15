@@ -105,12 +105,13 @@ fn loopback_info(endpoint: &Endpoint) -> ConnectionInfo {
             } else {
                 Ipv6Addr::LOCALHOST.into()
             };
-            SocketAddr::new(ip, bound.port()).to_string()
+            SocketAddr::new(ip, bound.port())
         })
         .collect();
     ConnectionInfo::Iroh {
         node_id: endpoint.id().to_string(),
         addrs,
+        relays: vec![],
     }
 }
 
@@ -146,7 +147,7 @@ fn bench_iroh(payload: &Path, out: &Path, bytes: u64) -> f64 {
 fn bench_webrtc(payload: &Path, out: &Path, bytes: u64) -> f64 {
     let config = WebRtcConfig {
         stun_servers: vec![],
-        bind_addrs: vec!["127.0.0.1:0".into()],
+        bind_addrs: vec!["127.0.0.1:0".parse().unwrap()],
         loopback: true,
         ice_timeouts: None,
     };

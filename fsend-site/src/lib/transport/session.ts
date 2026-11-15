@@ -21,7 +21,7 @@ export interface Link {
 }
 
 function webRtcInfo(sdp: string): ConnectionInfo {
-  return { type: "web_rtc", sdp, ice_candidates: [] };
+  return { type: "web_rtc", sdp };
 }
 
 function sdpOf(info: ConnectionInfo): string {
