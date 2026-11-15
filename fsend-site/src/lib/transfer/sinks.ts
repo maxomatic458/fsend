@@ -1,11 +1,9 @@
+import { CONCURRENT_FILES } from "../../config";
 import type { Bytes, Entry, Local, TopEntry } from "../proto";
 import { formatBytes } from "../format";
-import {
-  writeZip,
-  zipName,
-  type BrowserStorage,
-  type ZipInput,
-} from "../files/storage";
+import type { BrowserStorage } from "../files/storage";
+import { Checksums, zipName, zipOffer } from "../files/zip";
+import { eachAtOnce } from "../parallel";
 
 /// Long enough for the browser to have started reading the blob.
 const REVOKE_DELAY_MS = 60_000;
@@ -18,8 +16,8 @@ export interface TransferSink {
   probe(entry: Entry): Promise<Local>;
   /// The file at `path`, which `probe` found.
   read(path: string[]): Promise<Blob>;
-  /// Throws unless `remaining` more bytes fit, of an offer of `total`.
-  reserve(remaining: number, total: number): Promise<void>;
+  /// Throws unless `remaining` more bytes fit.
+  reserve(remaining: number): Promise<void>;
   createDir(path: string[]): Promise<void>;
   /// Writes the rest of a file, from `offset` on, in one go; several may run at once.
   writeFile(path: string[], offset: number, data: Bytes): Promise<void>;
@@ -44,7 +42,8 @@ export function createFolderSink(
   storage?: BrowserStorage,
 ): TransferSink {
   let writable: FileSystemWritableFileStream | null = null;
-  let tops: TopEntry[] = [];
+  // Kept only for a zip of browser storage.
+  let checksums: Checksums | undefined;
 
   // Handles of the directories reached so far, by path.
   const dirs = new Map<string, FileSystemDirectoryHandle>([["", dirHandle]]);
@@ -95,9 +94,9 @@ export function createFolderSink(
   };
 
   return {
-    async prepare(offered) {
-      tops = offered;
-      await storage?.keepOnly(offered);
+    async prepare(tops) {
+      if (storage && isZip(tops)) checksums = new Checksums();
+      await storage?.keepOnly(tops);
     },
 
     async probe(entry) {
@@ -130,18 +129,13 @@ export function createFolderSink(
       return (await fileAt(path)).getFile();
     },
 
-    async reserve(remaining, total) {
+    async reserve(remaining) {
       const free = await storage?.free();
-      if (free === undefined) return;
-      // Several files are zipped next to the staged ones.
-      const needed =
-        remaining + (tops.length === 1 && !tops[0].dir ? 0 : total);
-      if (needed > free) {
-        throw new Error(
-          `Not enough browser storage: ${formatBytes(needed)} needed, ${formatBytes(free)} free. ` +
-            "Clear the browser storage, or choose Download as Zip.",
-        );
-      }
+      if (free === undefined || remaining <= free) return;
+      throw new Error(
+        `Not enough browser storage: ${formatBytes(remaining)} needed, ${formatBytes(free)} free. ` +
+          "Clear the browser storage, or choose Download as Zip.",
+      );
     },
 
     async createDir(path) {
@@ -159,6 +153,7 @@ export function createFolderSink(
       if (offset > 0) await writable.seek(offset);
       await writable.write(data);
       await writable.close();
+      checksums?.whole(path, offset, data);
     },
 
     async open(path, offset) {
@@ -168,22 +163,36 @@ export function createFolderSink(
       });
       writable = await file.createWritable({ keepExistingData: offset > 0 });
       if (offset > 0) await writable.seek(offset);
+      checksums?.begin(path, offset);
     },
 
     async write(chunk) {
       await writable!.write(chunk);
+      checksums?.update(chunk);
     },
 
     async closeFile() {
       if (!writable) return;
       await writable.close();
       writable = null;
+      checksums?.end();
     },
 
     async finish(entries, tops, onProgress) {
       if (!storage) return;
-      const file = await storage.export(entries, tops, onProgress);
-      triggerDownload(file, file.name);
+      if (!checksums) {
+        const file = await (await fileAt([tops[0].name])).getFile();
+        triggerDownload(file, file.name);
+        return;
+      }
+      // The zip is made of the stored files themselves, which stay until the next transfer.
+      const blobs = new Map<string, Blob>();
+      const files = entries.filter((entry) => entry.kind === "file");
+      await eachAtOnce(files, CONCURRENT_FILES, async ({ path }) => {
+        blobs.set(path.join("/"), await (await fileAt(path)).getFile());
+      });
+      const zip = await zipOffer(entries, blobs, checksums, onProgress);
+      triggerDownload(zip, zipName(tops));
     },
 
     async abandon() {
@@ -197,7 +206,7 @@ export function createFolderSink(
 /// Buffers in memory and saves the files at the end, zipped if more than one.
 export function createZipSink(): TransferSink {
   const files = new Map<string, Blob>();
-  const dirs: string[] = [];
+  const checksums = new Checksums();
   let current: { path: string; chunks: Bytes[] } | null = null;
 
   return {
@@ -216,43 +225,40 @@ export function createZipSink(): TransferSink {
       // The browser says nothing reliable about free memory.
     },
 
-    async createDir(path) {
-      dirs.push(path.join("/"));
+    async createDir() {
+      // Folders are part of the offer, which the zip is made from.
     },
 
-    async writeFile(path, _, data) {
+    async writeFile(path, offset, data) {
       files.set(path.join("/"), new Blob([data]));
+      checksums.whole(path, offset, data);
     },
 
-    async open(path) {
+    async open(path, offset) {
       current = { path: path.join("/"), chunks: [] };
+      checksums.begin(path, offset);
     },
 
     async write(chunk) {
       current!.chunks.push(chunk);
+      checksums.update(chunk);
     },
 
     async closeFile() {
       // A blob lets the browser keep the bytes outside the JS heap.
       if (current) files.set(current.path, new Blob(current.chunks));
       current = null;
+      checksums.end();
     },
 
-    async finish(_, tops, onProgress) {
-      if (tops.length === 1 && !tops[0].dir && files.size === 1) {
+    async finish(entries, tops, onProgress) {
+      if (!isZip(tops)) {
         const [[path, blob]] = files;
         triggerDownload(blob, path);
         return;
       }
-
-      const inputs: ZipInput[] = [
-        ...dirs.map((name) => ({ name })),
-        ...[...files].map(([name, input]) => ({ name, input })),
-      ];
-      const chunks: Uint8Array[] = [];
-      await writeZip(inputs, (chunk) => void chunks.push(chunk), onProgress);
       triggerDownload(
-        new Blob(chunks as BlobPart[], { type: "application/zip" }),
+        await zipOffer(entries, files, checksums, onProgress),
         zipName(tops),
       );
     },
@@ -260,11 +266,13 @@ export function createZipSink(): TransferSink {
     async abandon() {
       // A partial in-memory transfer is worthless — nothing can resume it.
       files.clear();
-      dirs.length = 0;
       current = null;
     },
   };
 }
+
+/// Whether a transfer of `tops` is saved as a zip: anything but a single file.
+const isZip = (tops: TopEntry[]) => tops.length !== 1 || tops[0].dir;
 
 function triggerDownload(blob: Blob, filename: string): void {
   const url = URL.createObjectURL(blob);

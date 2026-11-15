@@ -242,6 +242,14 @@ impl Progress {
     }
 }
 
+/// The CRC-32 (IEEE) of `data` following the bytes `previous` is the CRC-32 of, as zip files record.
+#[wasm_bindgen]
+pub fn crc32(data: &[u8], previous: u32) -> u32 {
+    let mut hasher = crc32fast::Hasher::new_with_initial(previous);
+    hasher.update(data);
+    hasher.finalize()
+}
+
 /// The highest protocol version both sides speak.
 #[wasm_bindgen]
 pub fn negotiate(version: u32, min_version: u32) -> Option<u32> {

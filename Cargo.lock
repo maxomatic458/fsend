@@ -859,6 +859,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32fast"
+version = "1.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b929dd2a135771f40afabd1073f85eed59c800b7c61901e5c254270497dad64"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "critical-section"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1354,6 +1363,7 @@ dependencies = [
 name = "fsend-proto-wasm"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "fsend-proto",
  "getrandom 0.2.17",
  "getrandom 0.4.3",

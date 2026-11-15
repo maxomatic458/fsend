@@ -7,6 +7,7 @@ export { runReceive } from "../src/lib/transfer/receive";
 export { createFolderSink, createZipSink } from "../src/lib/transfer/sinks";
 export { buildOffer } from "../src/lib/files/tree";
 export { BrowserStorage } from "../src/lib/files/storage";
+export { zipBlob } from "../src/lib/files/zip";
 export { watchDisconnect } from "../src/lib/transport/webrtc";
 export { DATA_CHUNK_BYTES, MAX_BUFFERED_BYTES } from "../src/config";
 export { createSendSession } from "../src/primitives/createSendSession";

@@ -1,7 +1,7 @@
 import { CONCURRENT_FILES } from "../../config";
 import { openReceiverSession, type Link } from "../transport/session";
 import { getConnectionType } from "../transport/webrtc";
-import { entrySize, fingerprintOf, offerSizeBytes } from "../files/tree";
+import { entrySize, fingerprintOf } from "../files/tree";
 import {
   ACK_INTERVAL_MS,
   ACK_STEP,
@@ -133,7 +133,7 @@ async function receive(
     (n, { id, offset }) => n + entrySize(entries[id]) - offset,
     0,
   );
-  await sink.reserve(remaining, offerSizeBytes(entries));
+  await sink.reserve(remaining);
   peer.send({ type: "accept", files });
   emit(transferring(tops, presentBytes(entries, files)));
   if (plan.conflicts.length > 0) {

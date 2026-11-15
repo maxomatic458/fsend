@@ -131,6 +131,10 @@ export type Bytes = Uint8Array<ArrayBuffer>;
 export const encodeBlock = (data: Uint8Array): Bytes =>
   wasm.encodeBlock(data, true) as Bytes;
 
+/** The CRC-32 of `data` following bytes whose CRC-32 is `previous`. */
+export const crc32 = (data: Uint8Array, previous: number): number =>
+  wasm.crc32(data, previous);
+
 /** Reassembles the file bytes of blocks from data stream bytes split anywhere. */
 export class BlockDecoder {
   private inner = new wasm.BlockDecoder();

@@ -311,11 +311,11 @@ describe("browser storage (OPFS)", () => {
     return { send: send.record, recv: recv.record };
   }
 
-  test("several files are zipped out of storage, then dropped", async () => {
+  test("several files are zipped from storage without a copy", async () => {
     const storage = await openStorage();
     const spec = {
       "top.bin": bytes(5000, 181),
-      folder: { "x.dat": bytes(900, 182) },
+      folder: { "x.dat": bytes(900, 182), "empty.txt": new Uint8Array(0) },
     };
     const { recv } = await staged(storage, spec);
 
@@ -323,9 +323,30 @@ describe("browser storage (OPFS)", () => {
     const [download] = getDownloads();
     assert.equal(download.name, "fsend-files.zip");
     assertFiles(await unzip(download.blob), expectedSnapshot(spec));
-    assert.deepEqual(storage.incoming.snapshot(), {});
-    // Only the export is left, until the next transfer.
-    assert.equal(await storage.usage(), download.blob.size);
+    // The zip is made of the stored files, which stay until the next transfer.
+    assertFiles(storage.incoming.snapshot(), expectedSnapshot(spec));
+    assert.equal(await storage.usage(), 5900);
+    assert.ok(!recv.states.includes("packing"), "nothing to pack");
+  });
+
+  test("a resumed transfer of several files zips correctly", async () => {
+    const storage = await openStorage();
+    const spec = {
+      "a.bin": bytes(600_000, 191),
+      "b.bin": bytes(1_500_000, 192),
+      "c.bin": bytes(400_000, 193),
+    };
+    const first = await staged(storage, spec, { cutAfter: 1_300_000 });
+    assert.ok(first.recv.error, "the first attempt fails");
+
+    // Complete and resumed files were not checksummed as they arrived.
+    const { recv } = await staged(storage, spec);
+    assert.equal(recv.error, null);
+    assert.ok(recv.states.includes("packing"));
+    assertFiles(
+      await unzip(getDownloads().at(-1).blob),
+      expectedSnapshot(spec),
+    );
   });
 
   test("a single file is saved as it is", async () => {

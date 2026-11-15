@@ -37,6 +37,7 @@ import {
   unexpected,
 } from "./peer";
 import type { TransferListener } from "./events";
+import { eachAtOnce } from "../parallel";
 import { createCodec } from "./codec";
 import type { SelectedEntry } from "../types";
 
@@ -240,21 +241,14 @@ class BlockReader {
       filled += n;
       this.position += n;
     }
-    let next = 0;
-    const readSlices = async () => {
-      while (next < slices.length) {
-        const { source, start, end, at } = slices[next++];
+    await eachAtOnce(
+      slices,
+      CONCURRENT_FILES,
+      async ({ source, start, end, at }) =>
         bytes.set(
           new Uint8Array(await source.slice(start, end).arrayBuffer()),
           at,
-        );
-      }
-    };
-    await Promise.all(
-      Array.from(
-        { length: Math.min(CONCURRENT_FILES, slices.length) },
-        readSlices,
-      ),
+        ),
     );
     this.left -= bytes.length;
     return bytes;
