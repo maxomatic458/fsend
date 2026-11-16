@@ -22,6 +22,9 @@ class TypeMismatchError extends Error {
   }
 }
 
+/** Bytes writes may still add, as a browser's real limit; a test may lower it. */
+export const storageLimit = { left: Infinity };
+
 export class MemoryFileHandle {
   constructor(name) {
     this.kind = "file";
@@ -63,6 +66,12 @@ class MemoryWritable {
         : chunk instanceof ArrayBuffer
           ? new Uint8Array(chunk)
           : new Uint8Array(chunk.data ?? chunk);
+    if ((storageLimit.left -= data.length) < 0) {
+      throw new DOMException(
+        "The operation failed because it would cause the application to exceed its storage quota.",
+        "QuotaExceededError",
+      );
+    }
     for (let i = 0; i < data.length; i++) this._buf[this._pos + i] = data[i];
     this._pos += data.length;
     // Commit as we go, so an abandoned writable still leaves partial data on

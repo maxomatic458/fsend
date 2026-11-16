@@ -16,6 +16,7 @@ import {
   unzip,
 } from "./harness/index.mjs";
 import { sctpLimits } from "./harness/webrtc.mjs";
+import { storageLimit } from "./harness/fs-access.mjs";
 
 const {
   BrowserStorage,
@@ -279,9 +280,23 @@ describe("complete transfers (fallback, no File System Access API)", () => {
 });
 
 describe("browser storage (OPFS)", () => {
-  /** fsend's storage below a fresh origin, with `quota` bytes. */
-  const openStorage = (origin = new MemoryDirectoryHandle(), quota = 1e9) =>
-    BrowserStorage.open(origin, async () => ({ quota, usage: 0 }));
+  /**
+   * fsend's storage below a fresh origin, with `quota` bytes; `persisted`
+   * is the quota once the user lets fsend keep its data, if they do.
+   */
+  const openStorage = (
+    origin = new MemoryDirectoryHandle(),
+    quota = 1e9,
+    persisted,
+  ) =>
+    BrowserStorage.open(origin, {
+      estimate: async () => ({ quota, usage: 0 }),
+      persist: async () => {
+        if (persisted === undefined) return false;
+        quota = persisted;
+        return true;
+      },
+    });
 
   /** One transfer of `spec` into `storage`, as the receive page runs it. */
   async function staged(storage, spec, { cutAfter } = {}) {
@@ -328,6 +343,7 @@ describe("browser storage (OPFS)", () => {
     // The zip is made of the stored files, which stay until the next transfer.
     assertFiles(storage.incoming.snapshot(), expectedSnapshot(spec));
     assert.equal(await storage.usage(), 5900);
+    assert.ok(!recv.states.includes("askingStorage"), "it fits as it is");
     assert.ok(!recv.states.includes("packing"), "nothing to pack");
   });
 
@@ -407,8 +423,37 @@ describe("browser storage (OPFS)", () => {
     const { send, recv } = await staged(storage, {
       "big.bin": bytes(5000, 187),
     });
+    assert.ok(recv.states.includes("askingStorage"), "more room was asked for");
     assert.match(recv.error ?? "", /Not enough browser storage/);
     assert.match(send.error ?? "", /The other side failed/);
+  });
+
+  test("a transfer that fits once the user allows more room is received", async () => {
+    // Firefox allows half the disk instead of 10 GiB once a site may keep its data.
+    const storage = await openStorage(undefined, 1000, 1e9);
+    const spec = { "big.bin": bytes(5000, 189) };
+    const { recv } = await staged(storage, spec);
+    assert.equal(recv.error, null);
+    assert.ok(recv.states.includes("askingStorage"));
+    assertFiles(storage.incoming.snapshot(), expectedSnapshot(spec));
+  });
+
+  test("storage that holds less than it reports fails clearly", async () => {
+    // Chromium in a private window reports 10 GiB, then stops at about 4 GiB.
+    const storage = await openStorage();
+    storageLimit.left = 3000;
+    try {
+      const { send, recv } = await staged(storage, {
+        "big.bin": bytes(5000, 188),
+      });
+      assert.match(
+        recv.error ?? "",
+        /Browser storage ran out.*Clear the browser storage, or choose Download as Zip/,
+      );
+      assert.match(send.error ?? "", /The other side failed/);
+    } finally {
+      storageLimit.left = Infinity;
+    }
   });
 
   test("clearing removes everything kept", async () => {

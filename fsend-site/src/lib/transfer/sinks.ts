@@ -5,6 +5,8 @@ import type { BrowserStorage } from "../files/storage";
 import { Checksums, zipName, zipOffer } from "../files/zip";
 import { eachAtOnce } from "../parallel";
 
+const STORAGE_ADVICE = "Clear the browser storage, or choose Download as Zip.";
+
 /// Long enough for the browser to have started reading the blob.
 const REVOKE_DELAY_MS = 60_000;
 
@@ -16,8 +18,8 @@ export interface TransferSink {
   probe(entry: Entry): Promise<Local>;
   /// The file at `path`, which `probe` found.
   read(path: string[]): Promise<Blob>;
-  /// Throws unless `remaining` more bytes fit.
-  reserve(remaining: number): Promise<void>;
+  /// Throws unless `remaining` more bytes fit; `onAsk` runs while the user is asked for more room.
+  reserve(remaining: number, onAsk: () => void): Promise<void>;
   createDir(path: string[]): Promise<void>;
   /// Writes the rest of a file, from `offset` on, in one go; several may run at once.
   writeFile(path: string[], offset: number, data: Bytes): Promise<void>;
@@ -64,6 +66,24 @@ export function createFolderSink(
   const fileAt = async (path: string[]) => {
     const dir = await dirOf(path.slice(0, -1), false);
     return dir.getFileHandle(path[path.length - 1]);
+  };
+
+  // Some browsers, Chromium in private windows for one, report more storage than they allow.
+  const writing = async (write: () => Promise<void>) => {
+    try {
+      await write();
+    } catch (err) {
+      if (
+        storage &&
+        err instanceof DOMException &&
+        err.name === "QuotaExceededError"
+      ) {
+        throw new Error(
+          `Browser storage ran out, though the browser reported enough room. ${STORAGE_ADVICE}`,
+        );
+      }
+      throw err;
+    }
   };
 
   // What each directory held when first probed, so a path costs no call of its own.
@@ -129,12 +149,17 @@ export function createFolderSink(
       return (await fileAt(path)).getFile();
     },
 
-    async reserve(remaining) {
-      const free = await storage?.free();
+    async reserve(remaining, onAsk) {
+      if (!storage) return;
+      let free = await storage.free();
       if (free === undefined || remaining <= free) return;
+      onAsk();
+      if (await storage.persist()) {
+        free = await storage.free();
+        if (free === undefined || remaining <= free) return;
+      }
       throw new Error(
-        `Not enough browser storage: ${formatBytes(remaining)} needed, ${formatBytes(free)} free. ` +
-          "Clear the browser storage, or choose Download as Zip.",
+        `Not enough browser storage: ${formatBytes(remaining)} needed, ${formatBytes(free)} free. ${STORAGE_ADVICE}`,
       );
     },
 
@@ -143,37 +168,41 @@ export function createFolderSink(
     },
 
     async writeFile(path, offset, data) {
-      const dir = await dirOf(path.slice(0, -1), true);
-      const file = await dir.getFileHandle(path[path.length - 1], {
-        create: true,
+      await writing(async () => {
+        const dir = await dirOf(path.slice(0, -1), true);
+        const file = await dir.getFileHandle(path[path.length - 1], {
+          create: true,
+        });
+        const writable = await file.createWritable({
+          keepExistingData: offset > 0,
+        });
+        if (offset > 0) await writable.seek(offset);
+        await writable.write(data);
+        await writable.close();
       });
-      const writable = await file.createWritable({
-        keepExistingData: offset > 0,
-      });
-      if (offset > 0) await writable.seek(offset);
-      await writable.write(data);
-      await writable.close();
       checksums?.whole(path, offset, data);
     },
 
     async open(path, offset) {
-      const dir = await dirOf(path.slice(0, -1), true);
-      const file = await dir.getFileHandle(path[path.length - 1], {
-        create: true,
+      await writing(async () => {
+        const dir = await dirOf(path.slice(0, -1), true);
+        const file = await dir.getFileHandle(path[path.length - 1], {
+          create: true,
+        });
+        writable = await file.createWritable({ keepExistingData: offset > 0 });
+        if (offset > 0) await writable.seek(offset);
       });
-      writable = await file.createWritable({ keepExistingData: offset > 0 });
-      if (offset > 0) await writable.seek(offset);
       checksums?.begin(path, offset);
     },
 
     async write(chunk) {
-      await writable!.write(chunk);
+      await writing(() => writable!.write(chunk));
       checksums?.update(chunk);
     },
 
     async closeFile() {
       if (!writable) return;
-      await writable.close();
+      await writing(() => writable!.close());
       writable = null;
       checksums?.end();
     },

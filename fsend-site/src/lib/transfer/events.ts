@@ -25,6 +25,8 @@ export type TransferEvent =
       accept: () => void;
       reject: () => void;
     }
+  /// Receiver only: the browser asks the user to let fsend store more.
+  | { type: "askingStorage" }
   | { type: "transferring"; entries: TransferEntry[] }
   /// Receiver only: existing entries that differ from the offer, replaced or left alone.
   | { type: "conflicts"; replaced: number; skipped: number }

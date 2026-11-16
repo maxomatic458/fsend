@@ -133,7 +133,7 @@ async function receive(
     (n, { id, offset }) => n + entrySize(entries[id]) - offset,
     0,
   );
-  await sink.reserve(remaining);
+  await sink.reserve(remaining, () => emit({ type: "askingStorage" }));
   peer.send({ type: "accept", files });
   emit(transferring(tops, presentBytes(entries, files)));
   if (plan.conflicts.length > 0) {

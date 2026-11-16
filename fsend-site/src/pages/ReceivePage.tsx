@@ -200,6 +200,12 @@ export function ReceivePage() {
             onAccept={receive.acceptOffer}
             onReject={receive.rejectOffer}
           />
+          <Show when={receive.askingStorage()}>
+            <p class="text-sm text-ink-dim text-center">
+              This transfer needs more browser storage than fsend may use by
+              default. Allow it when your browser asks.
+            </p>
+          </Show>
         </Show>
 
         <Show

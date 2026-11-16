@@ -54,13 +54,13 @@ export class BrowserStorage {
   private constructor(
     private root: FileSystemDirectoryHandle,
     readonly incoming: FileSystemDirectoryHandle,
-    private estimate: () => Promise<StorageEstimate>,
+    private manager: Pick<StorageManager, "estimate" | "persist">,
   ) {}
 
   /** Opens it below `origin`, or returns null if the browser refuses. */
   static async open(
     origin?: FileSystemDirectoryHandle,
-    estimate = () => navigator.storage.estimate(),
+    manager: Pick<StorageManager, "estimate" | "persist"> = navigator.storage,
   ): Promise<BrowserStorage | null> {
     try {
       const top = origin ?? (await navigator.storage.getDirectory());
@@ -68,7 +68,7 @@ export class BrowserStorage {
       return new BrowserStorage(
         root,
         await root.getDirectoryHandle(INCOMING, { create: true }),
-        estimate,
+        manager,
       );
     } catch {
       return null;
@@ -111,8 +111,13 @@ export class BrowserStorage {
 
   /** Free bytes, if the browser says. */
   async free(): Promise<number | undefined> {
-    const { quota, usage } = await this.estimate();
+    const { quota, usage } = await this.manager.estimate();
     return quota === undefined ? undefined : quota - (usage ?? 0);
+  }
+
+  /** Asks to keep the storage for good: Firefox then allows half the disk instead of 10 GiB. */
+  async persist(): Promise<boolean> {
+    return this.manager.persist().catch(() => false);
   }
 }
 

@@ -69,6 +69,8 @@ export function createReceiveSession() {
   const [conflicts, setConflicts] = createSignal({ replaced: 0, skipped: 0 });
   /// 0-100 while the sink packs a zip, null when there is nothing to pack.
   const [packing, setPacking] = createSignal<number | null>(null);
+  /// Whether the browser is asking the user to let fsend store more.
+  const [askingStorage, setAskingStorage] = createSignal(false);
 
   let accept: (() => void) | null = null;
   let reject: (() => void) | null = null;
@@ -145,6 +147,7 @@ export function createReceiveSession() {
     setOffered([]);
     setConflicts({ replaced: 0, skipped: 0 });
     setPacking(null);
+    setAskingStorage(false);
     setState("input");
   };
 
@@ -184,7 +187,11 @@ export function createReceiveSession() {
         reject = event.reject;
         setState("offered");
         break;
+      case "askingStorage":
+        setAskingStorage(true);
+        break;
       case "transferring":
+        setAskingStorage(false);
         run.tracker.initialize(event.entries);
         setState("transferring");
         break;
@@ -207,6 +214,7 @@ export function createReceiveSession() {
         void refreshUsage();
         break;
       case "error":
+        setAskingStorage(false);
         run.setError(event.message);
         setState("error");
         void refreshUsage();
@@ -249,6 +257,7 @@ export function createReceiveSession() {
     storageUsed,
     clearStorage,
     packing,
+    askingStorage,
     isReady,
     chooseFolder,
     start,
