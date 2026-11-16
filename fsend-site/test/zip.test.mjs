@@ -35,17 +35,14 @@ test("only the headers are new bytes", async () => {
   assert.equal(zip.size, 1_000_000 + 30 + 7 + 46 + 7 + 22);
 });
 
-test("zip64 end records once there are too many entries", async () => {
-  const entries = Array.from({ length: 70_000 }, (_, i) => ({ name: `d${i}` }));
-  const bytes = new Uint8Array(await zipBlob(entries).arrayBuffer());
-  const view = new DataView(bytes.buffer);
-  // End of central directory, after the zip64 record and its locator.
-  const end = bytes.length - 22;
-  assert.equal(view.getUint32(end, true), 0x06054b50);
-  assert.equal(view.getUint16(end + 10, true), 0xffff);
-  const locator = end - 20;
-  assert.equal(view.getUint32(locator, true), 0x07064b50);
-  const record = Number(view.getBigUint64(locator + 8, true));
-  assert.equal(view.getUint32(record, true), 0x06064b50);
-  assert.equal(Number(view.getBigUint64(record + 32, true)), 70_000);
+test("zip64 once there are too many entries", async () => {
+  const zip = zipBlob(
+    Array.from({ length: 70_000 }, (_, i) => file(`f${i}`, `${i}`)),
+  );
+  // The classic end record only says "too many".
+  const end = new DataView(await zip.slice(-22).arrayBuffer());
+  assert.equal(end.getUint16(10, true), 0xffff);
+  const files = await unzip(zip);
+  assert.equal(Object.keys(files).length, 70_000);
+  assert.equal(new TextDecoder().decode(files.f69999), "69999");
 });

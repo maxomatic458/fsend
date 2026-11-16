@@ -8,6 +8,9 @@
  * hard on demand — drop a peer abruptly, or close one gracefully.
  */
 
+/** What `sctp.maxMessageSize` reports once connected; a test may lower it. */
+export const sctpLimits = { maxMessageSize: 256 * 1024 };
+
 /** Offers waiting to be answered, keyed by the token embedded in the SDP. */
 const pendingOffers = new Map();
 let nextId = 0;
@@ -123,6 +126,7 @@ export class FakePeerConnection extends FakeEventTarget {
     this._remote = null;
     this._latency = latencyMs;
     this._id = `pc${nextId++}`;
+    this.sctp = null;
   }
 
   createDataChannel(label) {
@@ -180,6 +184,7 @@ export class FakePeerConnection extends FakeEventTarget {
       for (const pc of [offerer, this]) {
         pc.connectionState = "connected";
         pc.iceConnectionState = "connected";
+        pc.sctp = { maxMessageSize: sctpLimits.maxMessageSize };
       }
       // The answerer learns about the channels via ondatachannel.
       for (const [, mirror] of this._channels) {

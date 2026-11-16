@@ -1,10 +1,6 @@
-import {
-  DATA_CHUNK_BYTES,
-  CONCURRENT_FILES,
-  MAX_BUFFERED_BYTES,
-} from "../../config";
+import { CONCURRENT_FILES, MAX_BUFFERED_BYTES } from "../../config";
 import { openSenderSession, type Link } from "../transport/session";
-import { getConnectionType } from "../transport/webrtc";
+import { dataMessageBytes, getConnectionType } from "../transport/webrtc";
 import {
   buildOffer,
   entrySize,
@@ -77,7 +73,10 @@ export async function runSend(
       .catch(() => {});
 
     const peer = Peer.sender(link, abort);
-    await peer.explained(() => send(peer, dataChannel, outgoing, offer, emit));
+    const messageBytes = dataMessageBytes(link.pc);
+    await peer.explained(() =>
+      send(peer, dataChannel, messageBytes, outgoing, offer, emit),
+    );
     emit({ type: "complete" });
   } catch (err) {
     if (!abort.aborted) emit({ type: "error", message: messageOf(err) });
@@ -89,6 +88,7 @@ export async function runSend(
 async function send(
   peer: SenderPeer,
   channel: RTCDataChannel,
+  messageBytes: number,
   { entries, files: sources }: Outgoing,
   offer: Uint8Array,
   emit: TransferListener,
@@ -170,14 +170,14 @@ async function send(
   /** Sends a block of `size` file bytes, which count in proportion to its bytes sent. */
   async function sendBlock(size: number, block: Uint8Array) {
     let counted = 0;
-    for (let offset = 0; offset < block.length; offset += DATA_CHUNK_BYTES) {
+    for (let offset = 0; offset < block.length; offset += messageBytes) {
       if (channel.bufferedAmount > MAX_BUFFERED_BYTES) {
         await Promise.race([
           new Promise((resolve) => (channel.onbufferedamountlow = resolve)),
           peer.stopped,
         ]);
       }
-      const end = Math.min(offset + DATA_CHUNK_BYTES, block.length);
+      const end = Math.min(offset + messageBytes, block.length);
       channel.send(block.slice(offset, end));
       const now = Math.floor((size * end) / block.length);
       for (const [entry, n] of progress.advance(now - counted)) {

@@ -106,6 +106,19 @@ async fn a_lost_link_fails_the_streams_instead_of_hanging() {
 }
 
 #[tokio::test]
+async fn peers_may_send_large_messages() {
+    let (mut sender, mut receiver) = connected_pair().await;
+    // Between two of us, the negotiated limit is what each one takes.
+    let sctp = sender.pc.sctp().await.unwrap();
+    assert_eq!(
+        sctp.max_message_size().await.unwrap(),
+        MAX_INCOMING_MESSAGE_BYTES
+    );
+    sender.close(true).await;
+    receiver.close(true).await;
+}
+
+#[tokio::test]
 async fn writes_are_split_into_channel_sized_messages() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

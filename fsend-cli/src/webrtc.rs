@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use rtc::peer_connection::configuration::setting_engine::SctpMaxMessageSize;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Notify, mpsc, watch};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -33,7 +34,10 @@ pub const DEFAULT_BIND_ADDRS: [SocketAddr; 2] = [
     SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
     SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
 ];
+/// Largest data channel message sent: every peer takes it, and Chromium takes it fastest.
 pub const MAX_MESSAGE_BYTES: usize = 16384;
+/// Largest data channel message taken: browsers send larger messages faster.
+const MAX_INCOMING_MESSAGE_BYTES: u32 = 256 * 1024;
 
 /// Per-channel send buffer.
 const MAX_BUFFERED_BYTES: usize = 1024 * 1024;
@@ -302,8 +306,9 @@ impl WebRtcTransfer {
         let link_tx = Arc::new(link_tx);
         let gathered = Arc::new(Notify::new());
 
-        let mut settings =
-            SettingEngineBuilder::new().with_include_loopback_candidate(config.loopback);
+        let mut settings = SettingEngineBuilder::new()
+            .with_include_loopback_candidate(config.loopback)
+            .with_sctp_max_message_size(SctpMaxMessageSize::Bounded(MAX_INCOMING_MESSAGE_BYTES));
         if let Some((disconnected, failed, keep_alive)) = config.ice_timeouts {
             settings =
                 settings.with_ice_timeouts(Some(disconnected), Some(failed), Some(keep_alive));

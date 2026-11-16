@@ -15,6 +15,7 @@ import {
   sleep,
   unzip,
 } from "./harness/index.mjs";
+import { sctpLimits } from "./harness/webrtc.mjs";
 
 const {
   BrowserStorage,
@@ -24,6 +25,7 @@ const {
   createZipSink,
   encodeFrame,
   Role,
+  MAX_DATA_MESSAGE_BYTES,
 } = await import("./.build/app.mjs");
 
 let peerConnections;
@@ -657,12 +659,14 @@ describe("compression", () => {
     );
     const realSend = channel.send.bind(channel);
     let wire = 0;
+    let largest = 0;
     channel.send = (data) => {
       wire += data.byteLength;
+      largest = Math.max(largest, data.byteLength);
       realSend(tamper ? tamper(data) : data);
     };
     await Promise.all([senderDone, receiverDone]);
-    return { dir, wire, send: send.record, recv: recv.record };
+    return { dir, wire, largest, send: send.record, recv: recv.record };
   }
 
   test("compressible files cross in far fewer bytes", async () => {
@@ -699,7 +703,29 @@ describe("compression", () => {
     assert.equal(recv.error, null);
     for (const side of [send, recv]) {
       assert.equal(side.progress, 3 * 1024 * 1024);
-      assert.ok(side.largestStep <= 16 * 1024, `steps of ${side.largestStep}`);
+      assert.ok(
+        side.largestStep <= MAX_DATA_MESSAGE_BYTES,
+        `steps of ${side.largestStep}`,
+      );
+    }
+  });
+
+  test("data messages are as large as both ends take", async () => {
+    const spec = { "big.bin": bytes(2 * 1024 * 1024, 194) };
+    const { dir, largest } = await counted(spec);
+    assertFiles(dir.snapshot(), expectedSnapshot(spec));
+    assert.equal(largest, MAX_DATA_MESSAGE_BYTES);
+  });
+
+  test("a peer that takes smaller messages gets them", async () => {
+    sctpLimits.maxMessageSize = 16 * 1024;
+    try {
+      const spec = { "big.bin": bytes(2 * 1024 * 1024, 195) };
+      const { dir, largest } = await counted(spec);
+      assertFiles(dir.snapshot(), expectedSnapshot(spec));
+      assert.equal(largest, 16 * 1024);
+    } finally {
+      sctpLimits.maxMessageSize = 256 * 1024;
     }
   });
 

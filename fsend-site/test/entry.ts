@@ -9,7 +9,7 @@ export { buildOffer } from "../src/lib/files/tree";
 export { BrowserStorage } from "../src/lib/files/storage";
 export { zipBlob } from "../src/lib/files/zip";
 export { watchDisconnect } from "../src/lib/transport/webrtc";
-export { DATA_CHUNK_BYTES, MAX_BUFFERED_BYTES } from "../src/config";
+export { MAX_DATA_MESSAGE_BYTES, MAX_BUFFERED_BYTES } from "../src/config";
 export { createSendSession } from "../src/primitives/createSendSession";
 export { createReceiveSession } from "../src/primitives/createReceiveSession";
 export { createProgressTracker } from "../src/primitives/createProgressTracker";

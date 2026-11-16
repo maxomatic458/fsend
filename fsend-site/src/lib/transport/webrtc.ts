@@ -2,6 +2,8 @@ import {
   STUN_SERVERS,
   ICE_GATHERING_TIMEOUT_MS,
   CONNECT_TIMEOUT_MS,
+  MAX_DATA_MESSAGE_BYTES,
+  MAX_MESSAGE_BYTES,
 } from "../../config";
 
 export interface WebRtcConnection {
@@ -227,6 +229,13 @@ export function watchDisconnect(
     },
   };
 }
+
+/** The largest data stream message both ends take, once connected. */
+export const dataMessageBytes = (pc: RTCPeerConnection): number =>
+  Math.min(
+    pc.sctp?.maxMessageSize || MAX_MESSAGE_BYTES,
+    MAX_DATA_MESSAGE_BYTES,
+  );
 
 export async function getConnectionType(
   pc: RTCPeerConnection,
