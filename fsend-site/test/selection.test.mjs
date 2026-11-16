@@ -12,118 +12,117 @@ const { createSendSession, createRoot } = await import("./.build/app.mjs");
  * none at all.
  */
 function slowFolder(name, fileCount, delayMs) {
-  const children = new Map();
-  for (let i = 0; i < fileCount; i++) {
-    children.set(`f${i}.bin`, {
-      kind: "file",
-      name: `f${i}.bin`,
-      async getFile() {
-        await sleep(delayMs);
-        return { size: 1000 };
-      },
-    });
-  }
-  return {
-    kind: "directory",
-    name,
-    handle: {
-      kind: "directory",
-      name,
-      async *entries() {
-        for (const [n, h] of children) yield [n, h];
-      },
-    },
-  };
+    const children = new Map();
+    for (let i = 0; i < fileCount; i++) {
+        children.set(`f${i}.bin`, {
+            kind: "file",
+            name: `f${i}.bin`,
+            async getFile() {
+                await sleep(delayMs);
+                return { size: 1000 };
+            },
+        });
+    }
+    return {
+        kind: "directory",
+        name,
+        handle: {
+            kind: "directory",
+            name,
+            async *entries() {
+                for (const [n, h] of children) yield [n, h];
+            },
+        },
+    };
 }
 
 /** A plain File entry — `buildOffer` reads `.size` with no await at all. */
 function fastFile(name, size) {
-  return { kind: "file", name, file: { size } };
+    return { kind: "file", name, file: { size } };
 }
 
 /** Every row's name paired with the size shown next to it. */
-const labelled = (session) =>
-  session.items().map((item) => [item.entry.name, item.sizeBytes]);
+const labelled = (session) => session.items().map((item) => [item.entry.name, item.sizeBytes]);
 
 const withSession = (body) => inRoot(createRoot, createSendSession, body);
 
 describe("selection sizing", () => {
-  test("a slow tree walk cannot mislabel a newer selection", async () => {
-    await withSession(async (session) => {
-      // A folder that takes many ticks to measure, then immediately a plain
-      // file that takes none — the second measurement resolves first.
-      session.add([slowFolder("big", 12, 4)]);
-      session.add([fastFile("quick.txt", 500)]);
+    test("a slow tree walk cannot mislabel a newer selection", async () => {
+        await withSession(async (session) => {
+            // A folder that takes many ticks to measure, then immediately a plain
+            // file that takes none — the second measurement resolves first.
+            session.add([slowFolder("big", 12, 4)]);
+            session.add([fastFile("quick.txt", 500)]);
 
-      await sleep(400);
+            await sleep(400);
 
-      assert.deepEqual(
-        labelled(session),
-        [
-          ["big", 12 * 1000],
-          ["quick.txt", 500],
-        ],
-        "each row must carry its own size, whatever order they finished in",
-      );
-      assert.equal(
-        session.selectionSizeBytes(),
-        12 * 1000 + 500,
-        "total must include both the folder and the file",
-      );
+            assert.deepEqual(
+                labelled(session),
+                [
+                    ["big", 12 * 1000],
+                    ["quick.txt", 500],
+                ],
+                "each row must carry its own size, whatever order they finished in",
+            );
+            assert.equal(
+                session.selectionSizeBytes(),
+                12 * 1000 + 500,
+                "total must include both the folder and the file",
+            );
+        });
     });
-  });
 
-  test("a removal is not undone by an in-flight measurement", async () => {
-    await withSession(async (session) => {
-      session.add([slowFolder("big", 12, 4), fastFile("quick.txt", 500)]);
-      // Remove the folder while its walk is still running.
-      session.add([fastFile("second.txt", 700)]);
-      session.remove(0);
+    test("a removal is not undone by an in-flight measurement", async () => {
+        await withSession(async (session) => {
+            session.add([slowFolder("big", 12, 4), fastFile("quick.txt", 500)]);
+            // Remove the folder while its walk is still running.
+            session.add([fastFile("second.txt", 700)]);
+            session.remove(0);
 
-      await sleep(400);
-      assert.deepEqual(
-        labelled(session),
-        [
-          ["quick.txt", 500],
-          ["second.txt", 700],
-        ],
-        "the removed folder must not come back when its walk lands",
-      );
-      assert.equal(
-        session.selectionSizeBytes(),
-        500 + 700,
-        "total must reflect the removal, not the pre-removal selection",
-      );
+            await sleep(400);
+            assert.deepEqual(
+                labelled(session),
+                [
+                    ["quick.txt", 500],
+                    ["second.txt", 700],
+                ],
+                "the removed folder must not come back when its walk lands",
+            );
+            assert.equal(
+                session.selectionSizeBytes(),
+                500 + 700,
+                "total must reflect the removal, not the pre-removal selection",
+            );
+        });
     });
-  });
 
-  test("going back keeps the selection, which is still measured", async () => {
-    await withSession(async (session) => {
-      session.add([slowFolder("big", 12, 4)]);
-      session.reset();
+    test("going back keeps the selection, which is still measured", async () => {
+        await withSession(async (session) => {
+            session.add([slowFolder("big", 12, 4)]);
+            session.reset();
 
-      await sleep(400);
-      assert.deepEqual(labelled(session), [["big", 12 * 1000]]);
-      assert.equal(session.selectionSizeBytes(), 12 * 1000);
+            await sleep(400);
+            assert.deepEqual(labelled(session), [["big", 12 * 1000]]);
+            assert.equal(session.selectionSizeBytes(), 12 * 1000);
+        });
     });
-  });
 
-  test("a size is shown as pending until its walk finishes", async () => {
-    await withSession(async (session) => {
-      session.add([slowFolder("big", 12, 20)]);
-      assert.deepEqual(
-        labelled(session),
-        [["big", null]],
-        "the row appears immediately, with no size yet",
-      );
-      assert.equal(
-        session.selectionSizeBytes(),
-        0,
-        "an unmeasured item contributes nothing to the total",
-      );
+    test("a size is shown as pending until its walk finishes", async () => {
+        await withSession(async (session) => {
+            session.add([slowFolder("big", 12, 20)]);
+            assert.deepEqual(
+                labelled(session),
+                [["big", null]],
+                "the row appears immediately, with no size yet",
+            );
+            assert.equal(
+                session.selectionSizeBytes(),
+                0,
+                "an unmeasured item contributes nothing to the total",
+            );
 
-      await sleep(600);
-      assert.deepEqual(labelled(session), [["big", 12 * 1000]]);
+            await sleep(600);
+            assert.deepEqual(labelled(session), [["big", 12 * 1000]]);
+        });
     });
-  });
 });

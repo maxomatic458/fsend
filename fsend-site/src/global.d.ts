@@ -6,21 +6,19 @@ declare const __BUILD_TIME__: string;
 declare const __BUILD_TIMESTAMP__: number;
 
 interface Window {
-  showOpenFilePicker(options?: {
-    multiple?: boolean;
-    types?: Array<{ description?: string; accept: Record<string, string[]> }>;
-  }): Promise<FileSystemFileHandle[]>;
-  showDirectoryPicker(options?: {
-    mode?: "read" | "readwrite";
-  }): Promise<FileSystemDirectoryHandle>;
+    showOpenFilePicker(options?: {
+        multiple?: boolean;
+        types?: Array<{ description?: string; accept: Record<string, string[]> }>;
+    }): Promise<FileSystemFileHandle[]>;
+    showDirectoryPicker(options?: {
+        mode?: "read" | "readwrite";
+    }): Promise<FileSystemDirectoryHandle>;
 }
 
 interface DataTransferItem {
-  getAsFileSystemHandle?(): Promise<
-    FileSystemFileHandle | FileSystemDirectoryHandle | null
-  >;
+    getAsFileSystemHandle?(): Promise<FileSystemFileHandle | FileSystemDirectoryHandle | null>;
 }
 
 interface HTMLInputElement {
-  webkitdirectory: boolean;
+    webkitdirectory: boolean;
 }

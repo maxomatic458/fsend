@@ -10,8 +10,8 @@
     "build": "node scripts/build-wasm.mjs && node scripts/buildinfo.mjs && vite build && vite build --ssr src/entry-server.tsx --outDir .ssg && node scripts/ssg.mjs",
     "serve": "vite preview",
     "test": "node test/run.mjs",
-    "format": "prettier --write .",
-    "format:check": "prettier --check .",
+    "format": "prettier --write --ignore-path .prettierignore .",
+    "format:check": "prettier --check --ignore-path .prettierignore .",
     "test:e2e": "playwright test",
     "test:all": "node test/run.mjs && playwright test"
   },

@@ -12,10 +12,10 @@ const root = document.getElementById("root")!;
 root.textContent = "";
 
 render(
-  () => (
-    <MetaProvider>
-      <App />
-    </MetaProvider>
-  ),
-  root,
+    () => (
+        <MetaProvider>
+            <App />
+        </MetaProvider>
+    ),
+    root,
 );
