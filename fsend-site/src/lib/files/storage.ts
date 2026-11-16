@@ -38,6 +38,19 @@ export function folderKind(): FolderKind | null {
   return null;
 }
 
+/** Whether transfers can be written as they arrive, rather than held in memory. */
+export async function canStoreTransfers(): Promise<boolean> {
+  const kind = folderKind();
+  if (kind !== "browser") return kind === "picked";
+  // Private windows may refuse browser storage, Firefox's always do.
+  try {
+    await navigator.storage.getDirectory();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function chooseFolder(): Promise<FileSystemDirectoryHandle> {
   return window.showDirectoryPicker({ mode: "readwrite" });
 }

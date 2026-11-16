@@ -109,14 +109,14 @@ describe("selection sizing", () => {
     });
   });
 
-  test("reset is not repopulated by an in-flight measurement", async () => {
+  test("going back keeps the selection, which is still measured", async () => {
     await withSession(async (session) => {
       session.add([slowFolder("big", 12, 4)]);
       session.reset();
 
       await sleep(400);
-      assert.deepEqual(session.items(), [], "the selection must stay cleared");
-      assert.equal(session.selectionSizeBytes(), 0, "total must stay cleared");
+      assert.deepEqual(labelled(session), [["big", 12 * 1000]]);
+      assert.equal(session.selectionSizeBytes(), 12 * 1000);
     });
   });
 

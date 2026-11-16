@@ -106,14 +106,30 @@ impl IrohTransfer {
         Ok(EndpointAddr::from_parts(id, addrs))
     }
 
-    /// Waits for the receiver to connect.
-    pub async fn accept(endpoint: Endpoint) -> Result<Self, TransferError> {
+    /// Waits for the receiver `peer` told about over the paired relay; anyone else is turned away.
+    pub async fn accept(endpoint: Endpoint, peer: &ConnectionInfo) -> Result<Self, TransferError> {
+        let expected = Self::addr_from_connection_info(peer)?.id;
         let accept = async {
-            let incoming = endpoint
-                .accept()
-                .await
-                .ok_or(TransferError::EndpointClosed)?;
-            Ok::<_, TransferError>(incoming.accept()?.await?)
+            loop {
+                let incoming = endpoint
+                    .accept()
+                    .await
+                    .ok_or(TransferError::EndpointClosed)?;
+                let conn = match incoming.accept() {
+                    Ok(connecting) => connecting.await,
+                    Err(err) => Err(err.into()),
+                };
+                match conn {
+                    Ok(conn) if conn.remote_id() == expected => {
+                        return Ok::<_, TransferError>(conn);
+                    }
+                    Ok(conn) => {
+                        tracing::warn!("turned away {}, not the paired receiver", conn.remote_id());
+                        conn.close(VarInt::from(CLOSE_ERR), b"not the paired receiver");
+                    }
+                    Err(err) => tracing::warn!("a connection attempt failed: {err}"),
+                }
+            }
         };
         let conn = tokio::time::timeout(CONNECT_TIMEOUT, accept)
             .await

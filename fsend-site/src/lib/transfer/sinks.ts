@@ -10,6 +10,17 @@ const STORAGE_ADVICE = "Clear the browser storage, or choose Download as Zip.";
 /// Long enough for the browser to have started reading the blob.
 const REVOKE_DELAY_MS = 60_000;
 
+/// How a sink asks the user for more room.
+export interface Asking {
+  /// Called as the browser starts asking.
+  start(): void;
+  /// Resolves once the user would rather not wait for the answer.
+  skipped: Promise<void>;
+}
+
+/// The sink has no room for the transfer, even after asking for more.
+export class NotEnoughRoom extends Error {}
+
 /// Bytes are written into this sink
 export interface TransferSink {
   /// Called once the offer of `tops` is accepted, before anything is probed.
@@ -18,11 +29,13 @@ export interface TransferSink {
   probe(entry: Entry): Promise<Local>;
   /// The file at `path`, which `probe` found.
   read(path: string[]): Promise<Blob>;
-  /// Throws unless `remaining` more bytes fit; `onAsk` runs while the user is asked for more room.
-  reserve(remaining: number, onAsk: () => void): Promise<void>;
+  /// Throws `NotEnoughRoom` unless `remaining` more bytes fit, asking for more room if that helps.
+  reserve(remaining: number, asking: Asking): Promise<void>;
   createDir(path: string[]): Promise<void>;
   /// Writes the rest of a file, from `offset` on, in one go; several may run at once.
   writeFile(path: string[], offset: number, data: Bytes): Promise<void>;
+  /// Opens a partial file ahead of the transfer: browsers copy it first, which can take minutes.
+  reopen(path: string[], offset: number): Promise<void>;
   /// Opens a file to write from `offset` on; at 0 whatever was there is dropped.
   open(path: string[], offset: number): Promise<void>;
   write(chunk: Bytes): Promise<void>;
@@ -44,6 +57,8 @@ export function createFolderSink(
   storage?: BrowserStorage,
 ): TransferSink {
   let writable: FileSystemWritableFileStream | null = null;
+  // Partial files opened by `reopen`, by path, until they are written to.
+  const reopened = new Map<string, FileSystemWritableFileStream>();
   // Kept only for a zip of browser storage.
   let checksums: Checksums | undefined;
 
@@ -66,6 +81,22 @@ export function createFolderSink(
   const fileAt = async (path: string[]) => {
     const dir = await dirOf(path.slice(0, -1), false);
     return dir.getFileHandle(path[path.length - 1]);
+  };
+
+  /** A writable for `path` from `offset` on, the one `reopen` made if there is one. */
+  const writableAt = async (path: string[], offset: number) => {
+    const ready = reopened.get(path.join("/"));
+    if (ready) {
+      reopened.delete(path.join("/"));
+      return ready;
+    }
+    const dir = await dirOf(path.slice(0, -1), true);
+    const file = await dir.getFileHandle(path[path.length - 1], {
+      create: true,
+    });
+    const opened = await file.createWritable({ keepExistingData: offset > 0 });
+    if (offset > 0) await opened.seek(offset);
+    return opened;
   };
 
   // Some browsers, Chromium in private windows for one, report more storage than they allow.
@@ -149,16 +180,20 @@ export function createFolderSink(
       return (await fileAt(path)).getFile();
     },
 
-    async reserve(remaining, onAsk) {
+    async reserve(remaining, asking) {
       if (!storage) return;
       let free = await storage.free();
       if (free === undefined || remaining <= free) return;
-      onAsk();
-      if (await storage.persist()) {
+      asking.start();
+      const granted = await Promise.race([
+        storage.persist(),
+        asking.skipped.then(() => false),
+      ]);
+      if (granted) {
         free = await storage.free();
         if (free === undefined || remaining <= free) return;
       }
-      throw new Error(
+      throw new NotEnoughRoom(
         `Not enough browser storage: ${formatBytes(remaining)} needed, ${formatBytes(free)} free. ${STORAGE_ADVICE}`,
       );
     },
@@ -169,28 +204,22 @@ export function createFolderSink(
 
     async writeFile(path, offset, data) {
       await writing(async () => {
-        const dir = await dirOf(path.slice(0, -1), true);
-        const file = await dir.getFileHandle(path[path.length - 1], {
-          create: true,
-        });
-        const writable = await file.createWritable({
-          keepExistingData: offset > 0,
-        });
-        if (offset > 0) await writable.seek(offset);
+        const writable = await writableAt(path, offset);
         await writable.write(data);
         await writable.close();
       });
       checksums?.whole(path, offset, data);
     },
 
+    async reopen(path, offset) {
+      await writing(async () => {
+        reopened.set(path.join("/"), await writableAt(path, offset));
+      });
+    },
+
     async open(path, offset) {
       await writing(async () => {
-        const dir = await dirOf(path.slice(0, -1), true);
-        const file = await dir.getFileHandle(path[path.length - 1], {
-          create: true,
-        });
-        writable = await file.createWritable({ keepExistingData: offset > 0 });
-        if (offset > 0) await writable.seek(offset);
+        writable = await writableAt(path, offset);
       });
       checksums?.begin(path, offset);
     },
@@ -228,15 +257,36 @@ export function createFolderSink(
       // Closing flushes what arrived, which is what resume reads back.
       await writable?.close().catch(() => {});
       writable = null;
+      for (const ready of reopened.values())
+        await ready.close().catch(() => {});
+      reopened.clear();
     },
   };
 }
+
+/// How much of a streamed file the zip sink holds as chunks before adding them to its blob.
+const BLOB_STEP_BYTES = 64 * 1024 * 1024;
 
 /// Buffers in memory and saves the files at the end, zipped if more than one.
 export function createZipSink(): TransferSink {
   const files = new Map<string, Blob>();
   const checksums = new Checksums();
-  let current: { path: string; chunks: Bytes[] } | null = null;
+  // The file being streamed: its blob so far, and the chunks not yet in it.
+  let current: {
+    path: string;
+    blob: Blob;
+    chunks: Bytes[];
+    pending: number;
+  } | null = null;
+  // A blob lets the browser keep the bytes outside the JS heap, and adding to
+  // one refers to it rather than copying, so the file is never held twice.
+  // (Measured: one blob per step joined at the end costs Firefox more memory.)
+  const addChunks = () => {
+    if (!current || current.chunks.length === 0) return;
+    current.blob = new Blob([current.blob, ...current.chunks]);
+    current.chunks = [];
+    current.pending = 0;
+  };
 
   return {
     async prepare() {},
@@ -263,19 +313,30 @@ export function createZipSink(): TransferSink {
       checksums.whole(path, offset, data);
     },
 
+    async reopen() {
+      // Nothing it holds survives a transfer, so nothing is partial.
+    },
+
     async open(path, offset) {
-      current = { path: path.join("/"), chunks: [] };
+      current = {
+        path: path.join("/"),
+        blob: new Blob(),
+        chunks: [],
+        pending: 0,
+      };
       checksums.begin(path, offset);
     },
 
     async write(chunk) {
       current!.chunks.push(chunk);
+      current!.pending += chunk.length;
+      if (current!.pending >= BLOB_STEP_BYTES) addChunks();
       checksums.update(chunk);
     },
 
     async closeFile() {
-      // A blob lets the browser keep the bytes outside the JS heap.
-      if (current) files.set(current.path, new Blob(current.chunks));
+      addChunks();
+      if (current) files.set(current.path, current.blob);
       current = null;
       checksums.end();
     },

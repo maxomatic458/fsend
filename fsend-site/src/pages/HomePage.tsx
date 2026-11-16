@@ -1,10 +1,10 @@
-import { createSignal, For, Show, type JSX } from "solid-js";
+import { createSignal, For, onMount, Show, type JSX } from "solid-js";
 import { A, useNavigate } from "@solidjs/router";
 import { Title, Meta, Link } from "@solidjs/meta";
 import { FiUpload, FiDownload } from "solid-icons/fi";
 import { handleDrop } from "../lib/files/source";
 import { setPendingDrop } from "../lib/pendingDrop";
-import { folderKind } from "../lib/files/storage";
+import { canStoreTransfers } from "../lib/files/storage";
 import { GITHUB_URL, MDN_FS_API, MDN_WEBRTC, SITE_URL } from "../lib/links";
 import { createWindowDropTarget } from "../primitives/createWindowDropTarget";
 import { Logo } from "../components/Logo";
@@ -120,7 +120,9 @@ function Eyebrow(props: { children: string }) {
 
 export function HomePage() {
   const navigate = useNavigate();
-  const canResume = folderKind() !== null;
+  // Known only in the browser, so the prerendered page shows no notice.
+  const [memoryOnly, setMemoryOnly] = createSignal(false);
+  onMount(async () => setMemoryOnly(!(await canStoreTransfers())));
   const [isProcessing, setIsProcessing] = createSignal(false);
 
   const isDragging = createWindowDropTarget(async (data) => {
@@ -175,12 +177,13 @@ export function HomePage() {
         </div>
 
         <div class="w-full max-w-[560px] mt-10 flex flex-col gap-3.5">
-          <Show when={!canResume}>
+          <Show when={memoryOnly()}>
             <div class="flex gap-3 items-start text-left bg-warn-bg border border-warn-line text-warn-ink rounded-lg px-4 py-3.5 text-sm leading-relaxed">
               <div>
-                Your browser has limited support. Transfers are held in memory
-                and you won't be able to resume interrupted ones. For the best
-                experience, use a current Chrome, Edge, Firefox or Safari.
+                This browser holds received files in memory until the transfer
+                finishes, so their size is limited by free memory and an
+                interrupted transfer can't resume. A normal window of a current
+                Chrome, Edge, Firefox or Safari saves them as they arrive.
               </div>
               <div class="flex-shrink-0"></div>
             </div>

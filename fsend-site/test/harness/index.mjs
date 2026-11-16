@@ -153,6 +153,8 @@ export function makeRecorder({ onOffered } = {}) {
   const record = {
     code: null,
     states: [],
+    /// When each kind of event first arrived.
+    at: {},
     progress: 0,
     /// The largest progress step.
     largestStep: 0,
@@ -168,6 +170,7 @@ export function makeRecorder({ onOffered } = {}) {
 
   const emit = (event) => {
     record.states.push(event.type);
+    record.at[event.type] ??= Date.now();
     switch (event.type) {
       case "code":
         record.code = event.code;

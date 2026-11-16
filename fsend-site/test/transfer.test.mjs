@@ -15,8 +15,8 @@ import {
   sleep,
   unzip,
 } from "./harness/index.mjs";
-import { sctpLimits } from "./harness/webrtc.mjs";
-import { storageLimit } from "./harness/fs-access.mjs";
+import { ice, sctpLimits } from "./harness/webrtc.mjs";
+import { reopening, storageLimit } from "./harness/fs-access.mjs";
 
 const {
   BrowserStorage,
@@ -282,7 +282,8 @@ describe("complete transfers (fallback, no File System Access API)", () => {
 describe("browser storage (OPFS)", () => {
   /**
    * fsend's storage below a fresh origin, with `quota` bytes; `persisted`
-   * is the quota once the user lets fsend keep its data, if they do.
+   * is the quota once the user lets fsend keep its data, if they do, or
+   * "unanswered" when they never decide.
    */
   const openStorage = (
     origin = new MemoryDirectoryHandle(),
@@ -292,6 +293,7 @@ describe("browser storage (OPFS)", () => {
     BrowserStorage.open(origin, {
       estimate: async () => ({ quota, usage: 0 }),
       persist: async () => {
+        if (persisted === "unanswered") return new Promise(() => {});
         if (persisted === undefined) return false;
         quota = persisted;
         return true;
@@ -299,7 +301,7 @@ describe("browser storage (OPFS)", () => {
     });
 
   /** One transfer of `spec` into `storage`, as the receive page runs it. */
-  async function staged(storage, spec, { cutAfter } = {}) {
+  async function staged(storage, spec, { cutAfter, options } = {}) {
     const send = makeRecorder();
     const recv = makeRecorder();
     const senderDone = runSend(
@@ -314,6 +316,7 @@ describe("browser storage (OPFS)", () => {
       "replace",
       recv.emit,
       new AbortController().signal,
+      options,
     );
     if (cutAfter !== undefined) {
       await waitFor(() => recv.record.progress > cutAfter, {
@@ -380,6 +383,28 @@ describe("browser storage (OPFS)", () => {
     );
   });
 
+  test("a partial file is reopened before the sender starts sending", async () => {
+    // Reopening copies the file, which can outlast the sender's wait for acks.
+    const storage = await openStorage();
+    const spec = { "movie.bin": bytes(2_000_000, 183) };
+    const first = await staged(storage, spec, { cutAfter: 1_300_000 });
+    assert.ok(first.recv.error, "the first attempt fails");
+
+    reopening.ms = 300;
+    try {
+      const { send, recv } = await staged(storage, spec);
+      assert.equal(recv.error, null);
+      assert.ok(reopening.doneAt > 0, "the partial file was reopened");
+      assert.ok(
+        reopening.doneAt <= send.at.transferring,
+        "reopened before the sender was accepted",
+      );
+    } finally {
+      reopening.ms = 0;
+      reopening.doneAt = 0;
+    }
+  });
+
   test("an interrupted transfer resumes from storage", async () => {
     const storage = await openStorage();
     const spec = { "movie.bin": bytes(2_000_000, 184) };
@@ -428,6 +453,29 @@ describe("browser storage (OPFS)", () => {
     assert.match(send.error ?? "", /The other side failed/);
   });
 
+  for (const [why, persisted, skipAsking] of [
+    ["the user denies more room", undefined, undefined],
+    ["the user downloads it as a zip instead", "unanswered", Promise.resolve()],
+  ]) {
+    test(`a transfer without room is held in memory when ${why}`, async () => {
+      const storage = await openStorage(undefined, 1000, persisted);
+      const spec = { "big.bin": bytes(5000, 190) };
+      const { recv } = await staged(storage, spec, {
+        options: { fallback: createZipSink, skipAsking },
+      });
+      assert.equal(recv.error, null);
+      assert.ok(recv.states.includes("askingStorage"));
+      assert.ok(recv.states.includes("heldInMemory"));
+      const [download] = getDownloads();
+      assert.equal(download.name, "big.bin");
+      assert.deepEqual(
+        new Uint8Array(await download.blob.arrayBuffer()),
+        spec["big.bin"],
+      );
+      assert.deepEqual(storage.incoming.snapshot(), {}, "nothing was stored");
+    });
+  }
+
   test("a transfer that fits once the user allows more room is received", async () => {
     // Firefox allows half the disk instead of 10 GiB once a site may keep its data.
     const storage = await openStorage(undefined, 1000, 1e9);
@@ -475,6 +523,54 @@ describe("browser storage (OPFS)", () => {
 });
 
 describe("interrupted transfers", () => {
+  /** One attempt in which the peers get on as `outcome` says; `then` runs once both are trying. */
+  async function attempt(outcome, then = async () => {}) {
+    ice.outcome = outcome;
+    try {
+      const send = makeRecorder();
+      const recv = makeRecorder();
+      const sendAbort = new AbortController();
+      const recvAbort = new AbortController();
+      const senderDone = runSend(
+        makeEntries({ "a.bin": bytes(100, 70) }),
+        send.emit,
+        sendAbort.signal,
+      );
+      const code = await waitFor(() => send.record.code, {
+        label: "share code",
+      });
+      const receiverDone = runReceive(
+        code,
+        createFolderSink(new MemoryDirectoryHandle()),
+        "skip",
+        recv.emit,
+        recvAbort.signal,
+      );
+      await waitFor(() => peerConnections.length >= 2, {
+        label: "both connections",
+      });
+      await then(sendAbort, recvAbort);
+      await Promise.all([senderDone, receiverDone]);
+      return { send: send.record, recv: recv.record };
+    } finally {
+      ice.outcome = "connect";
+    }
+  }
+
+  test("peers that never connect both fail instead of waiting", async () => {
+    const { send, recv } = await attempt("fail");
+    assert.match(recv.error ?? "", /WebRTC connection failed/);
+    assert.match(send.error ?? "", /WebRTC connection failed/);
+  });
+
+  test("cancelling while the peers connect ends the attempt at once", async () => {
+    const { send, recv } = await attempt("stall", async (...aborts) => {
+      for (const abort of aborts) abort.abort();
+    });
+    assert.equal(recv.error, null, "a cancel is not an error");
+    assert.equal(send.error, null, "a cancel is not an error");
+  });
+
   test("sender stops when the receiver's tab disappears", async () => {
     const spec = { "big.bin": bytes(4_000_000, 71) };
     const send = makeRecorder();

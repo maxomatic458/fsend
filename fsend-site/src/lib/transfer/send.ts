@@ -64,7 +64,6 @@ export async function runSend(
       onWaitingPeer: () => emit({ type: "waitingPeer" }),
       onHandshaking: () => emit({ type: "handshaking" }),
     });
-    if (!link) return;
     const { dataChannel } = link;
 
     // cosmetic: fetched in the background, ignored if it fails.

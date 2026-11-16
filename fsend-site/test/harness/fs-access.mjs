@@ -25,6 +25,9 @@ class TypeMismatchError extends Error {
 /** Bytes writes may still add, as a browser's real limit; a test may lower it. */
 export const storageLimit = { left: Infinity };
 
+/** How long reopening a partial file takes, as browsers copy it first; and when one last finished. */
+export const reopening = { ms: 0, doneAt: 0 };
+
 export class MemoryFileHandle {
   constructor(name) {
     this.kind = "file";
@@ -37,6 +40,10 @@ export class MemoryFileHandle {
   }
 
   async createWritable({ keepExistingData = false } = {}) {
+    if (keepExistingData && reopening.ms > 0) {
+      await new Promise((resolve) => setTimeout(resolve, reopening.ms));
+      reopening.doneAt = Date.now();
+    }
     return new MemoryWritable(this, keepExistingData);
   }
 }

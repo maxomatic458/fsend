@@ -117,6 +117,7 @@ fn loopback_info(endpoint: &Endpoint) -> ConnectionInfo {
 
 fn bench_iroh(payload: &Path, out: &Path, bytes: u64) -> f64 {
     let (addr_tx, addr_rx) = mpsc::channel();
+    let (peer_tx, peer_rx) = mpsc::channel();
 
     let sender = thread::spawn({
         let payload = payload.to_path_buf();
@@ -124,7 +125,8 @@ fn bench_iroh(payload: &Path, out: &Path, bytes: u64) -> f64 {
             send_harness(payload, async {
                 let endpoint = IrohTransfer::bind(presets::Minimal).await.unwrap();
                 addr_tx.send(loopback_info(&endpoint)).unwrap();
-                Box::new(IrohTransfer::accept(endpoint).await.unwrap()) as Box<dyn Transport>
+                let peer = peer_rx.recv().unwrap();
+                Box::new(IrohTransfer::accept(endpoint, &peer).await.unwrap()) as Box<dyn Transport>
             })
         }
     });
@@ -133,6 +135,7 @@ fn bench_iroh(payload: &Path, out: &Path, bytes: u64) -> f64 {
         move || {
             receive_harness(out, bytes, async {
                 let endpoint = IrohTransfer::bind(presets::Minimal).await.unwrap();
+                peer_tx.send(loopback_info(&endpoint)).unwrap();
                 let peer = addr_rx.recv().unwrap();
                 Box::new(IrohTransfer::connect(endpoint, peer).await.unwrap()) as Box<dyn Transport>
             })

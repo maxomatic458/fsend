@@ -31,9 +31,11 @@ use tokio::{
 use tracing::info;
 
 /// Largest frame a client may send.
-pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+pub const MAX_MESSAGE_BYTES: usize = 32 * 1024;
 /// Signals one client may send per session.
-pub const MAX_SIGNALS: usize = 32;
+pub const MAX_SIGNALS: usize = 4;
+/// Nameplates tried before a nearly full relay reports itself busy.
+const NAMEPLATE_TRIES: usize = 64;
 /// Time for any single write to a client.
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// Time for a client to say `create` or `join` after connecting.
@@ -149,12 +151,9 @@ impl Relay {
         let (join, joined) = oneshot::channel();
         let mut slots = self.slots();
         slots.retain(|_, slot| !matches!(slot, Slot::Expired { until } if *until <= now));
-        let nameplate = loop {
-            let nameplate = Nameplate::random();
-            if !slots.contains_key(&nameplate) {
-                break nameplate;
-            }
-        };
+        let nameplate = std::iter::repeat_with(Nameplate::random)
+            .take(NAMEPLATE_TRIES)
+            .find(|nameplate| !slots.contains_key(nameplate))?;
         slots.insert(
             nameplate.clone(),
             Slot::Open {
@@ -185,7 +184,7 @@ impl Relay {
 async fn upgrade(ws: WebSocketUpgrade, State(relay): State<Arc<Relay>>) -> Response {
     ws.max_message_size(MAX_MESSAGE_BYTES)
         .max_frame_size(MAX_MESSAGE_BYTES)
-        .on_upgrade(move |ws| connection(Socket(ws), relay))
+        .on_upgrade(move |ws| connection(Socket::new(ws), relay))
 }
 
 async fn connection(mut ws: Socket, relay: Arc<Relay>) {
@@ -246,7 +245,7 @@ async fn create(mut ws: Socket, relay: Arc<Relay>, transports: Vec<Transport>) {
                 break joined.await;
             }
             _ = ping.tick() => {
-                if !ws.send(Message::Ping(Default::default())).await {
+                if !ws.ping().await {
                     relay.close(&nameplate, false);
                     return;
                 }
@@ -331,7 +330,7 @@ async fn forward(mut ws: Socket, config: &Config, peer: Peer) {
                 return ws.fail(ErrorCode::Expired).await;
             }
             _ = ping.tick() => {
-                if !ws.send(Message::Ping(Default::default())).await {
+                if !ws.ping().await {
                     return;
                 }
             }
@@ -378,12 +377,28 @@ fn pinger(period: Duration) -> Interval {
     ping
 }
 
-struct Socket(WebSocket);
+struct Socket {
+    ws: WebSocket,
+    /// Whether the last ping was answered.
+    answered: bool,
+}
 
 impl Socket {
+    fn new(ws: WebSocket) -> Self {
+        Self { ws, answered: true }
+    }
+
+    /// Pings, unless the last ping went unanswered: the client is gone.
+    async fn ping(&mut self) -> bool {
+        if !std::mem::replace(&mut self.answered, false) {
+            return false;
+        }
+        self.send(Message::Ping(Default::default())).await
+    }
+
     async fn send(&mut self, message: Message) -> bool {
         matches!(
-            timeout(SEND_TIMEOUT, self.0.send(message)).await,
+            timeout(SEND_TIMEOUT, self.ws.send(message)).await,
             Ok(Ok(()))
         )
     }
@@ -407,10 +422,11 @@ impl Socket {
     /// The next data frame, `None` once closed.
     async fn recv(&mut self) -> Option<Frame> {
         loop {
-            match self.0.recv().await? {
+            match self.ws.recv().await? {
                 Ok(Message::Text(text)) => return Some(Frame::Text(text)),
                 Ok(Message::Binary(data)) => return Some(Frame::Binary(data)),
-                Ok(Message::Ping(_) | Message::Pong(_)) => {}
+                Ok(Message::Pong(_)) => self.answered = true,
+                Ok(Message::Ping(_)) => {}
                 Ok(Message::Close(_)) | Err(_) => return None,
             }
         }

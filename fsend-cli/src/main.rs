@@ -107,9 +107,9 @@ async fn connect_as_sender(relay: &mut Relay) -> color_eyre::Result<Box<dyn tran
             let my_info = IrohTransfer::local_connection_info(&endpoint).await;
 
             relay.send_connection(my_info).await?;
-            let _peer_info = relay.connection().await?;
+            let peer_info = relay.connection().await?;
 
-            Ok(Box::new(IrohTransfer::accept(endpoint).await?))
+            Ok(Box::new(IrohTransfer::accept(endpoint, &peer_info).await?))
         }
         Transport::Webrtc => {
             let (mut wrt, offer_sdp) = WebRtcTransfer::create_offerer().await?;

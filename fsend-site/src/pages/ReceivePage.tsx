@@ -26,6 +26,8 @@ export function ReceivePage() {
   const receive = createReceiveSession();
   const toFs = () => receive.mode() === "fs";
   const toFolder = () => toFs() && receive.kind() === "picked";
+  /// Held in memory: chosen, or because browser storage had no room.
+  const inMemory = () => !toFs() || receive.heldInMemory();
 
   createWindowDropTarget(() => {});
   const exitGuard = createExitGuard(receive.isTransferring);
@@ -64,7 +66,7 @@ export function ReceivePage() {
         open={receive.pendingLink() !== null}
         title="Receive From the New Link?"
         message={
-          toFs()
+          !inMemory()
             ? "This cancels the current transfer. What has arrived so far stays, so it can resume later."
             : "This cancels the current transfer."
         }
@@ -197,14 +199,25 @@ export function ReceivePage() {
           <FileOffer
             files={receive.offered()}
             inMemory={!toFs()}
+            busy={receive.accepted()}
             onAccept={receive.acceptOffer}
             onReject={receive.rejectOffer}
           />
           <Show when={receive.askingStorage()}>
-            <p class="text-sm text-ink-dim text-center">
-              This transfer needs more browser storage than fsend may use by
-              default. Allow it when your browser asks.
-            </p>
+            <div class="flex flex-col items-center gap-3 text-center">
+              <p class="text-sm text-ink-dim">
+                This transfer needs more browser storage than fsend may use by
+                default. Allow it when your browser asks, or download it as a
+                zip, which holds it in memory until it finishes.
+              </p>
+              <Button
+                tone="ghost"
+                size="sm"
+                onClick={receive.downloadAsZipInstead}
+              >
+                Download as Zip Instead
+              </Button>
+            </div>
           </Show>
         </Show>
 
@@ -223,12 +236,14 @@ export function ReceivePage() {
                 ? `Packing the zip... ${Math.round(receive.packing()!)}%`
                 : receive.state() !== "transferring"
                   ? undefined
-                  : toFs()
-                    ? "Cancelling keeps what has arrived, so you can resume later."
-                    : "Keep this tab open until the transfer finishes."
+                  : receive.heldInMemory()
+                    ? "Browser storage had no room, so this transfer is held in memory. Keep this tab open until it finishes."
+                    : !inMemory()
+                      ? "Cancelling keeps what has arrived, so you can resume later."
+                      : "Keep this tab open until the transfer finishes."
             }
             actions={
-              <Show when={receive.state() === "transferring" && toFs()}>
+              <Show when={receive.state() === "transferring" && !inMemory()}>
                 <Button tone="ghost" size="sm" onClick={cancelTransfer}>
                   Cancel
                 </Button>

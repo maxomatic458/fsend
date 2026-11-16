@@ -59,7 +59,7 @@ export interface SenderSessionHooks {
 export async function openSenderSession(
   abort: AbortSignal,
   hooks: SenderSessionHooks,
-): Promise<Link | null> {
+): Promise<Link> {
   await loadProto();
   const relay = await Relay.connect(abort);
   try {
@@ -76,13 +76,9 @@ export async function openSenderSession(
 
     relay.sendConnection(webRtcInfo(offerSdp));
     await applyAnswer(pc, sdpOf(await relay.connection()));
-    await waitConnected(pc, [controlChannel, dataChannel]);
+    await waitConnected(pc, [controlChannel, dataChannel], abort);
     // Once connected, the transfer tells the peer it was cancelled.
     abort.removeEventListener("abort", closeOnAbort);
-    if (abort.aborted) {
-      pc.close();
-      return null;
-    }
 
     return assemble(pc, controlChannel, dataChannel);
   } finally {
@@ -94,7 +90,7 @@ export async function openReceiverSession(
   code: string,
   abort: AbortSignal,
   hooks: { onHandshaking(): void },
-): Promise<Link | null> {
+): Promise<Link> {
   await loadProto();
   const parsed = parseCode(code);
   if ("error" in parsed) throw new Error(`Invalid code: ${parsed.message}`);
@@ -110,14 +106,16 @@ export async function openReceiverSession(
 
     relay.sendConnection(webRtcInfo(answerer.answerSdp));
 
-    const { controlChannel, dataChannel } = await answerer.channelsReady;
-    await waitConnected(pc, [controlChannel, dataChannel]);
+    // The channels only arrive once the peers connect, which may never happen.
+    const channels = answerer.channelsReady;
+    await waitConnected(
+      pc,
+      channels.then((c) => [c.controlChannel, c.dataChannel]),
+      abort,
+    );
+    const { controlChannel, dataChannel } = await channels;
     // Once connected, the transfer tells the peer it was cancelled.
     abort.removeEventListener("abort", closeOnAbort);
-    if (abort.aborted) {
-      pc.close();
-      return null;
-    }
     hooks.onHandshaking();
 
     return assemble(pc, controlChannel, dataChannel);

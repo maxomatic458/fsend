@@ -105,18 +105,29 @@ export function applyAnswer(
   );
 }
 
+/**
+ * Resolves once the connection is up and `channels` are open. `channels` may
+ * still be on their way, as the answerer's are until the peers connect.
+ * Rejects if the connection fails, `timeoutMs` passes, or `abort` fires.
+ */
 export function waitConnected(
   pc: RTCPeerConnection,
-  channels: RTCDataChannel[],
+  channels: RTCDataChannel[] | Promise<RTCDataChannel[]>,
+  abort: AbortSignal,
   timeoutMs = CONNECT_TIMEOUT_MS,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
+    let opened: RTCDataChannel[] = [];
+    let settled = false;
     const cleanup = () => {
       clearTimeout(timer);
       pc.removeEventListener("connectionstatechange", onState);
-      for (const ch of channels) ch.removeEventListener("open", check);
+      abort.removeEventListener("abort", onAbort);
+      for (const ch of opened) ch.removeEventListener("open", check);
     };
     const settle = (err?: Error) => {
+      if (settled) return;
+      settled = true;
       cleanup();
       if (err) reject(err);
       else resolve();
@@ -124,9 +135,10 @@ export function waitConnected(
 
     function check() {
       if (
+        opened.length > 0 &&
         (pc.connectionState === "connected" ||
           pc.connectionState === ("completed" as string)) &&
-        channels.every((ch) => ch.readyState === "open")
+        opened.every((ch) => ch.readyState === "open")
       ) {
         settle();
       }
@@ -140,20 +152,28 @@ export function waitConnected(
       check();
     }
 
+    function onAbort() {
+      settle(new Error("Cancelled"));
+    }
+
     const timer = setTimeout(
       () => settle(new Error("Timed out establishing the connection")),
       timeoutMs,
     );
-
+    if (abort.aborted) return onAbort();
     if (pc.connectionState === "failed") {
       settle(new Error("WebRTC connection failed"));
       return;
     }
-
     pc.addEventListener("connectionstatechange", onState);
-    for (const ch of channels) ch.addEventListener("open", check);
+    abort.addEventListener("abort", onAbort);
 
-    check();
+    Promise.resolve(channels).then((chs) => {
+      if (settled) return;
+      opened = chs;
+      for (const ch of opened) ch.addEventListener("open", check);
+      check();
+    }, settle);
   });
 }
 

@@ -1,9 +1,23 @@
+const BYTE_UNITS = [
+  ["KB", 1],
+  ["MB", 1],
+  ["GB", 2],
+] as const;
+
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024)
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  let value = bytes / 1024;
+  let unit = 0;
+  // Rounded before picking the unit, so it never shows "1024.0 KB".
+  while (
+    unit < BYTE_UNITS.length - 1 &&
+    Number(value.toFixed(BYTE_UNITS[unit][1])) >= 1024
+  ) {
+    value /= 1024;
+    unit++;
+  }
+  const [name, digits] = BYTE_UNITS[unit];
+  return `${value.toFixed(digits)} ${name}`;
 }
 
 export function formatSpeed(bytesPerSec: number): string {
@@ -35,13 +49,10 @@ function pluralize(n: number, unit: string): string {
 
 export function formatTime(seconds: number): string {
   if (seconds < 1) return "< 1s";
-  if (seconds < 60) return `${Math.round(seconds)}s`;
-  if (seconds < 3600) {
-    const m = Math.floor(seconds / 60);
-    const s = Math.round(seconds % 60);
-    return `${m}m ${s}s`;
-  }
-  const h = Math.floor(seconds / 3600);
-  const m = Math.round((seconds % 3600) / 60);
-  return `${h}h ${m}m`;
+  // Rounded before splitting, so it never shows "1m 60s".
+  const total = Math.round(seconds);
+  if (total < 60) return `${total}s`;
+  if (total < 3600) return `${Math.floor(total / 60)}m ${total % 60}s`;
+  const minutes = Math.round(total / 60);
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }

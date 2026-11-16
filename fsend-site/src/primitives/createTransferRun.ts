@@ -30,6 +30,7 @@ export function createTransferRun() {
     setConnection,
     /** Fresh signal for a new attempt, reusing the current one until it aborts. */
     beginAttempt: (): AbortSignal => {
+      setConnection("unknown");
       if (abortController.signal.aborted) {
         abortController = new AbortController();
       }

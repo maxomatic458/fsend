@@ -33,9 +33,9 @@ fn loopback_info(endpoint: &Endpoint) -> ConnectionInfo {
 async fn connected_pair() -> (IrohTransfer, IrohTransfer) {
     let sender = local_endpoint().await;
     let receiver = local_endpoint().await;
-    let info = loopback_info(&sender);
+    let (info, receiver_info) = (loopback_info(&sender), loopback_info(&receiver));
     let (sender, receiver) = tokio::join!(
-        IrohTransfer::accept(sender),
+        IrohTransfer::accept(sender, &receiver_info),
         IrohTransfer::connect(receiver, info)
     );
     (sender.unwrap(), receiver.unwrap())
@@ -74,6 +74,27 @@ async fn connection_over_loopback_is_direct() {
     let (sender, receiver) = connected_pair().await;
     assert_eq!(sender.connection_kind(), ConnectionKind::Direct);
     assert_eq!(receiver.connection_kind(), ConnectionKind::Direct);
+}
+
+#[tokio::test]
+async fn only_the_paired_receiver_gets_the_connection() {
+    let sender = local_endpoint().await;
+    let (receiver, stranger) = (local_endpoint().await, local_endpoint().await);
+    let (info, receiver_info) = (loopback_info(&sender), loopback_info(&receiver));
+    let receiver_id = receiver.id();
+    let accepting = tokio::spawn(async move { IrohTransfer::accept(sender, &receiver_info).await });
+
+    // Someone who found the sender's address gets in first, and is turned away.
+    let stranger = IrohTransfer::connect(stranger, info.clone()).await.unwrap();
+    assert!(matches!(
+        stranger.conn.closed().await,
+        ConnectionError::ApplicationClosed(close) if close.error_code == VarInt::from(CLOSE_ERR)
+    ));
+
+    let receiver = IrohTransfer::connect(receiver, info).await.unwrap();
+    let sender = accepting.await.unwrap().unwrap();
+    assert_eq!(sender.conn.remote_id(), receiver_id);
+    assert_eq!(receiver.conn.remote_id(), sender.endpoint.id());
 }
 
 #[tokio::test]

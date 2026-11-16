@@ -349,3 +349,27 @@ async fn the_relay_keeps_connections_alive_with_pings() {
         .unwrap();
     assert!(matches!(frame, Some(Ok(Message::Ping(_)))), "{frame:?}");
 }
+
+#[tokio::test]
+async fn a_sender_that_stops_answering_pings_loses_its_session() {
+    let url = start(Config {
+        ping_interval: Duration::from_millis(50),
+        ..Config::default()
+    })
+    .await;
+    // A client that reads answers pings; one that has gone quiet does not.
+    let (mut alive, alive_plate) = Client::create(&url, &["webrtc"]).await;
+    let (_gone, gone_plate) = Client::create(&url, &["webrtc"]).await;
+    let reading = timeout(Duration::from_millis(400), alive.frame()).await;
+    assert!(
+        reading.is_err(),
+        "the answering client is kept: {reading:?}"
+    );
+
+    Client::join(&url, &gone_plate, &["webrtc"])
+        .await
+        .expect_error("not_found")
+        .await;
+    let mut receiver = Client::join(&url, &alive_plate, &["webrtc"]).await;
+    assert_eq!(receiver.recv().await["type"], "paired");
+}

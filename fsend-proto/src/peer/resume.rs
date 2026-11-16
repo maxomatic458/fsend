@@ -137,6 +137,7 @@ impl Plan {
 /// conflict, and so does anything in the way of an offered entry.
 pub fn plan(entries: &[Entry], local: &[Local], verified: &[u32]) -> Plan {
     let mut plan = Plan::default();
+    let verified: HashSet<u32> = verified.iter().copied().collect();
     // Directories whose entries are skipped, since something else is in their place.
     let mut blocked = HashSet::<&[String]>::new();
     for (id, (entry, local)) in entries.iter().zip(local).enumerate() {

@@ -32,11 +32,18 @@ import {
   transferring,
   unexpected,
 } from "./peer";
-import type { TransferSink } from "./sinks";
+import { NotEnoughRoom, type Asking, type TransferSink } from "./sinks";
 import type { TransferListener } from "./events";
 import { createCodec, type BlockCodec } from "./codec";
 
 const SENDER_IDLE = "the sender stopped sending";
+
+export interface ReceiveOptions {
+  /// Where the transfer goes instead if `sink` has no room for it.
+  fallback?: () => TransferSink;
+  /// Resolves once the user would rather not wait for the browser to allow more room.
+  skipAsking?: Promise<void>;
+}
 
 /// Receives a transfer into `sink`; files there that differ from the offer are handled by `policy`.
 export async function runReceive(
@@ -45,8 +52,11 @@ export async function runReceive(
   policy: ConflictPolicy,
   emit: TransferListener,
   abort: AbortSignal,
+  options: ReceiveOptions = {},
 ): Promise<void> {
   let link: Link | null = null;
+  // The sink in use, which the fallback may replace before anything is written.
+  let current = sink;
 
   try {
     emit({ type: "connecting" });
@@ -54,7 +64,6 @@ export async function runReceive(
     link = await openReceiverSession(code, abort, {
       onHandshaking: () => emit({ type: "handshaking" }),
     });
-    if (!link) return;
 
     getConnectionType(link.pc)
       .then((kind) => emit({ type: "connectionType", kind }))
@@ -62,20 +71,20 @@ export async function runReceive(
 
     const peer = Peer.receiver(link, abort);
     const { entries, tops } = await peer.explained(() =>
-      receive(peer, sink, policy, emit),
+      receive(peer, sink, policy, emit, options, (next) => (current = next)),
     );
     link.peer.stop();
     link.pc.close();
 
-    await sink.finish(entries, tops, (percent) =>
+    await current.finish(entries, tops, (percent) =>
       emit({ type: "packing", percent }),
     );
     emit({ type: "complete" });
   } catch (err) {
-    await sink.abandon();
+    await current.abandon();
     if (!abort.aborted) emit({ type: "error", message: messageOf(err) });
   } finally {
-    await sink.closeFile().catch(() => {});
+    await current.closeFile().catch(() => {});
     link?.close();
   }
 }
@@ -86,6 +95,8 @@ async function receive(
   sink: TransferSink,
   policy: ConflictPolicy,
   emit: TransferListener,
+  { fallback, skipAsking }: ReceiveOptions,
+  use: (sink: TransferSink) => void,
 ): Promise<{ entries: Entry[]; tops: TopEntry[] }> {
   await peer.hello("the sender did not say hello in time", RECV_WINDOW);
   const offer = await peer.next(
@@ -121,19 +132,30 @@ async function receive(
     throw new TransferFailure("Transfer rejected");
   }
 
-  await sink.prepare(tops);
-  const local: Local[] = [];
-  for (const entry of entries) local.push(await sink.probe(entry));
-  const checked = filesToCheck(entries, local);
-  const verified =
-    checked.length === 0 ? [] : await verify(peer, sink, entries, checked);
-  const plan = planReceive(entries, local, verified);
-  const files = acceptPlan(plan, policy);
-  const remaining = files.reduce(
-    (n, { id, offset }) => n + entrySize(entries[id]) - offset,
-    0,
-  );
-  await sink.reserve(remaining, () => emit({ type: "askingStorage" }));
+  let { plan, files } = await planFor(peer, sink, entries, tops, policy);
+  const asking: Asking = {
+    start: () => emit({ type: "askingStorage" }),
+    skipped: skipAsking ?? new Promise(() => {}),
+  };
+  try {
+    const remaining = files.reduce(
+      (n, { id, offset }) => n + entrySize(entries[id]) - offset,
+      0,
+    );
+    await Promise.race([sink.reserve(remaining, asking), peer.stopped]);
+  } catch (err) {
+    if (!(err instanceof NotEnoughRoom) || !fallback) throw err;
+    sink = fallback();
+    use(sink);
+    emit({ type: "heldInMemory" });
+    ({ plan, files } = await planFor(peer, sink, entries, tops, policy));
+  }
+  // Before accepting, as the sender then waits for acks only so long.
+  for (const { id, offset } of files) {
+    if (offset > 0) {
+      await Promise.race([sink.reopen(entries[id].path, offset), peer.stopped]);
+    }
+  }
   peer.send({ type: "accept", files });
   emit(transferring(tops, presentBytes(entries, files)));
   if (plan.conflicts.length > 0) {
@@ -161,6 +183,24 @@ async function receive(
   peer.send({ type: "done" });
   await peer.goodbye();
   return { entries, tops };
+}
+
+/** What to receive into `sink`, given what it already holds. */
+async function planFor(
+  peer: ReceiverPeer,
+  sink: TransferSink,
+  entries: Entry[],
+  tops: TopEntry[],
+  policy: ConflictPolicy,
+) {
+  await sink.prepare(tops);
+  const local: Local[] = [];
+  for (const entry of entries) local.push(await sink.probe(entry));
+  const checked = filesToCheck(entries, local);
+  const verified =
+    checked.length === 0 ? [] : await verify(peer, sink, entries, checked);
+  const plan = planReceive(entries, local, verified);
+  return { plan, files: acceptPlan(plan, policy) };
 }
 
 /** Writes the accepted files from the data stream into `sink`, acking as it goes. */

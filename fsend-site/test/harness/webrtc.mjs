@@ -8,6 +8,12 @@
  * hard on demand — drop a peer abruptly, or close one gracefully.
  */
 
+/**
+ * How peers get on: "connect", "fail" as when ICE finds no route between
+ * them, or "stall", neither connecting nor failing.
+ */
+export const ice = { outcome: "connect" };
+
 /** What `sctp.maxMessageSize` reports once connected; a test may lower it. */
 export const sctpLimits = { maxMessageSize: 256 * 1024 };
 
@@ -168,6 +174,16 @@ export class FakePeerConnection extends FakeEventTarget {
   _link(offerer) {
     this._remote = offerer;
     offerer._remote = this;
+    if (ice.outcome === "stall") return;
+    if (ice.outcome === "fail") {
+      setTimeout(() => {
+        for (const pc of [offerer, this]) {
+          pc.connectionState = "failed";
+          pc._emit("connectionstatechange", {});
+        }
+      }, this._latency);
+      return;
+    }
 
     for (const [label, ch] of offerer._channels) {
       const mirror = new FakeDataChannel(

@@ -34,3 +34,4 @@ export {
   topEntries,
   validateOffer,
 } from "../src/lib/proto";
+export { formatBytes, formatTime } from "../src/lib/format";

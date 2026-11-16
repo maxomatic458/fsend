@@ -58,14 +58,19 @@ export function createSendSession() {
     setItems((current) => current.filter((_, i) => i !== index));
   };
 
+  // Events of an earlier attempt that are still on their way are ignored.
+  let attempt = 0;
+
   const start = () => {
     if (entries().length === 0) return;
     const signal = run.beginAttempt();
+    const current = ++attempt;
     setState("connecting");
 
     runSend(
       entries(),
       (event) => {
+        if (current !== attempt) return;
         switch (event.type) {
           case "code":
             setShareCode(event.code);
@@ -102,9 +107,10 @@ export function createSendSession() {
     );
   };
 
+  /// Back to the selection, which is kept.
   const reset = () => {
+    attempt++;
     setState("selecting");
-    setItems([]);
     setShareCode("");
     run.setError("");
   };

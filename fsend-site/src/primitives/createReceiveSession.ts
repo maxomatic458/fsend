@@ -71,6 +71,12 @@ export function createReceiveSession() {
   const [packing, setPacking] = createSignal<number | null>(null);
   /// Whether the browser is asking the user to let fsend store more.
   const [askingStorage, setAskingStorage] = createSignal(false);
+  /// Whether browser storage had no room, so the transfer is held in memory.
+  const [heldInMemory, setHeldInMemory] = createSignal(false);
+  /// Whether the offer was accepted, while the transfer gets ready.
+  const [accepted, setAccepted] = createSignal(false);
+  /// Stops waiting for the browser to allow more room, and downloads as a zip.
+  let skipAsking = () => {};
 
   let accept: (() => void) | null = null;
   let reject: (() => void) | null = null;
@@ -104,6 +110,9 @@ export function createReceiveSession() {
     };
     setState("connecting");
     setConflicts({ replaced: 0, skipped: 0 });
+    setAskingStorage(false);
+    setHeldInMemory(false);
+    setAccepted(false);
 
     const staging = mode() === "fs" && kind() === "browser" ? storage() : null;
     const sink =
@@ -113,6 +122,7 @@ export function createReceiveSession() {
           ? createFolderSink(staging.incoming, staging)
           : createFolderSink(folder()!);
 
+    const skipped = new Promise<void>((resolve) => (skipAsking = resolve));
     const receive = () =>
       runReceive(
         code(),
@@ -121,6 +131,8 @@ export function createReceiveSession() {
         staging ? "replace" : policy(),
         onEvent,
         signal,
+        // Without room in browser storage, it is held in memory like a zip download.
+        staging ? { fallback: createZipSink, skipAsking: skipped } : {},
       );
     if (!staging) {
       previous = receive();
@@ -190,6 +202,10 @@ export function createReceiveSession() {
       case "askingStorage":
         setAskingStorage(true);
         break;
+      case "heldInMemory":
+        setAskingStorage(false);
+        setHeldInMemory(true);
+        break;
       case "transferring":
         setAskingStorage(false);
         run.tracker.initialize(event.entries);
@@ -229,6 +245,7 @@ export function createReceiveSession() {
       if (!folder()) return;
     }
     accept?.();
+    setAccepted(true);
   };
 
   return {
@@ -258,6 +275,9 @@ export function createReceiveSession() {
     clearStorage,
     packing,
     askingStorage,
+    heldInMemory,
+    accepted,
+    downloadAsZipInstead: () => skipAsking(),
     isReady,
     chooseFolder,
     start,

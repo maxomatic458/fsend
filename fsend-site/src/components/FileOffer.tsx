@@ -8,6 +8,8 @@ interface FileOfferProps {
   files: TopEntry[];
   /// True when the browser has no File System Access API
   inMemory?: boolean;
+  /// Accepted, so the choice is made.
+  busy?: boolean;
   onAccept: () => void;
   onReject: () => void;
 }
@@ -74,10 +76,21 @@ export function FileOffer(props: FileOfferProps) {
       </Show>
 
       <div class="flex gap-2.5">
-        <Button tone="accent" size="lg" class="flex-1" onClick={props.onAccept}>
+        <Button
+          tone="accent"
+          size="lg"
+          class="flex-1"
+          disabled={props.busy}
+          onClick={props.onAccept}
+        >
           Accept &amp; Receive
         </Button>
-        <Button tone="ghost" size="lg" onClick={props.onReject}>
+        <Button
+          tone="ghost"
+          size="lg"
+          disabled={props.busy}
+          onClick={props.onReject}
+        >
           Reject
         </Button>
       </div>
