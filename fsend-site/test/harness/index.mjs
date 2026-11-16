@@ -1,7 +1,3 @@
-/**
- * Installs the fake browser environment and provides the helpers the scenarios
- * are written against.
- */
 import { readFileSync } from "node:fs";
 import { installWebRtc, resetWebRtc } from "./webrtc.mjs";
 import { installRelay, resetRelay } from "./relay.mjs";
@@ -231,6 +227,20 @@ export function waitFor(
 }
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Runs `body` with what `make` returns, inside a reactive root disposed afterwards. */
+export async function inRoot(createRoot, make, body) {
+  let dispose;
+  const value = createRoot((d) => {
+    dispose = d;
+    return make();
+  });
+  try {
+    await body(value);
+  } finally {
+    dispose();
+  }
+}
 
 /** A control frame of `json`, valid or not. */
 export function jsonFrame(json) {

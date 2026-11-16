@@ -1,14 +1,4 @@
 /**
- * Loopback RTCPeerConnection / RTCDataChannel.
- *
- * Close enough to the real thing for the transfer code to be unable to tell:
- * messages are copied (never shared memory), delivered asynchronously and in
- * order, `bufferedAmount` rises and falls with the queue, and the connection
- * exposes the same state machine. It also lets a test do what a browser makes
- * hard on demand — drop a peer abruptly, or close one gracefully.
- */
-
-/**
  * How peers get on: "connect", "fail" as when ICE finds no route between
  * them, or "stall", neither connecting nor failing.
  */
@@ -276,7 +266,6 @@ export function installWebRtc(
   };
   globals.RTCSessionDescription = FakeRTCSessionDescription;
   const created = [];
-  globals.__peerConnections = created;
   return created;
 }
 

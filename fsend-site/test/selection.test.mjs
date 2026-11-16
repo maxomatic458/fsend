@@ -1,9 +1,9 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 
-const { createSendSession, createRoot } = await import("./.build/app.mjs");
+import { inRoot, sleep } from "./harness/index.mjs";
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const { createSendSession, createRoot } = await import("./.build/app.mjs");
 
 /**
  * A directory handle whose files resolve slowly, standing in for a real
@@ -45,19 +45,7 @@ function fastFile(name, size) {
 const labelled = (session) =>
   session.items().map((item) => [item.entry.name, item.sizeBytes]);
 
-/** Runs `body` inside a reactive root and disposes it afterwards. */
-async function withSession(body) {
-  let dispose;
-  const session = createRoot((d) => {
-    dispose = d;
-    return createSendSession();
-  });
-  try {
-    await body(session);
-  } finally {
-    dispose();
-  }
-}
+const withSession = (body) => inRoot(createRoot, createSendSession, body);
 
 describe("selection sizing", () => {
   test("a slow tree walk cannot mislabel a newer selection", async () => {

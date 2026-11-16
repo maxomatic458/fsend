@@ -61,7 +61,7 @@ export class Relay {
     });
     const { nameplate, expires_in } = await this.expect("created");
     const code = newCode(nameplate);
-    if (!code) throw protocolError("the relay assigned an invalid nameplate");
+    if (!code) throw pairingError("the relay assigned an invalid nameplate");
     onCode(code, expires_in);
     await this.expect("paired");
     await this.handshake(code, Role.Sender);
@@ -86,7 +86,7 @@ export class Relay {
     this.ws.send(channel.seal({ type: "confirm", app: APP }));
     const confirm = channel.open(await this.signal());
     if (confirm.type !== "confirm") {
-      throw protocolError("expected a confirm message");
+      throw pairingError("expected a confirm message");
     }
     this.channel = channel;
   }
@@ -98,7 +98,7 @@ export class Relay {
   async connection(): Promise<ConnectionInfo> {
     const message = this.paired().open(await this.signal());
     if (message.type !== "connection") {
-      throw protocolError("repeated confirm message");
+      throw pairingError("repeated confirm message");
     }
     return message.info;
   }
@@ -108,7 +108,7 @@ export class Relay {
   }
 
   private paired(): Channel {
-    if (!this.channel) throw protocolError("not paired yet");
+    if (!this.channel) throw pairingError("not paired yet");
     return this.channel;
   }
 
@@ -121,7 +121,7 @@ export class Relay {
   ): Promise<Extract<Reply, { type: T }>> {
     const frame = await this.next();
     if (frame instanceof Uint8Array || frame.type !== type) {
-      throw protocolError(`expected ${type}`);
+      throw pairingError(`expected ${type}`);
     }
     return frame as Extract<Reply, { type: T }>;
   }
@@ -129,7 +129,7 @@ export class Relay {
   private async signal(): Promise<Uint8Array> {
     const frame = await this.next();
     if (!(frame instanceof Uint8Array)) {
-      throw protocolError(`unexpected ${frame.type} message`);
+      throw pairingError(`unexpected ${frame.type} message`);
     }
     return frame;
   }
@@ -162,11 +162,11 @@ function parse(frame: string): ServerMessage {
   try {
     return parseServerMessage(frame);
   } catch {
-    throw protocolError("invalid relay message");
+    throw pairingError("invalid relay message");
   }
 }
 
-function protocolError(message: string): Error {
+function pairingError(message: string): Error {
   return new Error(`Pairing failed: ${message}.`);
 }
 

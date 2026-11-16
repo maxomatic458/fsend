@@ -1,11 +1,4 @@
-import {
-  createSignal,
-  For,
-  Show,
-  onMount,
-  onCleanup,
-  type JSX,
-} from "solid-js";
+import { createSignal, For, Show, onMount, type JSX } from "solid-js";
 import { A } from "@solidjs/router";
 import { Title, Meta, Link } from "@solidjs/meta";
 import { OcCopy2, OcCheck2 } from "solid-icons/oc";
@@ -18,20 +11,11 @@ import {
   type Os,
 } from "../lib/install";
 import { SITE_URL } from "../lib/links";
+import { createCopy } from "../primitives/createCopy";
+import { Ext } from "../components/Ext";
 
 function Terminal(props: { shell?: string; code: string }) {
-  const [copied, setCopied] = createSignal(false);
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  onCleanup(() => clearTimeout(timer));
-
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(props.code);
-      setCopied(true);
-      clearTimeout(timer);
-      timer = setTimeout(() => setCopied(false), 1600);
-    } catch {}
-  };
+  const { copied, copy } = createCopy(1600);
 
   return (
     <div class="bg-surface-2 border border-line rounded-[9px]">
@@ -42,7 +26,7 @@ function Terminal(props: { shell?: string; code: string }) {
           </span>
           <button
             type="button"
-            onClick={copy}
+            onClick={() => copy(props.code)}
             class="-mr-1 p-1 rounded-md text-ink-dim hover:text-ink hover:bg-surface transition-colors cursor-pointer"
             aria-label={copied() ? "Copied" : "Copy to clipboard"}
           >
@@ -99,7 +83,7 @@ export function DownloadPage() {
 
   return (
     <div class="flex-1 flex flex-col items-center gap-[26px] px-5 sm:px-10 pt-[26px] pb-16">
-      <Title>Download fsend — CLI for peer-to-peer file transfer</Title>
+      <Title>Download fsend — CLI for Peer-to-Peer File Transfer</Title>
       <Meta
         name="description"
         content="Install the fsend command-line tool on Linux, macOS or Windows. Signed APT repository for Debian and Ubuntu, static binaries for everything else, or build from source with cargo."
@@ -147,7 +131,6 @@ export function DownloadPage() {
             )}
           </For>
         </div>
-        {/* if the OS has variants (e.g x86, aarch64) */}
         <Show when={os().variants.length > 1}>
           <div
             role="tablist"
@@ -233,15 +216,7 @@ export function DownloadPage() {
         <Section>
           <p class="text-[13.5px] text-ink-dim leading-relaxed">
             Prebuilt binaries for every platform are on{" "}
-            <a
-              href={RELEASES_URL}
-              target="_blank"
-              rel="noopener noreferrer"
-              class="text-azure underline underline-offset-2 decoration-azure/40 hover:text-azure-hi hover:decoration-azure-hi transition-colors"
-            >
-              GitHub Releases
-            </a>
-            .
+            <Ext href={RELEASES_URL}>GitHub Releases</Ext>.
           </p>
         </Section>
       </div>

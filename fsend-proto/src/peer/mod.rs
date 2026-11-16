@@ -6,6 +6,7 @@ pub mod block;
 pub mod frame;
 pub mod limits;
 pub mod offer;
+pub mod progress;
 pub mod resume;
 
 pub const VERSION: u32 = 4;

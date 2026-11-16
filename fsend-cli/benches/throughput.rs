@@ -1,9 +1,9 @@
-//! Throughput of a cli transfer over both iroh and WebRTC.
-//!
-//!     cargo bench
-//!     FSEND_BENCH_MIB=1024 FSEND_BENCH_RUNS=5 cargo bench
-//!     cargo bench -- webrtc
-//!     FSEND_BENCH_ZSTD=0 cargo bench
+// Throughput of a CLI transfer over iroh and WebRTC:
+//
+//     cargo bench
+//     FSEND_BENCH_MIB=1024 FSEND_BENCH_RUNS=5 cargo bench
+//     cargo bench -- webrtc
+//     FSEND_BENCH_ZSTD=0 cargo bench
 
 use std::future::Future;
 use std::io::Write;
@@ -137,7 +137,8 @@ fn bench_iroh(payload: &Path, out: &Path, bytes: u64) -> f64 {
                 let endpoint = IrohTransfer::bind(presets::Minimal).await.unwrap();
                 peer_tx.send(loopback_info(&endpoint)).unwrap();
                 let peer = addr_rx.recv().unwrap();
-                Box::new(IrohTransfer::connect(endpoint, peer).await.unwrap()) as Box<dyn Transport>
+                Box::new(IrohTransfer::connect(endpoint, &peer).await.unwrap())
+                    as Box<dyn Transport>
             })
         }
     });

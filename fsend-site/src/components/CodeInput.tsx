@@ -1,4 +1,4 @@
-import { createSignal, For } from "solid-js";
+import { createSignal, Index } from "solid-js";
 import { CODE_LENGTH } from "../lib/proto";
 
 export function CodeInput(props: {
@@ -33,25 +33,26 @@ export function CodeInput(props: {
         class="absolute inset-0 w-full h-full opacity-0 cursor-text"
       />
       <div class="flex justify-center gap-1.5 sm:gap-2 pointer-events-none">
-        <For each={chars()}>
+        {/* Index, not For: each box stays put, so its colour can transition. */}
+        <Index each={chars()}>
           {(char, i) => {
             const active = () =>
-              focused() && i() === caret() && props.value.length < CODE_LENGTH;
+              focused() && i === caret() && props.value.length < CODE_LENGTH;
             return (
               <div
                 class={`flex-1 min-w-0 max-w-[48px] h-[52px] sm:h-[60px] rounded-[9px] border grid place-items-center font-mono text-xl sm:text-2xl transition-colors ${
                   active()
                     ? "border-azure text-ink"
-                    : char.trim()
+                    : char().trim()
                       ? "border-line text-ink"
                       : "border-line text-transparent"
                 } bg-surface-2`}
               >
-                {char.trim() || " "}
+                {char().trim() || " "}
               </div>
             );
           }}
-        </For>
+        </Index>
       </div>
     </div>
   );

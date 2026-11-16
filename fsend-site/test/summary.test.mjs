@@ -1,10 +1,10 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 
+import { sleep } from "./harness/index.mjs";
+
 const { summarize, createProgressTracker, createRoot } =
   await import("./.build/app.mjs");
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 describe("finished transfer summary", () => {
   test("the mean rate covers the whole transfer", () => {

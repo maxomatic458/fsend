@@ -8,19 +8,7 @@ import { canStoreTransfers } from "../lib/files/storage";
 import { GITHUB_URL, MDN_FS_API, MDN_WEBRTC, SITE_URL } from "../lib/links";
 import { createWindowDropTarget } from "../primitives/createWindowDropTarget";
 import { Logo } from "../components/Logo";
-
-function Ext(props: { href: string; children: JSX.Element }) {
-  return (
-    <a
-      href={props.href}
-      target="_blank"
-      rel="noopener noreferrer"
-      class="text-azure underline underline-offset-2 decoration-azure/40 hover:text-azure-hi hover:decoration-azure-hi transition-colors"
-    >
-      {props.children}
-    </a>
-  );
-}
+import { Ext } from "../components/Ext";
 
 const STEPS = [
   {
@@ -110,6 +98,31 @@ const FAQ_ITEMS = [
   },
 ];
 
+function HeroLink(props: {
+  href: string;
+  theme: string;
+  lifted: boolean;
+  children: JSX.Element;
+}) {
+  return (
+    <A
+      href={props.href}
+      draggable={false}
+      class={`${props.theme} bg-accent-deep rounded-xl border-none cursor-pointer font-bold text-lg group select-none`}
+    >
+      <span
+        class={`block box-border border-2 border-accent-line rounded-xl py-3 px-6 bg-accent-soft text-accent-ink transition-all duration-150 text-center ${
+          props.lifted
+            ? "bg-accent-soft-hi -translate-y-0.5"
+            : "group-hover:bg-accent-soft-hi group-hover:-translate-y-0.5"
+        }`}
+      >
+        {props.children}
+      </span>
+    </A>
+  );
+}
+
 function Eyebrow(props: { children: string }) {
   return (
     <div class="font-mono text-xs tracking-[0.14em] uppercase text-ink-dim">
@@ -178,51 +191,29 @@ export function HomePage() {
 
         <div class="w-full max-w-[560px] mt-10 flex flex-col gap-3.5">
           <Show when={memoryOnly()}>
-            <div class="flex gap-3 items-start text-left bg-warn-bg border border-warn-line text-warn-ink rounded-lg px-4 py-3.5 text-sm leading-relaxed">
-              <div>
-                This browser holds received files in memory until the transfer
-                finishes, so their size is limited by free memory and an
-                interrupted transfer can't resume. A normal window of a current
-                Chrome, Edge, Firefox or Safari saves them as they arrive.
-              </div>
-              <div class="flex-shrink-0"></div>
+            <div class="text-left bg-warn-bg border border-warn-line text-warn-ink rounded-lg px-4 py-3.5 text-sm leading-relaxed">
+              This browser holds received files in memory until the transfer
+              finishes, so their size is limited by free memory and an
+              interrupted transfer can't resume. A normal window of a current
+              Chrome, Edge, Firefox or Safari saves them as they arrive.
             </div>
           </Show>
 
-          {/* The slab sits behind the face and shows through as it lifts. */}
-          <A
-            href="/send"
-            draggable={false}
-            class="theme-flame bg-accent-deep rounded-xl border-none cursor-pointer font-bold text-lg group select-none"
-          >
-            <span
-              class={`block box-border border-2 border-accent-line rounded-xl py-3 px-6 bg-accent-soft text-accent-ink transition-all duration-150 text-center ${
-                isDragging()
-                  ? "bg-accent-soft-hi -translate-y-0.5"
-                  : "group-hover:bg-accent-soft-hi group-hover:-translate-y-0.5"
-              }`}
-            >
-              <FiUpload
-                class="inline-block w-5 h-5 mr-2 -mt-1"
-                aria-hidden="true"
-              />
-              {isDragging() ? "Drop to Send" : "Send Files"}
-            </span>
-          </A>
+          <HeroLink href="/send" theme="theme-flame" lifted={isDragging()}>
+            <FiUpload
+              class="inline-block w-5 h-5 mr-2 -mt-1"
+              aria-hidden="true"
+            />
+            {isDragging() ? "Drop to Send" : "Send Files"}
+          </HeroLink>
 
-          <A
-            href="/receive"
-            draggable={false}
-            class="theme-azure bg-accent-deep rounded-xl border-none cursor-pointer font-bold text-lg group select-none"
-          >
-            <span class="block box-border border-2 border-accent-line rounded-xl py-3 px-6 bg-accent-soft text-accent-ink transition-all duration-150 group-hover:bg-accent-soft-hi group-hover:-translate-y-0.5 text-center">
-              <FiDownload
-                class="inline-block w-5 h-5 mr-2 -mt-1"
-                aria-hidden="true"
-              />
-              Receive Files
-            </span>
-          </A>
+          <HeroLink href="/receive" theme="theme-azure" lifted={false}>
+            <FiDownload
+              class="inline-block w-5 h-5 mr-2 -mt-1"
+              aria-hidden="true"
+            />
+            Receive Files
+          </HeroLink>
 
           <p class="text-sm text-ink-dim mt-1.5">
             Drop a file anywhere on this page to start
@@ -231,13 +222,14 @@ export function HomePage() {
 
         <a
           class="mt-8 inline-block"
-          href="https://www.producthunt.com/products/fsend-sh/reviews/new?utm_source=badge-product_review&utm_medium=badge&utm_source=badge-fsend&#0045;sh"
+          href="https://www.producthunt.com/products/fsend-sh/reviews/new?utm_source=badge-product_review&utm_medium=badge"
           target="_blank"
         >
           <img
             class="dark:hidden"
             src="https://api.producthunt.com/widgets/embed-image/v1/product_review.svg?product_id=1293275&theme=light"
-            alt="fsend&#0046;sh - peer&#0032;to&#0032;peer&#0032;filesharing&#0032;in&#0032;your&#0032;browser | Product Hunt"
+            alt="fsend.sh - peer to peer filesharing in your browser | Product Hunt"
+            loading="lazy"
             style="width: 250px; height: 54px;"
             width="250"
             height="54"
@@ -245,7 +237,8 @@ export function HomePage() {
           <img
             class="hidden dark:block"
             src="https://api.producthunt.com/widgets/embed-image/v1/product_review.svg?product_id=1293275&theme=dark"
-            alt="fsend&#0046;sh - peer&#0032;to&#0032;peer&#0032;filesharing&#0032;in&#0032;your&#0032;browser | Product Hunt"
+            alt="fsend.sh - peer to peer filesharing in your browser | Product Hunt"
+            loading="lazy"
             style="width: 250px; height: 54px;"
             width="250"
             height="54"
@@ -276,9 +269,7 @@ export function HomePage() {
         id="how"
         class="border-t border-line-soft px-5 sm:px-10 py-16 sm:py-18 flex flex-col items-center gap-10"
       >
-        <div class="flex flex-col items-center gap-2 text-center">
-          <Eyebrow>How It Works</Eyebrow>
-        </div>
+        <Eyebrow>How It Works</Eyebrow>
 
         <ol class="grid sm:grid-cols-3 gap-4.5 max-w-[1000px] w-full">
           <For each={STEPS}>
@@ -301,9 +292,7 @@ export function HomePage() {
         id="faq"
         class="border-t border-line-soft px-5 sm:px-10 py-16 sm:py-18 flex flex-col items-center gap-9"
       >
-        <div class="flex flex-col items-center gap-2 text-center">
-          <Eyebrow>FAQ</Eyebrow>
-        </div>
+        <Eyebrow>FAQ</Eyebrow>
 
         <div class="grid md:grid-cols-2 gap-4.5 max-w-[1000px] w-full">
           <For each={FAQ_ITEMS}>

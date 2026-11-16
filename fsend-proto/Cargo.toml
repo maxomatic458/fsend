@@ -21,6 +21,6 @@ serde_json.workspace = true
 sha2 = "0.11.1"
 spake2 = "0.4.0"
 thiserror.workspace = true
-ts-rs = { version = "12.0.1", optional = true, features = ["no-serde-warnings"] }
-xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
+ts-rs = { workspace = true, optional = true, features = ["no-serde-warnings"] }
+xxhash-rust = { version = "0.8.21", features = ["xxh3"] }
 zstd = { version = "0.14.4", default-features = false }

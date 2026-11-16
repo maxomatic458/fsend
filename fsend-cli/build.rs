@@ -1,4 +1,4 @@
-//! Generates shell completions and a man page into `dist/` for release packaging.
+// Generates shell completions and a man page into `dist/` for release packaging.
 
 use clap::CommandFactory;
 use clap_complete::{Shell, generate_to};
@@ -16,9 +16,8 @@ fn is_managed_checkout(dir: &Path) -> bool {
         .windows(2)
         .any(|w| w[0] == "registry" && w[1] == "src");
 
-    // Verify builds run from `<target-dir>/package/<pkg>-<ver>`. `<target-dir>`
-    // is whatever `--target-dir` says, so match the parent name alone — keying
-    // on a literal `target/package` misses `--target-dir target/publish`.
+    // Verify builds run from `<target-dir>/package/<pkg>-<ver>`; the parent name
+    // alone matches, as `--target-dir` varies.
     let from_package = dir.parent().and_then(Path::file_name) == Some(OsStr::new("package"));
 
     from_registry || from_package

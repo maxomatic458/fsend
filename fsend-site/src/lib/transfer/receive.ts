@@ -73,8 +73,7 @@ export async function runReceive(
     const { entries, tops } = await peer.explained(() =>
       receive(peer, sink, policy, emit, options, (next) => (current = next)),
     );
-    link.peer.stop();
-    link.pc.close();
+    link.close();
 
     await current.finish(entries, tops, (percent) =>
       emit({ type: "packing", percent }),

@@ -136,7 +136,7 @@ impl From<Code> for String {
 }
 
 /// `len` symbols from the operating system's CSPRNG.
-pub fn random_symbols(len: usize) -> String {
+fn random_symbols(len: usize) -> String {
     // Bytes from 252 up are dropped so that `% 36` stays uniform.
     let mut out = String::with_capacity(len);
     let mut bytes = [0u8; 32];
@@ -154,7 +154,7 @@ pub fn random_symbols(len: usize) -> String {
 }
 
 /// Whether `s` is exactly `len` canonical symbols.
-pub fn is_canonical(s: &str, len: usize) -> bool {
+fn is_canonical(s: &str, len: usize) -> bool {
     s.len() == len && s.bytes().all(|b| ALPHABET.contains(&b))
 }
 

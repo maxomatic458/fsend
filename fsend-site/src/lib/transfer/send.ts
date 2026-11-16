@@ -20,6 +20,7 @@ import {
   presentBytes,
   topEntries,
   type AcceptedFile,
+  type Bytes,
   type Entry,
   type ReceiverMessage,
 } from "../proto";
@@ -51,7 +52,7 @@ export async function runSend(
   try {
     const outgoing = await buildOffer(entries);
     await loadProto();
-    let offer: Uint8Array;
+    let offer: Bytes;
     try {
       offer = encodeOffer(outgoing.entries);
     } catch (err) {
@@ -89,7 +90,7 @@ async function send(
   channel: RTCDataChannel,
   messageBytes: number,
   { entries, files: sources }: Outgoing,
-  offer: Uint8Array,
+  offer: Bytes,
   emit: TransferListener,
 ): Promise<void> {
   const window = await peer.hello("the receiver did not say hello in time");
@@ -141,7 +142,7 @@ async function send(
   const progress = new Progress(entries, files, topOf);
   const codec = reader.done ? undefined : await createCodec();
   try {
-    const encoding: { size: number; frame: Promise<Uint8Array> }[] = [];
+    const encoding: { size: number; frame: Promise<Bytes> }[] = [];
     while (!reader.done || encoding.length > 0) {
       for (let m = peer.poll(); m; m = peer.poll()) ack(m);
       while (
@@ -167,7 +168,7 @@ async function send(
   }
 
   /** Sends a block of `size` file bytes, which count in proportion to its bytes sent. */
-  async function sendBlock(size: number, block: Uint8Array) {
+  async function sendBlock(size: number, block: Bytes) {
     let counted = 0;
     for (let offset = 0; offset < block.length; offset += messageBytes) {
       if (channel.bufferedAmount > MAX_BUFFERED_BYTES) {
@@ -177,7 +178,7 @@ async function send(
         ]);
       }
       const end = Math.min(offset + messageBytes, block.length);
-      channel.send(block.slice(offset, end));
+      channel.send(block.subarray(offset, end));
       const now = Math.floor((size * end) / block.length);
       for (const [entry, n] of progress.advance(now - counted)) {
         emit({ type: "progress", entry, bytes: n });
@@ -218,18 +219,19 @@ class BlockReader {
 
   /** Up to `max` (and a block's worth of) bytes, reading a few files at once. */
   async read(max: number): Promise<Uint8Array> {
-    const bytes = new Uint8Array(Math.min(max, this.left, MAX_BLOCK_BYTES));
+    const length = Math.min(max, this.left, MAX_BLOCK_BYTES);
+    this.left -= length;
     // Where each file's part of the block comes from and goes.
     const slices: { source: Source; start: number; end: number; at: number }[] =
       [];
-    for (let filled = 0; filled < bytes.length;) {
+    for (let filled = 0; filled < length;) {
       const { id } = this.files[this.file];
       const size = entrySize(this.entries[id]);
       if (this.position === size) {
         this.position = this.files[++this.file].offset;
         continue;
       }
-      const n = Math.min(size - this.position, bytes.length - filled);
+      const n = Math.min(size - this.position, length - filled);
       const start = this.position;
       slices.push({
         source: this.sources[id]!,
@@ -240,16 +242,14 @@ class BlockReader {
       filled += n;
       this.position += n;
     }
-    await eachAtOnce(
-      slices,
-      CONCURRENT_FILES,
-      async ({ source, start, end, at }) =>
-        bytes.set(
-          new Uint8Array(await source.slice(start, end).arrayBuffer()),
-          at,
-        ),
+    const sliceBytes = async ({ source, start, end }: (typeof slices)[0]) =>
+      new Uint8Array(await source.slice(start, end).arrayBuffer());
+    // Part of one file: its bytes are the block.
+    if (slices.length === 1) return sliceBytes(slices[0]);
+    const bytes = new Uint8Array(length);
+    await eachAtOnce(slices, CONCURRENT_FILES, async (slice) =>
+      bytes.set(await sliceBytes(slice), slice.at),
     );
-    this.left -= bytes.length;
     return bytes;
   }
 }

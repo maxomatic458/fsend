@@ -1,11 +1,3 @@
-/**
- * Bakes each route into a static HTML file.
- *
- * `vite build` emits the client bundle plus an empty index.html shell, then
- * `vite build --ssr` emits a Node build of the same app. This script renders
- * every route with that build and writes the result back into dist/, so
- * crawlers get real markup instead of <div id="root"></div>.
- */
 import { readFile, writeFile, mkdir, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -25,10 +17,40 @@ const template = (await readFile(join(DIST, "index.html"), "utf8"))
   .replace(/\s*<meta[^>]*name="description"[^>]*>/, "")
   .replace(/\s*<link[^>]*rel="canonical"[^>]*>/, "");
 
+/** The `name` attribute of the first tag in `html` that `tag` matches. */
+const attr = (html, tag, name) =>
+  new RegExp(`${name}="([^"]*)"`).exec(tag.exec(html)?.[0] ?? "")?.[1];
+
+/** `template` with its share tags set to `fields`, by property or name. */
+const share = (template, fields) =>
+  Object.entries(fields).reduce(
+    (out, [key, value]) =>
+      value === undefined
+        ? out
+        : out.replace(
+            new RegExp(`(<meta[^>]*="${key}"[^>]*content=")[^"]*"`),
+            `$1${value}"`,
+          ),
+    template,
+  );
+
 for (const url of ROUTES) {
   const { html, head } = renderRoute(url);
+  const title = /<title[^>]*>([\s\S]*?)<\/title>/.exec(head)?.[1];
+  const description = attr(
+    head,
+    /<meta[^>]*name="description"[^>]*>/,
+    "content",
+  );
+  const canonical = attr(head, /<link[^>]*rel="canonical"[^>]*>/, "href");
 
-  const out = template
+  const out = share(template, {
+    "og:title": title,
+    "twitter:title": title,
+    "og:description": description,
+    "twitter:description": description,
+    "og:url": canonical,
+  })
     .replace("</head>", `  ${head}\n  </head>`)
     .replace('<div id="root"></div>', `<div id="root">${html}</div>`);
 

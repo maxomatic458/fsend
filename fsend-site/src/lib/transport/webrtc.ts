@@ -44,10 +44,13 @@ export async function createOfferer(): Promise<{
   controlChannel.binaryType = "arraybuffer";
   dataChannel.binaryType = "arraybuffer";
 
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
-  await waitIceGathering(pc);
-
+  try {
+    await pc.setLocalDescription(await pc.createOffer());
+    await waitIceGathering(pc);
+  } catch (err) {
+    pc.close();
+    throw err;
+  }
   return {
     connection: { pc, controlChannel, dataChannel },
     offerSdp: pc.localDescription!.sdp,
@@ -81,12 +84,16 @@ export async function createAnswerer(offerSdp: string): Promise<{
     };
   });
 
-  await pc.setRemoteDescription(
-    new RTCSessionDescription({ type: "offer", sdp: offerSdp }),
-  );
-  const answer = await pc.createAnswer();
-  await pc.setLocalDescription(answer);
-  await waitIceGathering(pc);
+  try {
+    await pc.setRemoteDescription(
+      new RTCSessionDescription({ type: "offer", sdp: offerSdp }),
+    );
+    await pc.setLocalDescription(await pc.createAnswer());
+    await waitIceGathering(pc);
+  } catch (err) {
+    pc.close();
+    throw err;
+  }
 
   return {
     pc,
@@ -136,8 +143,7 @@ export function waitConnected(
     function check() {
       if (
         opened.length > 0 &&
-        (pc.connectionState === "connected" ||
-          pc.connectionState === ("completed" as string)) &&
+        pc.connectionState === "connected" &&
         opened.every((ch) => ch.readyState === "open")
       ) {
         settle();

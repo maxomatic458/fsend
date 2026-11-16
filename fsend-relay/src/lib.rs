@@ -140,7 +140,7 @@ impl Relay {
         self.slots.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Opens a session under a fresh nameplate, or `None` when at capacity.
+    /// Opens a session under a fresh nameplate, or `None` when full.
     fn open(self: &Arc<Self>, transports: Vec<Transport>) -> Option<(Nameplate, Joined, Active)> {
         if self.active.fetch_add(1, Ordering::Relaxed) >= self.config.max_sessions {
             self.active.fetch_sub(1, Ordering::Relaxed);
@@ -324,7 +324,7 @@ async fn forward(mut ws: Socket, config: &Config, peer: Peer) {
     let mut signals = 0;
     loop {
         tokio::select! {
-            // The deadline wins over a peer that just gave up on it.
+            // Report `expired`, not `peer_left`, when both fire.
             biased;
             _ = &mut deadline => {
                 return ws.fail(ErrorCode::Expired).await;

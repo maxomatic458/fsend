@@ -4,6 +4,7 @@ import { formatBytes } from "../format";
 import type { BrowserStorage } from "../files/storage";
 import { Checksums, zipName, zipOffer } from "../files/zip";
 import { eachAtOnce } from "../parallel";
+import { unref } from "./peer";
 
 const STORAGE_ADVICE = "Clear the browser storage, or choose Download as Zip.";
 
@@ -40,8 +41,7 @@ export interface TransferSink {
   open(path: string[], offset: number): Promise<void>;
   write(chunk: Bytes): Promise<void>;
   closeFile(): Promise<void>;
-  // Finish the transfer, by either flushing writes and closing files or by
-  // zipping and downloading the received files.
+  /// Saves the transfer: downloads it, zipped if needed, unless it already sits in a picked folder.
   finish(
     entries: Entry[],
     tops: TopEntry[],
@@ -373,12 +373,6 @@ function triggerDownload(blob: Blob, filename: string): void {
   anchor.click();
   document.body.removeChild(anchor);
 
-  // The click only *schedules* the download — the browser reads the blob after
-  // this task ends. Revoking straight away truncates or cancels it, which shows
-  // up on exactly the large zips this path exists for. The browser keeps the
-  // data alive while it is downloading, so holding the URL costs nothing.
-  const timer = setTimeout(() => URL.revokeObjectURL(url), REVOKE_DELAY_MS);
-  // Browsers return a number; Node returns a Timeout that would otherwise hold
-  // the test runner open for the full delay.
-  (timer as { unref?: () => void }).unref?.();
+  // The browser reads the blob after this task; revoking now cuts the download short.
+  unref(setTimeout(() => URL.revokeObjectURL(url), REVOKE_DELAY_MS));
 }

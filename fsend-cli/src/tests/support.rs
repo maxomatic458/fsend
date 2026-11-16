@@ -8,7 +8,7 @@ use fsend_proto::peer::{VERSION, hello};
 
 use super::*;
 
-/// Deterministic incompressable bytes
+/// Deterministic incompressible bytes.
 pub fn bytes(size: usize, seed: u8) -> Vec<u8> {
     let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ (seed as u64 + 1);
     (0..size)

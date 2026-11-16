@@ -25,17 +25,17 @@ use webrtc::runtime::TokioRuntime;
 use crate::transfer::*;
 use fsend_proto::peer::limits::RECV_WINDOW;
 
-pub const DEFAULT_STUN_SERVERS: &[&str] = &[
+pub(crate) const DEFAULT_STUN_SERVERS: &[&str] = &[
     "stun:stun.l.google.com:19302",
     "stun:stun1.l.google.com:19302",
 ];
 
-pub const DEFAULT_BIND_ADDRS: [SocketAddr; 2] = [
+pub(crate) const DEFAULT_BIND_ADDRS: [SocketAddr; 2] = [
     SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
     SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
 ];
 /// Largest data channel message sent: every peer takes it, and Chromium takes it fastest.
-pub const MAX_MESSAGE_BYTES: usize = 16384;
+pub(crate) const MAX_MESSAGE_BYTES: usize = 16384;
 /// Largest data channel message taken: browsers send larger messages faster.
 const MAX_INCOMING_MESSAGE_BYTES: u32 = 256 * 1024;
 
@@ -50,7 +50,7 @@ pub struct WebRtcConfig {
     pub stun_servers: Vec<String>,
     /// Local UDP addresses to bind.
     pub bind_addrs: Vec<SocketAddr>,
-    /// If loopback candidates are offered.
+    /// Whether to offer loopback candidates.
     pub loopback: bool,
     /// ICE `(disconnected, failed, keep-alive)` timeouts.
     /// `None` keeps the webrtc crate defaults.
@@ -484,7 +484,7 @@ impl Transport for WebRtcTransfer {
         Ok(Box::new(stream))
     }
 
-    /// A remote close arrives as a disconnect.
+    /// Always Ok: WebRTC cannot tell a hang-up from a lost link.
     async fn closed(&mut self) -> Result<(), TransferError> {
         let reason = closed(&mut self.link).await;
         tracing::debug!("peer hung up: {reason}");

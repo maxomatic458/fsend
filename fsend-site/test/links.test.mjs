@@ -8,6 +8,8 @@ import {
   makeRecorder,
   bytes,
   waitFor,
+  sleep,
+  inRoot,
 } from "./harness/index.mjs";
 
 const { createReceiveSession, createRoot, runSend } =
@@ -16,20 +18,7 @@ const { createReceiveSession, createRoot, runSend } =
 beforeEach(() => installBrowserEnv({ latencyMs: 0 }));
 afterEach(() => resetBrowserEnv());
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-async function withSession(body) {
-  let dispose;
-  const session = createRoot((d) => {
-    dispose = d;
-    return createReceiveSession();
-  });
-  try {
-    await body(session);
-  } finally {
-    dispose();
-  }
-}
+const withSession = (body) => inRoot(createRoot, createReceiveSession, body);
 
 /** A sender of one small file; returns its code and recorder. */
 async function sender() {

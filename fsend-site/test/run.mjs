@@ -1,8 +1,3 @@
-/**
- * Builds the protocol wasm, bundles src/lib to plain ESM with esbuild, then
- * runs the suite under Node's built-in test runner. Bundling (rather than
- * mocking modules) means the tests exercise the same code the browser ships.
- */
 import { build } from "esbuild";
 import { buildWasm } from "../scripts/build-wasm.mjs";
 import { spawn } from "node:child_process";

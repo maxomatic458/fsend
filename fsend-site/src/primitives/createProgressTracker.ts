@@ -2,7 +2,7 @@ import { createStore, produce } from "solid-js/store";
 import { TransferStats } from "../lib/stats";
 import type { TransferEntry } from "../lib/transfer/events";
 
-export interface ProgressEntry {
+interface ProgressEntry {
   name: string;
   sizeBytes: number;
   transferredBytes: number;
@@ -42,9 +42,7 @@ export function createProgressTracker() {
   }
 
   function initialize(items: TransferEntry[]) {
-    // A cancelled or failed attempt never reaches complete(), so its interval
-    // is still running when a retry starts. Without this the old one is
-    // orphaned: it keeps sampling into the shared stats and never stops.
+    // A failed attempt never reaches complete(); stop its clock.
     stopClock();
 
     const entries = items.map((item) => ({
@@ -102,9 +100,5 @@ export function createProgressTracker() {
     setProgress("endTimeMs", performance.now());
   }
 
-  function cleanup() {
-    stopClock();
-  }
-
-  return { progress, initialize, recordBytes, complete, cleanup };
+  return { progress, initialize, recordBytes, complete, cleanup: stopClock };
 }

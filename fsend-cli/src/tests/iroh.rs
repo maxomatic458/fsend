@@ -36,7 +36,7 @@ async fn connected_pair() -> (IrohTransfer, IrohTransfer) {
     let (info, receiver_info) = (loopback_info(&sender), loopback_info(&receiver));
     let (sender, receiver) = tokio::join!(
         IrohTransfer::accept(sender, &receiver_info),
-        IrohTransfer::connect(receiver, info)
+        IrohTransfer::connect(receiver, &info)
     );
     (sender.unwrap(), receiver.unwrap())
 }
@@ -85,13 +85,13 @@ async fn only_the_paired_receiver_gets_the_connection() {
     let accepting = tokio::spawn(async move { IrohTransfer::accept(sender, &receiver_info).await });
 
     // Someone who found the sender's address gets in first, and is turned away.
-    let stranger = IrohTransfer::connect(stranger, info.clone()).await.unwrap();
+    let stranger = IrohTransfer::connect(stranger, &info).await.unwrap();
     assert!(matches!(
         stranger.conn.closed().await,
         ConnectionError::ApplicationClosed(close) if close.error_code == VarInt::from(CLOSE_ERR)
     ));
 
-    let receiver = IrohTransfer::connect(receiver, info).await.unwrap();
+    let receiver = IrohTransfer::connect(receiver, &info).await.unwrap();
     let sender = accepting.await.unwrap().unwrap();
     assert_eq!(sender.conn.remote_id(), receiver_id);
     assert_eq!(receiver.conn.remote_id(), sender.endpoint.id());

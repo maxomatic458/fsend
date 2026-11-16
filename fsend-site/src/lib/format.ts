@@ -24,9 +24,7 @@ export function formatSpeed(bytesPerSec: number): string {
   return `${formatBytes(bytesPerSec)}/s`;
 }
 
-/// Long-form age for the footer's deploy stamp: "2 days, 0 hours, 5 minutes ago".
-/// Units above the largest non-zero one are dropped, so a fresh deploy reads
-/// "5 minutes ago" rather than padding out with zeroes.
+/// "2 days, 0 hours, 5 minutes ago"; units above the largest non-zero one are left out.
 export function formatAge(ms: number): string {
   const totalMinutes = Math.floor(ms / 60_000);
   if (totalMinutes < 1) return "just now";
@@ -56,3 +54,7 @@ export function formatTime(seconds: number): string {
   const minutes = Math.round(total / 60);
   return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }
+
+/** "1 file", "2 files". */
+export const plural = (n: number, one: string, many: string) =>
+  `${n} ${n === 1 ? one : many}`;

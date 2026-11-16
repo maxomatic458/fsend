@@ -1,6 +1,6 @@
 export interface FinishedTransfer {
   startTimeMs: number;
-  // 0 when transfer is in progress
+  /// 0 while it still runs.
   endTimeMs: number;
   totalTransferredBytes: number;
   skippedBytes: number;
@@ -11,7 +11,7 @@ export interface TransferSummary {
   averageBytesPerSec: number;
 }
 
-// headline numbers for a completed transfer
+/** Headline numbers for a finished transfer. */
 export function summarize(transfer: FinishedTransfer): TransferSummary {
   const elapsedSecs = Math.max(
     0,

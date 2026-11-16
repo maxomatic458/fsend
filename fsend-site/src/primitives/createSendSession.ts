@@ -4,14 +4,15 @@ import { buildOffer, offerSizeBytes } from "../lib/files/tree";
 import { createTransferRun, stepOf } from "./createTransferRun";
 import type { SelectedEntry } from "../lib/types";
 
-/// Selected item with its size
 export interface SelectedItem {
   entry: SelectedEntry;
-  /// null when the size is measured
+  /// null while measuring
   sizeBytes: number | null;
+  /// Why it could not be measured.
+  error?: string;
 }
 
-export type SendState =
+type SendState =
   | "selecting"
   | "connecting"
   | "waiting"
@@ -34,18 +35,25 @@ export function createSendSession() {
     items().reduce((total, item) => total + (item.sizeBytes ?? 0), 0),
   );
 
-  // Measure a single item and update its size in the list.
   const measure = async (item: SelectedItem) => {
-    const sizeBytes = offerSizeBytes((await buildOffer([item.entry])).entries);
+    let measured: Partial<SelectedItem>;
+    try {
+      measured = {
+        sizeBytes: offerSizeBytes((await buildOffer([item.entry])).entries),
+      };
+    } catch (err) {
+      measured = { error: err instanceof Error ? err.message : String(err) };
+    }
     setItems((current) =>
       current.includes(item)
-        ? current.map((each) => (each === item ? { ...each, sizeBytes } : each))
+        ? current.map((each) =>
+            each === item ? { ...each, ...measured } : each,
+          )
         : current,
     );
   };
 
   const add = (added: SelectedEntry[]) => {
-    // Appended to list
     const pending: SelectedItem[] = added.map((entry) => ({
       entry,
       sizeBytes: null,
@@ -131,9 +139,11 @@ export function createSendSession() {
     add,
     remove,
     start,
+    /// Back to an empty selection.
     cancel: () => {
       run.abort();
       reset();
+      setItems([]);
     },
     reset,
   };

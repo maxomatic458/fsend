@@ -1,13 +1,4 @@
-/**
- * Resolves the commit and timestamp shown in the footer.
- *
- * `bun run build` shells out to Vite twice (client, then SSR), so computing the
- * timestamp inside vite.config would give the two bundles different values and
- * the prerendered footer would disagree with the hydrated one. Instead this
- * runs once up front and pins the answer in .buildinfo.json, which both Vite
- * invocations read. Without that file — `vite dev`, a bare `vite build` — the
- * values are computed live.
- */
+// Pins the commit and build time in .buildinfo.json, so the client and SSR builds agree.
 import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";

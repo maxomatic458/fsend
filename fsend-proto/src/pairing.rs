@@ -176,8 +176,7 @@ impl Channel {
         ciphertext
     }
 
-    /// Opens the peer's next message. Their first is the confirm, so if that
-    /// fails to open the two sides used different codes.
+    /// Opens the peer's next message; failing on the first (the confirm) means the codes differ.
     pub fn open(&mut self, ciphertext: &[u8]) -> Result<Sealed, PairingError> {
         let plaintext = self
             .open

@@ -7,9 +7,7 @@ import { GITHUB_URL } from "../lib/links";
 import { formatAge } from "../lib/format";
 
 export function Layout(props: { children: JSX.Element }) {
-  // How old the build is depends on when the page is *viewed*, but these pages
-  // are prerendered — so the age stays empty through hydration and is filled in
-  // on the client, then ticked so a long-lived tab does not go stale.
+  // Prerendered, so the build age is filled in on the client and refreshed each minute.
   const [age, setAge] = createSignal<string | null>(null);
 
   onMount(() => {

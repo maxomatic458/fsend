@@ -5,7 +5,6 @@ declare const __BUILD_COMMIT_FULL__: string | null;
 declare const __BUILD_TIME__: string;
 declare const __BUILD_TIMESTAMP__: number;
 
-// Augment Window with File System Access API methods
 interface Window {
   showOpenFilePicker(options?: {
     multiple?: boolean;
@@ -16,14 +15,12 @@ interface Window {
   }): Promise<FileSystemDirectoryHandle>;
 }
 
-// Augment DataTransferItem
 interface DataTransferItem {
   getAsFileSystemHandle?(): Promise<
     FileSystemFileHandle | FileSystemDirectoryHandle | null
   >;
 }
 
-// Augment HTMLInputElement
 interface HTMLInputElement {
   webkitdirectory: boolean;
 }

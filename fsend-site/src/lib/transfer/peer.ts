@@ -12,6 +12,7 @@ import {
   type PeerMessage,
   type ReceiverMessage,
   type SenderMessage,
+  type Bytes,
   type TopEntry,
 } from "../proto";
 import type { Link } from "../transport/session";
@@ -59,7 +60,7 @@ export function unexpected(message: PeerMessage): TransferFailure {
 type Common = Extract<SenderMessage, ReceiverMessage>;
 
 /** What the peer sent on either channel. */
-export type Incoming<In> = In | Uint8Array;
+type Incoming<In> = In | Uint8Array;
 
 /** Items in arrival order; fails once the link stops. */
 class Inbox<T> {
@@ -71,6 +72,8 @@ class Inbox<T> {
   private error?: Error;
 
   push(item: T): void {
+    // Nothing that arrives after a failure counts.
+    if (this.error) return;
     const waiting = this.waiting;
     this.waiting = undefined;
     if (waiting) waiting.resolve(item);
@@ -182,10 +185,10 @@ export class Peer<Out extends PeerMessage, In extends PeerMessage> {
   }
 
   /** Frames go out in message-sized slices; the peer reassembles them. */
-  sendFrame(frame: Uint8Array): void {
+  sendFrame(frame: Bytes): void {
     for (let offset = 0; offset < frame.length; offset += MAX_MESSAGE_BYTES) {
       this.link.controlChannel.send(
-        frame.slice(offset, offset + MAX_MESSAGE_BYTES),
+        frame.subarray(offset, offset + MAX_MESSAGE_BYTES),
       );
     }
   }
@@ -306,7 +309,7 @@ export function transferring(
 }
 
 /** Browsers return a number; Node returns a Timeout that would otherwise hold the test runner open. */
-function unref<T>(timer: T): T {
+export function unref<T>(timer: T): T {
   (timer as { unref?: () => void }).unref?.();
   return timer;
 }

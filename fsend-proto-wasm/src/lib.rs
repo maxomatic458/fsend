@@ -2,7 +2,7 @@ use fsend_proto::{
     code::{Code, CodeError, Nameplate},
     pairing::{self, PairingError, Signal},
     peer::{
-        self, ReceiverMessage, SenderMessage, block, frame, limits, offer,
+        self, ReceiverMessage, SenderMessage, block, frame, limits, offer, progress,
         resume::{self, Fingerprint},
     },
     relay::ServerMessage,
@@ -18,7 +18,7 @@ enum ParsedCode {
     Invalid { error: CodeError, message: String },
 }
 
-/// Parses a code into a [`ParsedCode`].
+/// The JSON `ParsedCode` of `input`.
 #[wasm_bindgen(js_name = parseCode)]
 pub fn parse_code(input: &str) -> String {
     let parsed = match input.parse::<Code>() {
@@ -30,7 +30,7 @@ pub fn parse_code(input: &str) -> String {
             error,
         },
     };
-    serde_json::to_string(&parsed).expect("parsed codes serialize")
+    json(&parsed)
 }
 
 #[wasm_bindgen(js_name = codeLink)]
@@ -58,9 +58,18 @@ pub enum Role {
     Receiver,
 }
 
+impl From<Role> for pairing::Role {
+    fn from(role: Role) -> Self {
+        match role {
+            Role::Sender => Self::Sender,
+            Role::Receiver => Self::Receiver,
+        }
+    }
+}
+
 /// Thrown as an `Error` whose message is a JSON `PairingError`.
 fn thrown(error: PairingError) -> JsError {
-    JsError::new(&serde_json::to_string(&error).expect("pairing errors serialize"))
+    JsError::new(&json(&error))
 }
 
 // `Pake` and `Channel` take and return whole binary relay frames.
@@ -91,12 +100,8 @@ impl Pake {
         let Some(Signal::Pake(message)) = Signal::decode(frame) else {
             return Err(thrown(PairingError::UnexpectedSignal));
         };
-        let role = match role {
-            Role::Sender => pairing::Role::Sender,
-            Role::Receiver => pairing::Role::Receiver,
-        };
         self.pake
-            .finish(&message, role)
+            .finish(&message, role.into())
             .map(Channel)
             .map_err(thrown)
     }
@@ -119,7 +124,7 @@ impl Channel {
             return Err(thrown(PairingError::UnexpectedSignal));
         };
         let message = self.0.open(&sealed).map_err(thrown)?;
-        Ok(serde_json::to_string(&message).expect("sealed messages serialize"))
+        Ok(json(&message))
     }
 }
 
@@ -178,7 +183,10 @@ impl FrameDecoder {
 #[wasm_bindgen(js_name = encodeBlock)]
 pub fn encode_block(data: &[u8], compress: bool) -> Result<Vec<u8>, JsError> {
     if !(1..=limits::MAX_BLOCK_BYTES).contains(&data.len()) {
-        return Err(JsError::new("a block holds 1 to MAX_BLOCK_BYTES bytes"));
+        return Err(JsError::new(&format!(
+            "a block holds 1 to {} bytes",
+            limits::MAX_BLOCK_BYTES
+        )));
     }
     Ok(block::encode(data, compress))
 }
@@ -219,7 +227,7 @@ impl BlockDecoder {
 
 /// Turns counts of data stream bytes into progress per top-level entry, in stream order.
 #[wasm_bindgen]
-pub struct Progress(block::Progress);
+pub struct Progress(progress::Progress);
 
 #[wasm_bindgen]
 impl Progress {
@@ -229,7 +237,7 @@ impl Progress {
         let entries: Vec<_> = serde_json::from_str(entries)?;
         let files: Vec<_> = serde_json::from_str(files)?;
         let top_of: Vec<usize> = top_of.iter().map(|&top| top as usize).collect();
-        Ok(Self(block::Progress::new(&entries, &files, &top_of)))
+        Ok(Self(progress::Progress::new(&entries, &files, &top_of)))
     }
 
     /// `[top, bytes, top, bytes, ...]`: the bytes of each top-level entry among the next `n`.
@@ -242,7 +250,7 @@ impl Progress {
     }
 }
 
-/// The CRC-32 (IEEE) of `data` following the bytes `previous` is the CRC-32 of, as zip files record.
+/// The CRC-32 (IEEE, as zip uses) of `data`, continuing from `previous`.
 #[wasm_bindgen]
 pub fn crc32(data: &[u8], previous: u32) -> u32 {
     let mut hasher = crc32fast::Hasher::new_with_initial(previous);
@@ -331,16 +339,16 @@ pub fn accept_plan(plan: &str, policy: &str) -> Result<String, JsError> {
 /// JSON `[TopEntry[], number[]]`: the top-level entries of a valid offer, and the one each entry lies in.
 #[wasm_bindgen(js_name = topEntries)]
 pub fn top_entries(entries: &str) -> Result<String, JsError> {
-    Ok(json(&offer::top_entries(&serde_json::from_str::<Vec<_>>(
-        entries,
-    )?)))
+    Ok(json(&progress::top_entries(
+        &serde_json::from_str::<Vec<_>>(entries)?,
+    )))
 }
 
 /// JSON `number[]`: bytes of each top-level entry already present once `files` are accepted.
 #[wasm_bindgen(js_name = presentBytes)]
 pub fn present_bytes(entries: &str, files: &str) -> Result<String, JsError> {
     let entries: Vec<_> = serde_json::from_str(entries)?;
-    Ok(json(&offer::present(
+    Ok(json(&progress::present(
         &entries,
         &serde_json::from_str::<Vec<_>>(files)?,
     )))
@@ -355,7 +363,7 @@ mod bindings {
         pairing::{ConnectionInfo, Sealed},
         peer::{
             AcceptedFile, Cancel, CheckedFile, Entry, ErrorReport, Hello,
-            offer::TopEntry,
+            progress::TopEntry,
             resume::{Conflict, ConflictPolicy, Local, Plan},
         },
         relay::{ClientMessage, ErrorCode, Transport, VERSION},

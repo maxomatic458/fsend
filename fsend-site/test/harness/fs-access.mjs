@@ -1,12 +1,3 @@
-/**
- * In-memory File System Access API — the subset the receiver uses:
- * getDirectoryHandle/getFileHandle with { create }, createWritable with
- * { keepExistingData }, seek/write/close, getFile and entries.
- *
- * Files live as byte arrays so a test can assert on exact contents, and a
- * writable can be abandoned mid-write to model a transfer that was cut off.
- */
-
 class NotFoundError extends Error {
   constructor(name) {
     super(`NotFoundError: ${name}`);
@@ -60,11 +51,6 @@ class MemoryWritable {
     this._pos = pos;
   }
 
-  async truncate(size) {
-    this._buf.length = size;
-    if (this._pos > size) this._pos = size;
-  }
-
   async write(chunk) {
     if (this._closed) throw new Error("write after close");
     const data =
@@ -81,11 +67,9 @@ class MemoryWritable {
     }
     for (let i = 0; i < data.length; i++) this._buf[this._pos + i] = data[i];
     this._pos += data.length;
-    // Commit as we go, so an abandoned writable still leaves partial data on
-    // "disk" — which is exactly what resume relies on.
-    this._handle.bytes = Uint8Array.from(this._buf);
   }
 
+  /** Like a browser's, only this commits what was written. */
   async close() {
     this._closed = true;
     this._handle.bytes = Uint8Array.from(this._buf);

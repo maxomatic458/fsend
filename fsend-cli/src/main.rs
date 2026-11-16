@@ -18,7 +18,7 @@ use fsend_cli::webrtc::WebRtcTransfer;
 use fsend_proto::code::Code;
 use fsend_proto::pairing::ConnectionInfo;
 use fsend_proto::peer::resume::{Conflict, ConflictPolicy};
-use fsend_proto::peer::{self, Entry, offer::TopEntry};
+use fsend_proto::peer::{self, Entry, progress::TopEntry};
 use fsend_proto::relay::Transport;
 use url::Url;
 
@@ -75,8 +75,7 @@ async fn run() -> color_eyre::Result<()> {
     Ok(())
 }
 
-/// Only show errors for fsend and fsend_cli (webrtc throws some error logs that,
-/// are not actually errors) to avoid spam.
+/// At error level, libraries are silenced: webrtc logs errors that are not.
 fn log_filter(level: tracing::Level) -> Targets {
     let own = LevelFilter::from_level(level);
     let libraries = if level == tracing::Level::ERROR {
@@ -86,7 +85,7 @@ fn log_filter(level: tracing::Level) -> Targets {
     };
     Targets::new()
         .with_default(libraries)
-        .with_targets([("fsend", own), ("fsend_cli", own)])
+        .with_target("fsend", own)
 }
 
 fn print_version() {
@@ -116,11 +115,8 @@ async fn connect_as_sender(relay: &mut Relay) -> color_eyre::Result<Box<dyn tran
             let my_info = ConnectionInfo::WebRtc { sdp: offer_sdp };
 
             relay.send_connection(my_info).await?;
-            let peer_info = relay.connection().await?;
-
-            let answer_sdp = match &peer_info {
-                ConnectionInfo::WebRtc { sdp } => sdp.clone(),
-                _ => return Err(TransferError::UnexpectedConnectionInfo.into()),
+            let ConnectionInfo::WebRtc { sdp: answer_sdp } = relay.connection().await? else {
+                return Err(TransferError::UnexpectedConnectionInfo.into());
             };
             wrt.set_answer(&answer_sdp).await?;
             wrt.wait_connected().await?;
@@ -135,18 +131,19 @@ async fn connect_as_receiver(
     match relay.transport {
         Transport::Iroh => {
             let endpoint = IrohTransfer::create_endpoint().await?;
-            let my_info = IrohTransfer::local_connection_info(&endpoint).await;
-
-            let peer_info = relay.connection().await?;
+            // Finding our own address can take a while; the sender's arrives meanwhile.
+            let (my_info, peer_info) = tokio::join!(
+                IrohTransfer::local_connection_info(&endpoint),
+                relay.connection()
+            );
+            let peer_info = peer_info?;
             relay.send_connection(my_info).await?;
 
-            Ok(Box::new(IrohTransfer::connect(endpoint, peer_info).await?))
+            Ok(Box::new(IrohTransfer::connect(endpoint, &peer_info).await?))
         }
         Transport::Webrtc => {
-            let peer_info = relay.connection().await?;
-            let offer_sdp = match &peer_info {
-                ConnectionInfo::WebRtc { sdp } => sdp.clone(),
-                _ => return Err(TransferError::UnexpectedConnectionInfo.into()),
+            let ConnectionInfo::WebRtc { sdp: offer_sdp } = relay.connection().await? else {
+                return Err(TransferError::UnexpectedConnectionInfo.into());
             };
 
             let (mut wrt, answer_sdp) = WebRtcTransfer::create_answerer(&offer_sdp).await?;
@@ -165,11 +162,6 @@ async fn run_send(
     files: Vec<PathBuf>,
     compress: bool,
 ) -> color_eyre::Result<()> {
-    let missing: Vec<_> = files.iter().filter(|f| !f.exists()).cloned().collect();
-
-    if !missing.is_empty() {
-        return Err(TransferError::PathsNotFound(missing).into());
-    }
     let outgoing = build_offer(&files)?;
 
     let mut relay = pair_as_sender(relay_url, |code| {
@@ -277,7 +269,12 @@ impl Progress {
 fn accept_files(files: &[TopEntry]) -> bool {
     println!("The following files will be received:\n");
 
-    let longest = files.iter().map(|f| f.name.len()).max().unwrap_or(0) + 1;
+    let longest = files
+        .iter()
+        .map(|f| f.name.chars().count())
+        .max()
+        .unwrap_or(0)
+        + 1;
     let total_size: u64 = files.iter().map(|f| f.size).sum();
 
     for file in files {
@@ -301,10 +298,13 @@ fn accept_files(files: &[TopEntry]) -> bool {
         HumanBytes(total_size).to_string().red()
     );
 
-    dialoguer::Confirm::with_theme(&ColorfulTheme::default())
-        .with_prompt("Accept these files?")
-        .interact()
-        .unwrap_or(false)
+    // The prompt blocks, so the runtime moves other tasks off this thread meanwhile.
+    tokio::task::block_in_place(|| {
+        dialoguer::Confirm::with_theme(&ColorfulTheme::default())
+            .with_prompt("Accept these files?")
+            .interact()
+    })
+    .unwrap_or(false)
 }
 
 /// Lists the conflicts and picks what to do with them.
@@ -346,12 +346,14 @@ fn resolve_conflicts(
             ConflictPolicy::Replace
         }
         OnConflict::Ask => {
-            let choice = dialoguer::Select::with_theme(&ColorfulTheme::default())
-                .with_prompt("What should happen to them?")
-                .items(["Skip", "Replace"])
-                .default(0)
-                .interact()
-                .unwrap_or(0);
+            let choice = tokio::task::block_in_place(|| {
+                dialoguer::Select::with_theme(&ColorfulTheme::default())
+                    .with_prompt("What should happen to them?")
+                    .items(["Skip", "Replace"])
+                    .default(0)
+                    .interact()
+            })
+            .unwrap_or(0);
             match choice {
                 1 => ConflictPolicy::Replace,
                 _ => ConflictPolicy::Skip,
@@ -384,7 +386,7 @@ impl CliProgressBars {
         let (mut longest, total_progress, total_size) = data
             .iter()
             .fold((0usize, 0u64, 0u64), |(l, tp, ts), (name, prog, size)| {
-                (l.max(name.len()), tp + prog, ts + size)
+                (l.max(name.chars().count()), tp + prog, ts + size)
             });
         longest = longest.max("Total".len());
 

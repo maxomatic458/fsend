@@ -7,7 +7,7 @@ import { createReceiveSession } from "../primitives/createReceiveSession";
 import { createWindowDropTarget } from "../primitives/createWindowDropTarget";
 import { createExitGuard } from "../primitives/createExitGuard";
 import { ConfirmDialog } from "../components/ConfirmDialog";
-import { TransferHeader } from "../components/StepIndicator";
+import { TransferHeader } from "../components/TransferHeader";
 import { CodeInput } from "../components/CodeInput";
 import { FileOffer } from "../components/FileOffer";
 import { TransferProgress } from "../components/TransferProgress";
@@ -15,10 +15,7 @@ import { ErrorCard } from "../components/ErrorCard";
 import { Button } from "../components/Button";
 import { Busy } from "../components/Busy";
 import { StorageUsage } from "../components/StorageUsage";
-import { formatBytes } from "../lib/format";
-
-const count = (n: number, one: string, many: string) =>
-  `${n} ${n === 1 ? one : many}`;
+import { formatBytes, plural } from "../lib/format";
 
 export function ReceivePage() {
   const navigate = useNavigate();
@@ -29,6 +26,7 @@ export function ReceivePage() {
   /// Held in memory: chosen, or because browser storage had no room.
   const inMemory = () => !toFs() || receive.heldInMemory();
 
+  // Swallows stray drops so they don't open the file.
   createWindowDropTarget(() => {});
   const exitGuard = createExitGuard(receive.isTransferring);
 
@@ -260,24 +258,24 @@ export function ReceivePage() {
                 {formatBytes(receive.progress.totalTransferredBytes)}{" "}
                 {toFolder()
                   ? `saved to ${receive.folder()?.name}`
-                  : "Should now be downloading in your browser"}
+                  : "should now be downloading in your browser"}
               </p>
 
               <Show when={receive.conflicts().skipped > 0}>
                 <p class="text-[13px] text-ink-faint mb-4">
                   Skipped{" "}
-                  {count(
+                  {plural(
                     receive.conflicts().skipped,
                     "existing entry",
                     "existing entries",
                   )}{" "}
-                  that differ from the offer.
+                  that differed from the offer.
                 </p>
               </Show>
               <Show when={receive.conflicts().replaced > 0}>
                 <p class="text-[13px] text-ink-faint mb-4">
                   Replaced{" "}
-                  {count(
+                  {plural(
                     receive.conflicts().replaced,
                     "existing file",
                     "existing files",

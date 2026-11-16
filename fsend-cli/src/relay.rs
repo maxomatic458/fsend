@@ -13,12 +13,12 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungsten
 use url::Url;
 
 /// For connecting and for each reply of the relay.
-pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// For each signal from the peer; the relay gives the two sides a minute.
-pub const PEER_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const PEER_TIMEOUT: Duration = Duration::from_secs(60);
 /// In order of preference.
-pub const TRANSPORTS: [Transport; 2] = [Transport::Iroh, Transport::Webrtc];
-pub const APP: &str = concat!("fsend-cli ", env!("CARGO_PKG_VERSION"));
+pub(crate) const TRANSPORTS: [Transport; 2] = [Transport::Iroh, Transport::Webrtc];
+pub(crate) const APP: &str = concat!("fsend-cli ", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Error)]
 pub enum RelayError {

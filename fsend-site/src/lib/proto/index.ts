@@ -23,7 +23,11 @@ let loading: Promise<unknown> | undefined;
 
 /** Loads the wasm module; every other export needs it loaded. */
 export async function loadProto(): Promise<void> {
-  await (loading ??= init());
+  // A failed load is tried again next time.
+  await (loading ??= init().catch((err) => {
+    loading = undefined;
+    throw err;
+  }));
 }
 
 /** A code, checked and upper-cased. */
@@ -75,8 +79,8 @@ export class Pake {
   }
 
   /** The first frame for the peer. */
-  get message(): Uint8Array {
-    return this.inner.message;
+  get message(): Bytes {
+    return this.inner.message as Bytes;
   }
 
   finish(frame: Uint8Array, role: wasm.Role): Channel {
@@ -88,8 +92,8 @@ export class Pake {
 export class Channel {
   constructor(private inner: wasm.Channel) {}
 
-  seal(message: Sealed): Uint8Array {
-    return this.inner.seal(JSON.stringify(message));
+  seal(message: Sealed): Bytes {
+    return this.inner.seal(JSON.stringify(message)) as Bytes;
   }
 
   open(frame: Uint8Array): Sealed {
@@ -101,10 +105,8 @@ export class Channel {
 export type PeerMessage = SenderMessage | ReceiverMessage;
 
 /** One control frame of `message`; throws unless `from` sends it. */
-export const encodeFrame = (
-  message: PeerMessage,
-  from: wasm.Role,
-): Uint8Array => wasm.encodeFrame(JSON.stringify(message), from);
+export const encodeFrame = (message: PeerMessage, from: wasm.Role): Bytes =>
+  wasm.encodeFrame(JSON.stringify(message), from) as Bytes;
 
 /** Reassembles the control messages `from` sends, as `M`, from bytes split anywhere. */
 export class FrameDecoder<M extends PeerMessage> {
@@ -191,8 +193,8 @@ export const validateOffer = (entries: Entry[]): void =>
   wasm.validateOffer(JSON.stringify(entries));
 
 /** The control frame of an offer of `entries`; throws unless they follow the offer rules. */
-export const encodeOffer = (entries: Entry[]): Uint8Array =>
-  wasm.encodeOffer(JSON.stringify(entries));
+export const encodeOffer = (entries: Entry[]): Bytes =>
+  wasm.encodeOffer(JSON.stringify(entries)) as Bytes;
 
 /** Throws unless `files` names files of `entries`, in order, with offsets within them. */
 export const checkAccept = (entries: Entry[], files: AcceptedFile[]): void =>

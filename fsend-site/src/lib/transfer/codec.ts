@@ -102,8 +102,11 @@ function inWorker(worker: Worker): BlockCodec {
     { resolve: (response: CodecResponse) => void; reject: (e: Error) => void }
   >();
   let id = 0;
+  // Once set, the worker is gone and every request fails with it.
+  let failed: Error | undefined;
   const fail = (error: Error) => {
-    for (const { reject } of waiting.values()) reject(error);
+    failed ??= error;
+    for (const { reject } of waiting.values()) reject(failed);
     waiting.clear();
   };
   worker.onmessage = (event: MessageEvent<CodecResponse>) => {
@@ -118,6 +121,7 @@ function inWorker(worker: Worker): BlockCodec {
 
   const run = <T>(request: CodecRequest, transfer: Transferable[]) =>
     new Promise<T>((resolve, reject) => {
+      if (failed) return reject(failed);
       waiting.set(request.id, {
         resolve: (response) => resolve(response as T),
         reject,

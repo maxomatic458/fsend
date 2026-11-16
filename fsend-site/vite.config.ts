@@ -13,8 +13,7 @@ export default defineConfig(({ isSsrBuild }) => ({
     __BUILD_TIME__: JSON.stringify(buildInfo.builtAt),
     __BUILD_TIMESTAMP__: JSON.stringify(buildInfo.builtAtMs),
   },
-  // The prerender pass needs Solid compiled for the server (generate: "ssr"),
-  // so the same config serves both builds.
+  // The SSR build is the prerender pass.
   plugins: [
     ...(isSsrBuild ? [] : [devtools()]),
     solidPlugin({ ssr: isSsrBuild }),
@@ -29,7 +28,6 @@ export default defineConfig(({ isSsrBuild }) => ({
   build: {
     target: "esnext",
   },
-  // Workers are started as modules.
   worker: {
     format: "es",
   },

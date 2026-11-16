@@ -2,7 +2,6 @@ use zstd::bulk::Decompressor;
 
 use super::frame::{self, Deframer, FrameError, ZSTD};
 use super::limits::MAX_BLOCK_BYTES;
-use super::{AcceptedFile, Entry};
 
 /// Ahead of a compressed payload: the `u32 BE` count of file bytes in it.
 const RAW_LEN_BYTES: usize = 4;
@@ -15,11 +14,10 @@ pub fn encode(data: &[u8], compress: bool) -> Vec<u8> {
         (1..=MAX_BLOCK_BYTES).contains(&data.len()),
         "a block holds 1 to {MAX_BLOCK_BYTES} bytes"
     );
-    match compress.then(|| frame::compress(data)).flatten() {
-        Some(compressed) if RAW_LEN_BYTES + compressed.len() < data.len() => {
-            frame::frame(ZSTD, &[&(data.len() as u32).to_be_bytes(), &compressed])
-        }
-        _ => frame::frame(0, &[data]),
+    if compress {
+        frame::compact(&(data.len() as u32).to_be_bytes(), data)
+    } else {
+        frame::frame(0, &[data])
     }
 }
 
@@ -103,55 +101,6 @@ impl BlockDecoder {
         decompressor
             .decompress(payload, capacity)
             .map_err(|_| FrameError::Compression)
-    }
-}
-
-/// Turns counts of data stream bytes into progress per top-level entry, in stream order.
-#[derive(Debug, Clone)]
-pub struct Progress {
-    /// The top-level entry of each run of accepted bytes, and its length.
-    runs: Vec<(usize, u64)>,
-    run: usize,
-    /// Bytes of the current run already counted.
-    used: u64,
-}
-
-impl Progress {
-    /// For `files` accepted of `entries`, with `top_of` from [`super::offer::top_entries`].
-    pub fn new(entries: &[Entry], files: &[AcceptedFile], top_of: &[usize]) -> Self {
-        let mut runs = Vec::<(usize, u64)>::new();
-        for file in files {
-            let id = file.id as usize;
-            let bytes = entries[id].size() - file.offset;
-            match runs.last_mut() {
-                Some((top, run)) if *top == top_of[id] => *run += bytes,
-                _ if bytes > 0 => runs.push((top_of[id], bytes)),
-                _ => {}
-            }
-        }
-        Self {
-            runs,
-            run: 0,
-            used: 0,
-        }
-    }
-
-    /// The bytes of each top-level entry among the next `n`; nothing past the end.
-    pub fn advance(&mut self, mut n: u64) -> Vec<(usize, u64)> {
-        let mut steps = Vec::new();
-        while n > 0
-            && let Some(&(top, len)) = self.runs.get(self.run)
-        {
-            let take = n.min(len - self.used);
-            steps.push((top, take));
-            n -= take;
-            self.used += take;
-            if self.used == len {
-                self.run += 1;
-                self.used = 0;
-            }
-        }
-        steps
     }
 }
 
@@ -244,28 +193,6 @@ mod tests {
             assert!(decoder.next_block().unwrap().is_some());
             assert_eq!(decoder.partial(), 0);
         }
-    }
-
-    #[test]
-    fn progress_walks_the_accepted_bytes() {
-        let file = |path: &str, size| Entry::File {
-            path: vec![path.into()],
-            size,
-        };
-        let entries = [file("a", 10), file("b", 0), file("c", 5), file("d", 4)];
-        let files = [
-            AcceptedFile { id: 0, offset: 2 },
-            AcceptedFile { id: 1, offset: 0 },
-            AcceptedFile { id: 2, offset: 0 },
-            AcceptedFile { id: 3, offset: 0 },
-        ];
-        // a and b share a top-level entry, c and d do not.
-        let mut progress = Progress::new(&entries, &files, &[0, 0, 1, 2]);
-        assert_eq!(progress.advance(3), [(0, 3)]);
-        assert_eq!(progress.advance(7), [(0, 5), (1, 2)]);
-        assert_eq!(progress.advance(0), []);
-        assert_eq!(progress.advance(100), [(1, 3), (2, 4)]);
-        assert_eq!(progress.advance(1), []);
     }
 
     #[test]

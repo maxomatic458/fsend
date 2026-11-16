@@ -6,13 +6,14 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use colored::Colorize;
-use fsend_proto::peer::block::{self, BlockDecoder, Progress};
+use fsend_proto::peer::block::{self, BlockDecoder};
 use fsend_proto::peer::frame::{self, FrameDecoder};
 use fsend_proto::peer::limits::{
     ACK_INTERVAL, ACK_STEP, GOODBYE_TIMEOUT, HELLO_TIMEOUT, IDLE_TIMEOUT, MAX_BLOCK_BYTES,
     MAX_DEPTH, MIN_RECV_WINDOW, RECV_WINDOW,
 };
-use fsend_proto::peer::offer::{self, EntryError, OfferError, TopEntry};
+use fsend_proto::peer::offer::{self, EntryError, OfferError};
+use fsend_proto::peer::progress::{self, Progress, TopEntry};
 use fsend_proto::peer::resume::{self, Conflict, ConflictPolicy, Fingerprint, Local};
 use fsend_proto::peer::{
     self, AcceptedFile, Cancel, CheckedFile, Entry, ErrorCode, ErrorReport, Hello, Message,
@@ -25,8 +26,8 @@ use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
-/// Read chunk on the streams.
-pub const BUF_SIZE: usize = 64 * 1024;
+/// Chunk size for stream reads and writes.
+pub(crate) const BUF_SIZE: usize = 64 * 1024;
 /// Data blocks compressed at once.
 const COMPRESS_WORKERS: usize = 4;
 
@@ -39,14 +40,10 @@ const RECEIVER_IDLE: &str = "the receiver stopped responding";
 pub enum TransferError {
     #[error("io: {0}")]
     Io(io::Error),
-    #[error("connection: {0}")]
-    Connection(#[from] iroh::endpoint::ConnectionError),
     #[error("connection to the peer lost: {0}")]
     Disconnected(String),
     #[error("{} of the given paths do not exist", .0.len())]
     PathsNotFound(Vec<PathBuf>),
-    #[error("file does not exist: {0}")]
-    FileNotFound(PathBuf),
     /// The selection breaks the offer rules.
     #[error("cannot send these files: {0}")]
     Unsendable(OfferError),
@@ -75,8 +72,6 @@ pub enum TransferError {
     Bind(#[from] iroh::endpoint::BindError),
     #[error("connect: {0}")]
     Connect(#[from] iroh::endpoint::ConnectError),
-    #[error("accept: {0}")]
-    Accept(#[from] iroh::endpoint::ConnectingError),
     #[error("node id: {0}")]
     NodeId(#[from] iroh::KeyParsingError),
     #[error("the peer did not connect in time")]
@@ -92,14 +87,18 @@ pub enum TransferError {
 }
 
 impl TransferError {
-    /// Generate a user-facing error messages for user-facing "errors"
+    /// A message for the errors a user can act on.
     pub fn user_error(&self) -> Option<String> {
         let error = "error:".red();
         let update = "Update fsend on both sides.";
         Some(match self {
             Self::Declined => "Transfer declined.".to_owned(),
-            Self::PeerDeclined(_) => format!("{error} the peer declined the files"),
-            Self::PeerCancelled(_) => format!("{error} the peer cancelled the transfer"),
+            Self::PeerDeclined(_)
+            | Self::PeerCancelled(_)
+            | Self::Unsendable(_)
+            | Self::Timeout(_) => {
+                format!("{error} {self}")
+            }
             Self::Disconnected(reason) => format!(
                 "{error} the connection to the peer was lost ({reason}).\n\
                  Start a new session to resume the transfer where it stopped."
@@ -110,8 +109,6 @@ impl TransferError {
                 message,
             } => format!("{error} the peer speaks another protocol version ({message}).\n{update}"),
             Self::Peer { message, .. } => format!("{error} the peer failed: {message}"),
-            Self::Unsendable(e) => format!("{error} cannot send these files: {e}"),
-            Self::Timeout(what) => format!("{error} timed out: {what}"),
             Self::PathsNotFound(paths) => {
                 let noun = if paths.len() == 1 {
                     "path does"
@@ -128,13 +125,10 @@ impl TransferError {
                 "{error} the peer did not connect in time. Check that both sides are online and try again."
             ),
             Self::Io(_)
-            | Self::Connection(_)
-            | Self::FileNotFound(_)
             | Self::InvalidOffer(_)
             | Self::Protocol(_)
             | Self::Bind(_)
             | Self::Connect(_)
-            | Self::Accept(_)
             | Self::NodeId(_)
             | Self::EndpointClosed
             | Self::UnexpectedConnectionInfo
@@ -165,8 +159,14 @@ impl TransferError {
     }
 }
 
-/// A stream that reports the peer as gone is a lost connection, not an I/O
-/// fault; the transports mark those with `ConnectionAborted`/`NotConnected`.
+/// The transports report a peer that is gone as `ConnectionAborted`, `ConnectionReset` or `NotConnected`.
+/// A QUIC connection that fails has lost the peer.
+impl From<iroh::endpoint::ConnectionError> for TransferError {
+    fn from(e: iroh::endpoint::ConnectionError) -> Self {
+        Self::Disconnected(e.to_string())
+    }
+}
+
 impl From<io::Error> for TransferError {
     fn from(e: io::Error) -> Self {
         use io::ErrorKind::*;
@@ -242,11 +242,12 @@ pub struct Outgoing {
 
 /// Walks `paths` into a valid offer.
 pub fn build_offer(paths: &[PathBuf]) -> Result<Outgoing, TransferError> {
+    let missing: Vec<_> = paths.iter().filter(|p| !p.exists()).cloned().collect();
+    if !missing.is_empty() {
+        return Err(TransferError::PathsNotFound(missing));
+    }
     let mut outgoing = Outgoing::default();
     for path in paths {
-        if !path.exists() {
-            return Err(TransferError::FileNotFound(path.clone()));
-        }
         outgoing.add(path, vec![entry_name(path)?])?;
     }
     outgoing.frame = offer::encode(&outgoing.entries).map_err(TransferError::Unsendable)?;
@@ -302,7 +303,7 @@ fn entry_name(path: &Path) -> io::Result<String> {
 }
 
 /// Where an offered path lands under `root`; each name must be a plain file name here.
-pub fn local_path(root: &Path, path: &[String]) -> io::Result<PathBuf> {
+pub(crate) fn local_path(root: &Path, path: &[String]) -> io::Result<PathBuf> {
     let mut out = root.to_path_buf();
     for name in path {
         let mut components = Path::new(name).components();
@@ -320,14 +321,16 @@ pub fn local_path(root: &Path, path: &[String]) -> io::Result<PathBuf> {
 }
 
 /// Opens a file for receiving; at offset 0 whatever was there is dropped.
-pub async fn open_for_receive(path: &Path, offset: u64) -> io::Result<File> {
+pub(crate) async fn open_for_receive(path: &Path, offset: u64) -> io::Result<File> {
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(offset == 0)
         .open(path)
         .await?;
-    file.seek(io::SeekFrom::Start(offset)).await?;
+    if offset > 0 {
+        file.seek(io::SeekFrom::Start(offset)).await?;
+    }
     Ok(file)
 }
 
@@ -361,13 +364,13 @@ fn fingerprint(path: &Path, len: u64) -> io::Result<Fingerprint> {
 }
 
 /// Finishes a received file.
-pub async fn finish_received_file(file: &mut File, size: u64) -> io::Result<()> {
+pub(crate) async fn finish_received_file(file: &mut File, size: u64) -> io::Result<()> {
     file.set_len(size).await?;
     file.shutdown().await
 }
 
 /// A message the peer sends.
-pub trait PeerMessage: Message + Debug {
+pub(crate) trait PeerMessage: Message + Debug {
     /// What it means where the flow expects another one.
     fn unexpected(self) -> TransferError;
     /// Whether it is the peer's last word.
@@ -412,15 +415,15 @@ impl From<ErrorReport> for TransferError {
 }
 
 /// The control stream, one message per frame: we send `Out`, the peer sends `In`.
-pub struct Control<Out, In> {
+pub(crate) struct Control<Out, In> {
     stream: Box<dyn ByteStream>,
     decoder: FrameDecoder,
     buf: Vec<u8>,
     messages: PhantomData<fn(Out) -> In>,
 }
 
-pub type SenderControl = Control<SenderMessage, ReceiverMessage>;
-pub type ReceiverControl = Control<ReceiverMessage, SenderMessage>;
+pub(crate) type SenderControl = Control<SenderMessage, ReceiverMessage>;
+pub(crate) type ReceiverControl = Control<ReceiverMessage, SenderMessage>;
 
 impl<Out: Message + Debug, In: PeerMessage> Control<Out, In> {
     pub fn new(stream: Box<dyn ByteStream>) -> Self {
@@ -603,10 +606,10 @@ async fn send(
         other => return Err(other.unexpected()),
     };
     offer::check_accept(entries, &files).map_err(|e| TransferError::Protocol(e.to_string()))?;
-    let (tops, top_of) = offer::top_entries(entries);
+    let (tops, top_of) = progress::top_entries(entries);
     on_event(Event::Started {
         entries: &tops,
-        present: &offer::present(entries, &files),
+        present: &progress::present(entries, &files),
     });
 
     let mut reader = BlockReader::new(outgoing, &files);
@@ -694,7 +697,9 @@ impl<'a> BlockReader<'a> {
                     let next = self.files.next().expect("bytes are left");
                     let id = next.id as usize;
                     let mut file = File::open(&self.outgoing.sources[id]).await?;
-                    file.seek(io::SeekFrom::Start(next.offset)).await?;
+                    if next.offset > 0 {
+                        file.seek(io::SeekFrom::Start(next.offset)).await?;
+                    }
                     let left = self.outgoing.entries[id].size() - next.offset;
                     self.current = Some((file, left));
                     continue;
@@ -805,7 +810,7 @@ async fn receive(
         other => return Err(other.unexpected()),
     };
     offer::validate(&entries).map_err(TransferError::InvalidOffer)?;
-    let (tops, top_of) = offer::top_entries(&entries);
+    let (tops, top_of) = progress::top_entries(&entries);
 
     let Some(out) = accept(&tops) else {
         control
@@ -819,7 +824,7 @@ async fn receive(
         .iter()
         .map(|entry| local_path(&out, entry.path()))
         .collect::<io::Result<Vec<_>>>()?;
-    let local = local_entries(&paths).await;
+    let local = local_entries(&paths).await?;
     let checked = resume::to_check(&entries, &local);
     let verified = if checked.is_empty() {
         Vec::new()
@@ -839,7 +844,7 @@ async fn receive(
         .await?;
     on_event(Event::Started {
         entries: &tops,
-        present: &offer::present(&entries, &files),
+        present: &progress::present(&entries, &files),
     });
 
     for &id in &plan.dirs {
@@ -874,9 +879,10 @@ async fn receive(
             }
             None => Ok(()),
         };
-        // Even a partial file must be on disk before the next session resumes it.
-        file.flush().await?;
+        // Hands even a partial file to the OS, for a later session to resume.
+        let flushed = file.flush().await;
         received?;
+        flushed?;
         finish_received_file(&mut file, size).await?;
     }
     if incoming.is_some_and(|incoming| !incoming.is_empty()) {
@@ -890,18 +896,22 @@ async fn receive(
     Ok(())
 }
 
-/// What is already at each path.
-async fn local_entries(paths: &[PathBuf]) -> Vec<Local> {
-    let mut local = Vec::with_capacity(paths.len());
-    for path in paths {
-        local.push(match tokio::fs::metadata(path).await {
-            Err(_) => Local::Missing,
-            Ok(m) if m.is_file() => Local::File { size: m.len() },
-            Ok(m) if m.is_dir() => Local::Dir,
-            Ok(_) => Local::Other,
-        });
-    }
-    local
+/// What is already at each path, looked up in one blocking task.
+async fn local_entries(paths: &[PathBuf]) -> io::Result<Vec<Local>> {
+    let paths = paths.to_vec();
+    tokio::task::spawn_blocking(move || {
+        paths
+            .iter()
+            .map(|path| match std::fs::metadata(path) {
+                Err(_) => Local::Missing,
+                Ok(m) if m.is_file() => Local::File { size: m.len() },
+                Ok(m) if m.is_dir() => Local::Dir,
+                Ok(_) => Local::Other,
+            })
+            .collect()
+    })
+    .await
+    .map_err(io::Error::other)
 }
 
 /// Asks the sender for fingerprints of the `checked` files; returns the ids of those that match ours.

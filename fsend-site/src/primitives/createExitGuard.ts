@@ -1,7 +1,7 @@
 import { createSignal, onCleanup, onMount } from "solid-js";
 import { useBeforeLeave } from "@solidjs/router";
 
-export interface ExitGuard {
+interface ExitGuard {
   isPrompting: () => boolean;
   confirm: () => void;
   cancel: () => void;

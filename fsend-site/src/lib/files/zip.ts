@@ -160,7 +160,7 @@ export function zipBlob(entries: ZipEntry[], modified = new Date()): Blob {
 }
 
 /** The CRC-32 of `blob`, read a chunk at a time. */
-export async function crcOf(blob: Blob): Promise<number> {
+async function crcOf(blob: Blob): Promise<number> {
   let crc = 0;
   const reader = blob.stream().getReader();
   for (;;) {

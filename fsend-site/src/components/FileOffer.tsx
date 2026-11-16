@@ -1,14 +1,14 @@
 import { For, Show } from "solid-js";
-import { FiFolder, FiFile } from "solid-icons/fi";
-import { formatBytes } from "../lib/format";
+import { formatBytes, plural } from "../lib/format";
 import { Button } from "./Button";
 import type { TopEntry } from "../lib/proto";
+import { EntryName } from "./EntryName";
 
 interface FileOfferProps {
   files: TopEntry[];
-  /// True when the browser has no File System Access API
+  /// The transfer is held in memory.
   inMemory?: boolean;
-  /// Accepted, so the choice is made.
+  /// Disables both buttons once accepted.
   busy?: boolean;
   onAccept: () => void;
   onReject: () => void;
@@ -19,26 +19,17 @@ export function FileOffer(props: FileOfferProps) {
   const dirs = () => props.files.filter((f) => f.dir).length;
   const totalBytes = () => props.files.reduce((sum, f) => sum + f.size, 0);
 
-  const headline = () => {
-    const n = count();
-    if (dirs() === n && n > 0) {
-      return `The sender wants to share ${n} folder${n === 1 ? "" : "s"}`;
-    }
-    if (dirs() > 0) return `The sender wants to share ${n} items`;
-    return `The sender wants to share ${n} file${n === 1 ? "" : "s"}`;
-  };
-
   const summary = () => {
     const n = count();
-    if (dirs() === n && n > 0) return `${n} folder${n === 1 ? "" : "s"}`;
-    if (dirs() > 0) return `${n} items`;
-    return `${n} file${n === 1 ? "" : "s"}`;
+    if (dirs() === n && n > 0) return plural(n, "folder", "folders");
+    if (dirs() > 0) return plural(n, "item", "items");
+    return plural(n, "file", "files");
   };
 
   return (
     <div class="w-full max-w-[620px] mx-auto flex flex-col gap-4.5 pt-5">
       <div class="flex flex-col items-center gap-1.5 text-center">
-        <h2 class="text-xl font-bold">{headline()}</h2>
+        <h2 class="text-xl font-bold">The sender wants to share {summary()}</h2>
         <p class="text-sm text-ink-dim">
           Accepting starts the transfer straight away.
         </p>
@@ -48,14 +39,7 @@ export function FileOffer(props: FileOfferProps) {
         <For each={props.files}>
           {(entry) => (
             <div class="flex items-center justify-between gap-4 py-3.5 px-1 border-b border-line">
-              <div class="flex items-center gap-3 min-w-0">
-                {entry.dir ? (
-                  <FiFolder class="w-4 h-4 text-ink-faint shrink-0" />
-                ) : (
-                  <FiFile class="w-4 h-4 text-ink-faint shrink-0" />
-                )}
-                <span class="text-[15.5px] truncate">{entry.name}</span>
-              </div>
+              <EntryName name={entry.name} dir={entry.dir} />
               <span class="font-mono text-[13px] text-ink-dim shrink-0">
                 {formatBytes(entry.size)}
               </span>

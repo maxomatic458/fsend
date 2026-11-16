@@ -4,7 +4,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 use super::{
-    AcceptedFile, CheckedFile, Entry, SenderMessage, frame,
+    AcceptedFile, CheckedFile, Entry, frame,
     limits::{MAX_COMPONENT_BYTES, MAX_DEPTH, MAX_ENTRIES, MAX_PATH_BYTES, MAX_TOTAL_BYTES},
 };
 
@@ -97,13 +97,17 @@ fn valid_name(name: &str) -> bool {
             .any(|c| c == '/' || c == '\\' || c.is_control())
 }
 
+/// [`super::SenderMessage::Offer`] as it goes on the wire, borrowing its entries.
+#[derive(Serialize)]
+#[serde(tag = "type", rename = "offer")]
+struct OfferRef<'a> {
+    entries: &'a [Entry],
+}
+
 /// The control frame of an offer of `entries`, once they pass [`validate`].
 pub fn encode(entries: &[Entry]) -> Result<Vec<u8>, OfferError> {
     validate(entries)?;
-    frame::encode(&SenderMessage::Offer {
-        entries: entries.to_vec(),
-    })
-    .map_err(|_| OfferError::TooLong)
+    frame::encode(&OfferRef { entries }).map_err(|_| OfferError::TooLong)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -148,52 +152,10 @@ fn check_files(
     Ok(())
 }
 
-/// A top-level entry of an offer, with the size of everything below it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct TopEntry {
-    pub name: String,
-    pub dir: bool,
-    pub size: u64,
-}
-
-/// The top-level entries of a valid offer, and for each entry the index of the one it lies in.
-pub fn top_entries(entries: &[Entry]) -> (Vec<TopEntry>, Vec<usize>) {
-    let mut tops = Vec::new();
-    let mut index = HashMap::<&str, usize>::new();
-    let top_of = entries
-        .iter()
-        .map(|entry| {
-            let name = &entry.path()[0];
-            let top = *index.entry(name).or_insert_with(|| {
-                tops.push(TopEntry {
-                    name: name.clone(),
-                    dir: entry.is_dir(),
-                    size: 0,
-                });
-                tops.len() - 1
-            });
-            tops[top].size += entry.size();
-            top
-        })
-        .collect();
-    (tops, top_of)
-}
-
-/// Bytes of each top-level entry already present once `files` are accepted.
-pub fn present(entries: &[Entry], files: &[AcceptedFile]) -> Vec<u64> {
-    let (tops, top_of) = top_entries(entries);
-    let mut present: Vec<u64> = tops.iter().map(|top| top.size).collect();
-    for file in files {
-        let id = file.id as usize;
-        present[top_of[id]] -= entries[id].size() - file.offset;
-    }
-    present
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::peer::SenderMessage;
 
     fn file(path: &[&str], size: u64) -> Entry {
         Entry::File {
@@ -354,37 +316,5 @@ mod tests {
             check_lengths(&entries, &checked),
             Err(FileListError::PastEnd(2))
         );
-    }
-
-    #[test]
-    fn progress_counts_per_top_level_entry() {
-        let entries = [
-            file(&["a"], 10),
-            dir(&["d"]),
-            dir(&["e"]),
-            file(&["e", "x"], 3),
-            file(&["d", "b"], 5),
-            dir(&["d", "f"]),
-            file(&["d", "f", "c"], 7),
-        ];
-        let (tops, top_of) = top_entries(&entries);
-        let top = |name: &str, dir, size| TopEntry {
-            name: name.into(),
-            dir,
-            size,
-        };
-        assert_eq!(
-            tops,
-            [top("a", false, 10), top("d", true, 12), top("e", true, 3)]
-        );
-        // Entries of different top-level entries may interleave.
-        assert_eq!(top_of, [0, 1, 2, 2, 1, 1, 1]);
-
-        let files = [
-            AcceptedFile { id: 0, offset: 4 },
-            AcceptedFile { id: 6, offset: 0 },
-        ];
-        assert_eq!(present(&entries, &files), [4, 5, 3]);
-        assert_eq!(present(&entries, &[]), [10, 12, 3]);
     }
 }

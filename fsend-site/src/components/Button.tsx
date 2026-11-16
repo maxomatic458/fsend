@@ -1,11 +1,8 @@
 import type { JSX } from "solid-js";
 
-/**
- * `accent` follows whichever .accent-* class the page container carries, so the
- * same tone renders flame on /send and azure on /receive.
- */
-export type ButtonTone = "accent" | "neutral" | "ghost" | "danger";
-export type ButtonSize = "sm" | "md" | "lg";
+/** `accent` follows the page's .theme-* class. */
+type ButtonTone = "accent" | "neutral" | "ghost" | "danger";
+type ButtonSize = "sm" | "md" | "lg";
 
 const tones: Record<ButtonTone, string> = {
   accent:

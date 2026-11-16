@@ -9,7 +9,7 @@ import { createSendSession } from "../primitives/createSendSession";
 import { createWindowDropTarget } from "../primitives/createWindowDropTarget";
 import { createExitGuard } from "../primitives/createExitGuard";
 import { ConfirmDialog } from "../components/ConfirmDialog";
-import { TransferHeader } from "../components/StepIndicator";
+import { TransferHeader } from "../components/TransferHeader";
 import { Logo } from "../components/Logo";
 import { FileList } from "../components/FileList";
 import { ShareCode } from "../components/ShareCode";
@@ -45,7 +45,8 @@ export function SendPage() {
 
   const addFolder = async () => {
     try {
-      send.add([await pickDirectory()]);
+      const folder = await pickDirectory();
+      if (folder) send.add([folder]);
     } catch {}
   };
 
@@ -93,8 +94,8 @@ export function SendPage() {
                 }`}
               >
                 {isDragging()
-                  ? "Drop to add them"
-                  : "Drop files anywhere on this page"}
+                  ? "Drop to Add Them"
+                  : "Drop Files Anywhere on This Page"}
               </h2>
               <p class="text-[14.5px] text-ink-dim text-center">
                 No size limits
@@ -121,8 +122,7 @@ export function SendPage() {
             </Show>
 
             <div class="flex flex-wrap justify-center gap-2.5 mt-4">
-              {/* The first selection is the primary action; once there is one,
-                  Generate Share Code takes over and this steps back. */}
+              {/* Primary until something is selected. */}
               <Button
                 tone={send.entries().length === 0 ? "accent" : "neutral"}
                 onClick={addFiles}
@@ -149,7 +149,7 @@ export function SendPage() {
         </Show>
 
         <Show when={send.state() === "connecting"}>
-          <Busy label="Creating session..." onCancel={goBack} />
+          <Busy label="Creating session..." onCancel={send.cancel} />
         </Show>
 
         <Show when={send.state() === "waiting"}>

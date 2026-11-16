@@ -68,8 +68,7 @@ export function createWindowDropTarget(onFiles: (data: DataTransfer) => void) {
     if (isDragging()) clear();
   };
 
-  // Registered inside onMount so neither half runs during the build-time
-  // prerender, where there is no window to listen on.
+  // No window during prerender.
   onMount(() => {
     window.addEventListener("dragenter", handleEnter);
     window.addEventListener("dragover", handleOver);

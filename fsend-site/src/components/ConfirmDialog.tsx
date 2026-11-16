@@ -1,4 +1,4 @@
-import { Show, createEffect, onCleanup } from "solid-js";
+import { Show, createEffect, createUniqueId, onCleanup } from "solid-js";
 import { Button } from "./Button";
 
 interface ConfirmDialogProps {
@@ -13,6 +13,8 @@ interface ConfirmDialogProps {
 
 export function ConfirmDialog(props: ConfirmDialogProps) {
   let cancelButton: HTMLButtonElement | undefined;
+  // A page may hold several dialogs.
+  const titleId = createUniqueId();
 
   createEffect(() => {
     if (!props.open) return;
@@ -23,7 +25,7 @@ export function ConfirmDialog(props: ConfirmDialogProps) {
     window.addEventListener("keydown", onKey);
     onCleanup(() => window.removeEventListener("keydown", onKey));
 
-    // Move focus into the dialog so Escape and Tab behave as expected.
+    // The safe choice has focus as it opens.
     cancelButton?.focus();
   });
 
@@ -36,11 +38,11 @@ export function ConfirmDialog(props: ConfirmDialogProps) {
         <div
           role="dialog"
           aria-modal="true"
-          aria-labelledby="confirm-title"
+          aria-labelledby={titleId}
           class="bg-surface border border-line rounded-xl p-6 max-w-md w-full shadow-xl"
           onClick={(e) => e.stopPropagation()}
         >
-          <h2 id="confirm-title" class="text-lg font-bold text-ink mb-2">
+          <h2 id={titleId} class="text-lg font-bold text-ink mb-2">
             {props.title}
           </h2>
           <p class="text-ink-muted text-[15px] leading-relaxed mb-6">

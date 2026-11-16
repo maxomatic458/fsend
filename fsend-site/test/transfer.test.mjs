@@ -56,29 +56,42 @@ function assertFiles(actual, expected) {
  * Runs a sender and a native-FS receiver against each other.
  * Returns once both have settled.
  */
-async function transfer(
+/**
+ * Starts a transfer of the entries `spec` describes; a test steps in before
+ * awaiting `senderDone` and `receiverDone`.
+ */
+async function start(
   spec,
-  { mode = "file", policy = "skip", dir, sink } = {},
+  {
+    mode = "file",
+    policy = "skip",
+    sink = createFolderSink(new MemoryDirectoryHandle()),
+    options,
+    sendSignal = new AbortController().signal,
+    recvSignal = new AbortController().signal,
+    recv = makeRecorder(),
+  } = {},
 ) {
-  const dirHandle = dir ?? new MemoryDirectoryHandle();
   const send = makeRecorder();
-  const recv = makeRecorder();
-
-  const senderDone = runSend(
-    makeEntries(spec, mode),
-    send.emit,
-    new AbortController().signal,
-  );
-
+  const senderDone = runSend(makeEntries(spec, mode), send.emit, sendSignal);
   const code = await waitFor(() => send.record.code, { label: "share code" });
   const receiverDone = runReceive(
     code,
-    sink ?? createFolderSink(dirHandle),
+    sink,
     policy,
     recv.emit,
-    new AbortController().signal,
+    recvSignal,
+    options,
   );
+  return { send, recv, senderDone, receiverDone };
+}
 
+async function transfer(spec, { dir, ...opts } = {}) {
+  const dirHandle = dir ?? new MemoryDirectoryHandle();
+  const { send, recv, senderDone, receiverDone } = await start(spec, {
+    sink: createFolderSink(dirHandle),
+    ...opts,
+  });
   await Promise.all([senderDone, receiverDone]);
   return { dirHandle, send: send.record, recv: recv.record };
 }
@@ -224,21 +237,9 @@ describe("complete transfers (File System Access API)", () => {
 
 describe("complete transfers (fallback, no File System Access API)", () => {
   async function fallbackTransfer(spec) {
-    const send = makeRecorder();
-    const recv = makeRecorder();
-    const senderDone = runSend(
-      makeEntries(spec),
-      send.emit,
-      new AbortController().signal,
-    );
-    const code = await waitFor(() => send.record.code, { label: "share code" });
-    const receiverDone = runReceive(
-      code,
-      createZipSink(),
-      "skip",
-      recv.emit,
-      new AbortController().signal,
-    );
+    const { send, recv, senderDone, receiverDone } = await start(spec, {
+      sink: createZipSink(),
+    });
     await Promise.all([senderDone, receiverDone]);
     return { send: send.record, recv: recv.record };
   }
@@ -302,22 +303,11 @@ describe("browser storage (OPFS)", () => {
 
   /** One transfer of `spec` into `storage`, as the receive page runs it. */
   async function staged(storage, spec, { cutAfter, options } = {}) {
-    const send = makeRecorder();
-    const recv = makeRecorder();
-    const senderDone = runSend(
-      makeEntries(spec),
-      send.emit,
-      new AbortController().signal,
-    );
-    const code = await waitFor(() => send.record.code, { label: "share code" });
-    const receiverDone = runReceive(
-      code,
-      createFolderSink(storage.incoming, storage),
-      "replace",
-      recv.emit,
-      new AbortController().signal,
+    const { send, recv, senderDone, receiverDone } = await start(spec, {
+      sink: createFolderSink(storage.incoming, storage),
+      policy: "replace",
       options,
-    );
+    });
     if (cutAfter !== undefined) {
       await waitFor(() => recv.record.progress > cutAfter, {
         label: "partial download",
@@ -527,24 +517,11 @@ describe("interrupted transfers", () => {
   async function attempt(outcome, then = async () => {}) {
     ice.outcome = outcome;
     try {
-      const send = makeRecorder();
-      const recv = makeRecorder();
       const sendAbort = new AbortController();
       const recvAbort = new AbortController();
-      const senderDone = runSend(
-        makeEntries({ "a.bin": bytes(100, 70) }),
-        send.emit,
-        sendAbort.signal,
-      );
-      const code = await waitFor(() => send.record.code, {
-        label: "share code",
-      });
-      const receiverDone = runReceive(
-        code,
-        createFolderSink(new MemoryDirectoryHandle()),
-        "skip",
-        recv.emit,
-        recvAbort.signal,
+      const { send, recv, senderDone, receiverDone } = await start(
+        { "a.bin": bytes(100, 70) },
+        { sendSignal: sendAbort.signal, recvSignal: recvAbort.signal },
       );
       await waitFor(() => peerConnections.length >= 2, {
         label: "both connections",
@@ -573,22 +550,7 @@ describe("interrupted transfers", () => {
 
   test("sender stops when the receiver's tab disappears", async () => {
     const spec = { "big.bin": bytes(4_000_000, 71) };
-    const send = makeRecorder();
-    const recv = makeRecorder();
-
-    const senderDone = runSend(
-      makeEntries(spec),
-      send.emit,
-      new AbortController().signal,
-    );
-    const code = await waitFor(() => send.record.code, { label: "share code" });
-    const receiverDone = runReceive(
-      code,
-      createFolderSink(new MemoryDirectoryHandle()),
-      "skip",
-      recv.emit,
-      new AbortController().signal,
-    );
+    const { send, senderDone, receiverDone } = await start(spec);
 
     // Wait until data is genuinely flowing, then yank the receiver.
     await waitFor(() => send.record.progress > 100_000, {
@@ -614,30 +576,12 @@ describe("interrupted transfers", () => {
   });
 
   test("sender stops even when the send buffer never fills", async () => {
-    // The other interruption test is rescued by the backpressure path: a full
-    // buffer means the sender is already awaiting the disconnect promise. On a
-    // link fast enough that bufferedAmount stays at zero, the per-chunk
-    // isDown() check is the only thing that can notice — so pin it directly.
+    // With bufferedAmount at zero, only polling the inbox between blocks can notice.
     resetBrowserEnv();
     peerConnections = installBrowserEnv({ instantDrain: true });
 
     const spec = { "big.bin": bytes(4_000_000, 141) };
-    const send = makeRecorder();
-    const recv = makeRecorder();
-
-    const senderDone = runSend(
-      makeEntries(spec),
-      send.emit,
-      new AbortController().signal,
-    );
-    const code = await waitFor(() => send.record.code, { label: "share code" });
-    const receiverDone = runReceive(
-      code,
-      createFolderSink(new MemoryDirectoryHandle()),
-      "skip",
-      recv.emit,
-      new AbortController().signal,
-    );
+    const { send, senderDone, receiverDone } = await start(spec);
 
     // Yank the peer after a fixed number of chunks rather than after a delay:
     // with no backpressure the sender outruns any timer.
@@ -666,22 +610,7 @@ describe("interrupted transfers", () => {
 
   test("receiver stops when the sender's tab disappears", async () => {
     const spec = { "big.bin": bytes(4_000_000, 81) };
-    const send = makeRecorder();
-    const recv = makeRecorder();
-
-    const senderDone = runSend(
-      makeEntries(spec),
-      send.emit,
-      new AbortController().signal,
-    );
-    const code = await waitFor(() => send.record.code, { label: "share code" });
-    const receiverDone = runReceive(
-      code,
-      createFolderSink(new MemoryDirectoryHandle()),
-      "skip",
-      recv.emit,
-      new AbortController().signal,
-    );
+    const { recv, senderDone, receiverDone } = await start(spec);
 
     await waitFor(() => recv.record.progress > 100_000, {
       label: "transfer under way",
@@ -697,23 +626,9 @@ describe("interrupted transfers", () => {
 
   test("rejecting the offer stops both sides cleanly", async () => {
     const spec = { "unwanted.bin": bytes(500, 91) };
-    const send = makeRecorder();
-    const recv = makeRecorder({ onOffered: (e) => e.reject() });
-
-    const senderDone = runSend(
-      makeEntries(spec),
-      send.emit,
-      new AbortController().signal,
-    );
-    const code = await waitFor(() => send.record.code, { label: "share code" });
-    const receiverDone = runReceive(
-      code,
-      createFolderSink(new MemoryDirectoryHandle()),
-      "skip",
-      recv.emit,
-      new AbortController().signal,
-    );
-
+    const { send, recv, senderDone, receiverDone } = await start(spec, {
+      recv: makeRecorder({ onOffered: (e) => e.reject() }),
+    });
     await Promise.all([senderDone, receiverDone]);
 
     assert.match(
@@ -727,23 +642,10 @@ describe("interrupted transfers", () => {
 
   test("cancelling a receive tells the sender", async () => {
     const spec = { "big.bin": bytes(3_000_000, 102) };
-    const send = makeRecorder();
-    const recv = makeRecorder();
     const controller = new AbortController();
-
-    const senderDone = runSend(
-      makeEntries(spec),
-      send.emit,
-      new AbortController().signal,
-    );
-    const code = await waitFor(() => send.record.code, { label: "share code" });
-    const receiverDone = runReceive(
-      code,
-      createFolderSink(new MemoryDirectoryHandle()),
-      "skip",
-      recv.emit,
-      controller.signal,
-    );
+    const { send, recv, senderDone, receiverDone } = await start(spec, {
+      recvSignal: controller.signal,
+    });
     await waitFor(() => recv.record.progress > 100_000, {
       label: "transfer under way",
     });
@@ -778,22 +680,10 @@ describe("interrupted transfers", () => {
 describe("compression", () => {
   /** Runs a transfer of `spec`, counting the bytes on the sender's data channel. */
   async function counted(spec, tamper) {
-    const send = makeRecorder();
-    const recv = makeRecorder();
-    const senderDone = runSend(
-      makeEntries(spec),
-      send.emit,
-      new AbortController().signal,
-    );
-    const code = await waitFor(() => send.record.code, { label: "share code" });
     const dir = new MemoryDirectoryHandle();
-    const receiverDone = runReceive(
-      code,
-      createFolderSink(dir),
-      "skip",
-      recv.emit,
-      new AbortController().signal,
-    );
+    const { send, recv, senderDone, receiverDone } = await start(spec, {
+      sink: createFolderSink(dir),
+    });
     const channel = await waitFor(
       () => peerConnections[0]?._channels.get("data"),
       { label: "sender data channel" },
@@ -906,7 +796,6 @@ describe("protocol errors", () => {
     ],
   ]) {
     test(`${name} from the receiver fails the sender`, async () => {
-      const send = makeRecorder();
       const recv = makeRecorder({
         onOffered: (e) => {
           // Ahead of the receiver's accept.
@@ -914,21 +803,9 @@ describe("protocol errors", () => {
           e.accept();
         },
       });
-
-      const senderDone = runSend(
-        makeEntries({ "a.bin": bytes(500, 5) }),
-        send.emit,
-        new AbortController().signal,
-      );
-      const code = await waitFor(() => send.record.code, {
-        label: "share code",
-      });
-      const receiverDone = runReceive(
-        code,
-        createFolderSink(new MemoryDirectoryHandle()),
-        "skip",
-        recv.emit,
-        new AbortController().signal,
+      const { send, senderDone, receiverDone } = await start(
+        { "a.bin": bytes(500, 5) },
+        { recv },
       );
       await Promise.all([senderDone, receiverDone]);
 
@@ -948,23 +825,9 @@ describe("resuming an interrupted download", () => {
 
     // First attempt: pull the sender away partway through.
     {
-      const send = makeRecorder();
-      const recv = makeRecorder();
-      const senderDone = runSend(
-        makeEntries(spec),
-        send.emit,
-        new AbortController().signal,
-      );
-      const code = await waitFor(() => send.record.code, {
-        label: "share code",
+      const { recv, senderDone, receiverDone } = await start(spec, {
+        sink: createFolderSink(dirHandle),
       });
-      const receiverDone = runReceive(
-        code,
-        createFolderSink(dirHandle),
-        "skip",
-        recv.emit,
-        new AbortController().signal,
-      );
 
       // Past the first block, so some of it is on disk.
       await waitFor(() => recv.record.progress > 1_300_000, {
@@ -985,32 +848,14 @@ describe("resuming an interrupted download", () => {
     );
 
     // Second attempt: only the remainder should be sent.
-    const send2 = makeRecorder();
-    const recv2 = makeRecorder();
-    const senderDone2 = runSend(
-      makeEntries(spec),
-      send2.emit,
-      new AbortController().signal,
-    );
-    const code2 = await waitFor(() => send2.record.code, {
-      label: "share code",
-    });
-    const receiverDone2 = runReceive(
-      code2,
-      createFolderSink(dirHandle),
-      "skip",
-      recv2.emit,
-      new AbortController().signal,
-    );
-    await Promise.all([senderDone2, receiverDone2]);
-
-    assert.equal(send2.record.error, null);
-    assert.equal(recv2.record.error, null);
+    const second = await transfer(spec, { dir: dirHandle });
+    assert.equal(second.send.error, null);
+    assert.equal(second.recv.error, null);
     assertFiles(dirHandle.snapshot(), expectedSnapshot(spec));
     assert.ok(
-      send2.record.progress < payload.length,
+      second.send.progress < payload.length,
       `resume should skip the ${partial.length} bytes already on disk, ` +
-        `but sent ${send2.record.progress} of ${payload.length}`,
+        `but sent ${second.send.progress} of ${payload.length}`,
     );
   });
 
@@ -1083,6 +928,7 @@ describe("resuming an interrupted download", () => {
     const spec = { "fresh.bin": bytes(50_000, 121) };
     const { dirHandle, send } = await transfer(spec);
     assert.equal(send.error, null);
+    assert.equal(send.progress, 50_000, "every byte is sent");
     assertFiles(dirHandle.snapshot(), expectedSnapshot(spec));
   });
 });
@@ -1159,5 +1005,7 @@ describe("relay behaviour", () => {
     const { recv, send } = await transfer({ "x.bin": bytes(100, 131) });
     assert.equal(send.error, null);
     assert.equal(recv.error, null);
+    await waitFor(() => recv.connectionType, { label: "connection type" });
+    assert.equal(recv.connectionType, "direct");
   });
 });

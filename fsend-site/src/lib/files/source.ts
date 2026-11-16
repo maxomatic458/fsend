@@ -14,12 +14,14 @@ export async function pickFiles(): Promise<SelectedEntry[]> {
   return pickViaInput({ multiple: true });
 }
 
-export async function pickDirectory(): Promise<SelectedEntry> {
+/// Choose a folder to send; undefined if none was chosen.
+export async function pickDirectory(): Promise<SelectedEntry | undefined> {
   if (hasFileSystemAccess()) {
     const handle = await window.showDirectoryPicker();
     return { kind: "directory", name: handle.name, handle };
   }
-  return pickViaInput({ directory: true }).then((entries) => entries[0]);
+  const [picked] = await pickViaInput({ directory: true });
+  return picked;
 }
 
 function pickViaInput(opts: {
@@ -71,11 +73,16 @@ export async function handleDrop(
   dataTransfer: DataTransfer,
 ): Promise<SelectedEntry[]> {
   const entries: SelectedEntry[] = [];
-  const items = Array.from(dataTransfer.items);
+  // Items can only be read during the drop event, so all are read before awaiting any.
+  const items = Array.from(dataTransfer.items).filter(
+    (item) => item.kind === "file",
+  );
 
   if (hasFileSystemAccess()) {
-    for (const item of items) {
-      const handle = await item.getAsFileSystemHandle!();
+    const handles = await Promise.all(
+      items.map((item) => item.getAsFileSystemHandle!()),
+    );
+    for (const handle of handles) {
       if (!handle) continue;
       entries.push(
         handle.kind === "file"
@@ -94,8 +101,7 @@ export async function handleDrop(
     return entries;
   }
 
-  for (const item of items) {
-    const entry = item.webkitGetAsEntry?.();
+  for (const entry of items.map((item) => item.webkitGetAsEntry?.())) {
     if (!entry) continue;
     if (entry.isFile) {
       const file = await fileFromEntry(entry as FileSystemFileEntry);

@@ -12,7 +12,7 @@ import { createTransferRun, stepOf } from "./createTransferRun";
 import type { TransferEvent } from "../lib/transfer/events";
 import { CODE_LENGTH, type ConflictPolicy, type TopEntry } from "../lib/proto";
 
-export type ReceiveState =
+type ReceiveState =
   | "input"
   | "connecting"
   | "handshaking"
@@ -249,7 +249,6 @@ export function createReceiveSession() {
   };
 
   return {
-    /// The folder fs mode writes into, null when only zip is possible.
     kind,
     mode,
     setMode,

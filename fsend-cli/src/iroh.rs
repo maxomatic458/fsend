@@ -8,11 +8,11 @@ use crate::transfer::*;
 use fsend_proto::pairing::ConnectionInfo;
 use fsend_proto::peer::FSEND_ALPN;
 
-/// Resolving Home relay and direct address timeout.
+/// How long to wait for a home relay and a direct address.
 const ADDR_TIMEOUT: Duration = Duration::from_secs(15);
 
-// Initial peer connection timeout.
-pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long to wait for the peer to connect.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
 const CLOSE_OK: u32 = 0;
 const CLOSE_ERR: u32 = 1;
@@ -66,8 +66,7 @@ impl IrohTransfer {
         Self::connection_info_from_addr(&endpoint.addr())
     }
 
-    /// Convert the [`EndpointAddr`] into a [`ConnectionInfo`]
-    pub fn connection_info_from_addr(addr: &EndpointAddr) -> ConnectionInfo {
+    fn connection_info_from_addr(addr: &EndpointAddr) -> ConnectionInfo {
         let (mut addrs, mut relays) = (Vec::new(), Vec::new());
         for a in &addr.addrs {
             match a {
@@ -83,7 +82,7 @@ impl IrohTransfer {
         }
     }
 
-    pub fn addr_from_connection_info(info: &ConnectionInfo) -> Result<EndpointAddr, TransferError> {
+    fn addr_from_connection_info(info: &ConnectionInfo) -> Result<EndpointAddr, TransferError> {
         let ConnectionInfo::Iroh {
             node_id,
             addrs,
@@ -143,8 +142,8 @@ impl IrohTransfer {
     }
 
     /// Connects to the sender.
-    pub async fn connect(endpoint: Endpoint, peer: ConnectionInfo) -> Result<Self, TransferError> {
-        let addr = Self::addr_from_connection_info(&peer)?;
+    pub async fn connect(endpoint: Endpoint, peer: &ConnectionInfo) -> Result<Self, TransferError> {
+        let addr = Self::addr_from_connection_info(peer)?;
         let conn = tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(addr, FSEND_ALPN))
             .await
             .map_err(|_| TransferError::PeerTimeout)??;
@@ -199,7 +198,8 @@ impl Transport for IrohTransfer {
 
     async fn close(&mut self, ok: bool) {
         let code = if ok { CLOSE_OK } else { CLOSE_ERR };
-        self.conn.close(VarInt::from(code), b"done");
+        let reason: &[u8] = if ok { b"done" } else { b"failed" };
+        self.conn.close(VarInt::from(code), reason);
         self.endpoint.close().await;
     }
 }

@@ -4,7 +4,7 @@ use std::time::Duration;
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// Largest message after decompression.
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
-/// Payloads above this are compressed.
+/// Control messages above this are compressed if that helps.
 pub const COMPRESS_ABOVE: usize = 1024;
 
 pub const MAX_ENTRIES: usize = 1_000_000;
@@ -13,21 +13,21 @@ pub const MAX_DEPTH: usize = 64;
 pub const MAX_COMPONENT_BYTES: usize = 255;
 /// A path's components joined with `/`.
 pub const MAX_PATH_BYTES: usize = 4096;
-/// The largest integer a JavaScript number holds exactly.
+/// Largest offer total: the largest integer a JavaScript number holds exactly.
 pub const MAX_TOTAL_BYTES: u64 = (1 << 53) - 1;
 
 /// What a receiver announces as `recv_window`.
 pub const RECV_WINDOW: u64 = 16 * 1024 * 1024;
 /// The smallest window a sender accepts.
 pub const MIN_RECV_WINDOW: u64 = 64 * 1024;
-/// A receiver acks once this many bytes are unacknowledged,
+/// Unacknowledged bytes that make the receiver ack.
 pub const ACK_STEP: u64 = RECV_WINDOW / 4;
-/// or once written bytes waited this long.
+/// Longest written bytes wait for an ack.
 pub const ACK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// For the peer's `hello`, and the receiver's wait for the offer after it.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
-/// Without data or acks once the offer is accepted.
+/// Longest gap without data or acks after the accept.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// For the peer to read our last message and hang up.
 pub const GOODBYE_TIMEOUT: Duration = Duration::from_secs(5);

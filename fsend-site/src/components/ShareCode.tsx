@@ -3,6 +3,7 @@ import { FiCopy, FiCheck } from "solid-icons/fi";
 import qrcode from "qrcode-generator";
 import { Button } from "./Button";
 import { codeLink } from "../lib/proto";
+import { createCopy } from "../primitives/createCopy";
 
 interface ShareCodeProps {
   code: string;
@@ -11,7 +12,7 @@ interface ShareCodeProps {
 }
 
 export function ShareCode(props: ShareCodeProps) {
-  const [copied, setCopied] = createSignal(false);
+  const { copied, copy } = createCopy(2000);
   const [showQr, setShowQr] = createSignal(false);
   const [secondsLeft, setSecondsLeft] = createSignal(0);
 
@@ -41,12 +42,6 @@ export function ShareCode(props: ShareCodeProps) {
     return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
   };
 
-  const copy = async () => {
-    await navigator.clipboard.writeText(shareUrl());
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
-
   return (
     <div class="w-full max-w-[620px] mx-auto flex flex-col gap-4 pt-5">
       <div class="flex flex-col items-center gap-2">
@@ -60,7 +55,11 @@ export function ShareCode(props: ShareCodeProps) {
         <div class="flex-1 min-w-0 flex items-center px-4 py-3 border border-line rounded-lg bg-surface-2 font-mono text-[13.5px] text-ink-muted overflow-hidden text-ellipsis whitespace-nowrap">
           {shareUrl()}
         </div>
-        <Button tone="accent" onClick={copy} class="whitespace-nowrap">
+        <Button
+          tone="accent"
+          onClick={() => copy(shareUrl())}
+          class="whitespace-nowrap"
+        >
           <span class="flex items-center gap-2">
             {copied() ? (
               <FiCheck class="w-4 h-4" />
@@ -91,7 +90,7 @@ export function ShareCode(props: ShareCodeProps) {
           class="border-b border-line pb-0.5 hover:text-ink-muted transition-colors cursor-pointer"
           aria-expanded={showQr()}
         >
-          {showQr() ? "Hide QR code" : "Show QR code"}
+          {showQr() ? "Hide QR Code" : "Show QR Code"}
         </button>
         <span
           class={`font-mono text-[12.5px] ${

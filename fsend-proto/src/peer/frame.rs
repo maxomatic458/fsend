@@ -1,7 +1,13 @@
-use std::{borrow::Cow, cell::RefCell, io::Read};
+use std::{
+    borrow::Cow,
+    cell::RefCell,
+    io::{Cursor, Read},
+};
 
 use thiserror::Error;
 use zstd::bulk::Compressor;
+
+use serde::Serialize;
 
 use super::{
     Message,
@@ -33,17 +39,15 @@ pub enum FrameError {
 }
 
 /// `u32 BE length | u8 flags | payload`, the length counting flags and payload.
-pub fn encode(message: &impl Message) -> Result<Vec<u8>, FrameError> {
+pub fn encode(message: &impl Serialize) -> Result<Vec<u8>, FrameError> {
     let json = serde_json::to_vec(message).expect("messages serialize");
     if json.len() > MAX_MESSAGE_BYTES {
         return Err(FrameError::MessageTooLarge);
     }
-    let frame = match (json.len() > COMPRESS_ABOVE)
-        .then(|| compress(&json))
-        .flatten()
-    {
-        Some(compressed) if compressed.len() < json.len() => frame(ZSTD, &[&compressed]),
-        _ => frame(0, &[&json]),
+    let frame = if json.len() > COMPRESS_ABOVE {
+        compact(&[], &json)
+    } else {
+        frame(0, &[&json])
     };
     if frame.len() - HEADER_BYTES > MAX_FRAME_BYTES {
         return Err(FrameError::TooLarge(frame.len() - HEADER_BYTES));
@@ -51,26 +55,59 @@ pub fn encode(message: &impl Message) -> Result<Vec<u8>, FrameError> {
     Ok(frame)
 }
 
-/// `payload` at zstd level 1, with a compressor kept per thread.
-pub(super) fn compress(payload: &[u8]) -> Option<Vec<u8>> {
+/// The frame of `head` and the compressed `payload` if it is smaller than the raw frame of `payload`, else that one.
+pub(super) fn compact(head: &[u8], payload: &[u8]) -> Vec<u8> {
+    // Room for the raw frame, which the compressed one must beat.
+    let raw_len = HEADER_BYTES + 1 + payload.len();
+    let mut frame = Vec::with_capacity(raw_len);
+    frame.extend_from_slice(&[0; HEADER_BYTES]);
+    frame.push(ZSTD);
+    frame.extend_from_slice(head);
+    if compress_into(payload, &mut frame) && frame.len() < raw_len {
+        let len = (frame.len() - HEADER_BYTES) as u32;
+        frame[..HEADER_BYTES].copy_from_slice(&len.to_be_bytes());
+        return frame;
+    }
+    frame.clear();
+    push_frame(&mut frame, 0, &[payload]);
+    frame
+}
+
+/// Appends `payload` compressed to `out`, within its spare room; false, leaving `out` as it was, if it does not fit.
+fn compress_into(payload: &[u8], out: &mut Vec<u8>) -> bool {
+    let start = out.len();
     COMPRESSOR.with_borrow_mut(|compressor| {
         if compressor.is_none() {
             *compressor = Compressor::new(ZSTD_LEVEL).ok();
         }
-        compressor.as_mut()?.compress(payload).ok()
+        let Some(compressor) = compressor.as_mut() else {
+            return false;
+        };
+        let mut cursor = Cursor::new(&mut *out);
+        cursor.set_position(start as u64);
+        let fits = compressor.compress_to_buffer(payload, &mut cursor).is_ok();
+        if !fits {
+            out.truncate(start);
+        }
+        fits
     })
 }
 
 /// A frame of `flags` and the `payload` parts, joined.
 pub(super) fn frame(flags: u8, payload: &[&[u8]]) -> Vec<u8> {
-    let len = payload.iter().map(|part| part.len()).sum::<usize>() + 1;
-    let mut frame = Vec::with_capacity(HEADER_BYTES + len);
-    frame.extend_from_slice(&(len as u32).to_be_bytes());
-    frame.push(flags);
-    for part in payload {
-        frame.extend_from_slice(part);
-    }
+    let len = payload.iter().map(|part| part.len()).sum::<usize>();
+    let mut frame = Vec::with_capacity(HEADER_BYTES + 1 + len);
+    push_frame(&mut frame, flags, payload);
     frame
+}
+
+fn push_frame(out: &mut Vec<u8>, flags: u8, payload: &[&[u8]]) {
+    let len = payload.iter().map(|part| part.len()).sum::<usize>() + 1;
+    out.extend_from_slice(&(len as u32).to_be_bytes());
+    out.push(flags);
+    for part in payload {
+        out.extend_from_slice(part);
+    }
 }
 
 /// Splits frames of at most `max_len` bytes off a stream split anywhere.

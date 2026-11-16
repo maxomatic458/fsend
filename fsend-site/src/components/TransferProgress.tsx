@@ -1,9 +1,9 @@
 import { For, Show, type JSX } from "solid-js";
-import { FiFolder, FiFile } from "solid-icons/fi";
 import { formatBytes, formatSpeed, formatTime } from "../lib/format";
 import { summarize } from "../lib/stats";
 import type { ProgressStore } from "../primitives/createProgressTracker";
 import type { ConnectionKind } from "../lib/transfer/events";
+import { EntryName } from "./EntryName";
 
 interface TransferProgressProps {
   progress: ProgressStore;
@@ -19,6 +19,10 @@ export function TransferProgress(props: TransferProgressProps) {
   /** Once the clock has stopped, the live speed and ETA give way to totals. */
   const finished = () => props.progress.endTimeMs > 0;
   const summary = () => summarize(props.progress);
+  const via = () =>
+    props.connection && props.connection !== "unknown"
+      ? ` - ${props.connection}`
+      : "";
 
   const pct = () =>
     props.progress.totalSizeBytes === 0
@@ -45,12 +49,7 @@ export function TransferProgress(props: TransferProgressProps) {
                 <Show when={props.progress.speedBytesPerSec > 0}>
                   <div>
                     {formatSpeed(props.progress.speedBytesPerSec)}
-                    <Show
-                      when={props.connection && props.connection !== "unknown"}
-                    >
-                      {" "}
-                      · {props.connection}
-                    </Show>
+                    {via()}
                   </div>
                 </Show>
                 <Show
@@ -67,10 +66,7 @@ export function TransferProgress(props: TransferProgressProps) {
             <Show when={summary().averageBytesPerSec > 0}>
               <div>
                 {formatSpeed(summary().averageBytesPerSec)} average
-                <Show when={props.connection && props.connection !== "unknown"}>
-                  {" "}
-                  · {props.connection}
-                </Show>
+                {via()}
               </div>
             </Show>
             <div>{formatTime(summary().elapsedSecs)} total</div>
@@ -112,14 +108,11 @@ export function TransferProgress(props: TransferProgressProps) {
             return (
               <div class="flex flex-col gap-2">
                 <div class="flex items-center justify-between gap-4">
-                  <div class="flex items-center gap-3 min-w-0">
-                    {entry.isDir ? (
-                      <FiFolder class="w-4 h-4 text-ink-faint shrink-0" />
-                    ) : (
-                      <FiFile class="w-4 h-4 text-ink-faint shrink-0" />
-                    )}
-                    <span class="text-[15px] truncate">{entry.name}</span>
-                  </div>
+                  <EntryName
+                    name={entry.name}
+                    dir={entry.isDir}
+                    size="text-[15px]"
+                  />
                   <span class="font-mono text-[12.5px] text-ink-dim shrink-0">
                     {formatBytes(entry.transferredBytes)} /{" "}
                     {formatBytes(entry.sizeBytes)}

@@ -58,7 +58,7 @@ fn an_unsendable_selection_fails_before_pairing() {
     let tmp = tempfile::tempdir().unwrap();
     assert!(matches!(
         build_offer(&[tmp.path().join("nope")]),
-        Err(TransferError::FileNotFound(p)) if p.ends_with("nope")
+        Err(TransferError::PathsNotFound(p)) if p == [tmp.path().join("nope")]
     ));
 
     // Fine on this system, but not a portable name.
@@ -270,7 +270,6 @@ fn user_errors_are_worded_for_humans() {
         TransferError::InvalidOffer(OfferError::Empty),
         TransferError::Internal("x"),
         TransferError::UnexpectedConnectionInfo,
-        TransferError::FileNotFound("x".into()),
         TransferError::Io(io::Error::other("x")),
     ] {
         assert!(error.user_error().is_none(), "{error:?}");
