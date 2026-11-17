@@ -6,3 +6,11 @@ public/fonts
 *.png
 *.svg
 bun.lock
+src/lib/proto/pkg
+src/lib/proto/generated
+.ssg
+test-results
+playwright-report
+blob-report
+.buildinfo.json
+.wrangler

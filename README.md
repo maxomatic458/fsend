@@ -5,24 +5,21 @@ fsend is a peer-to-peer file transfer webapp and CLI tool.
 > `fsend-site` (the webapp) uses WebRTC for the connection, without a fallback relay. So depending on your network/browser, it may not work. `fsend-cli` makes use of [iroh](https://github.com/n0-computer/iroh) which provides a fallback relay by default.
 
 ## Features
-- **P2P File Transfer**: Directly send files between devices. The relay server only introduces the two peers — file data never passes through it.
+- **P2P File Transfer**: Directly send files between devices. The relay server only introduces the two peers - file data never passes through it.
 - **Web and CLI Interface**: fsend is available as a web application and a command-line tool, and the two interoperate.
 - **Resumable Transfers**: If the connection is lost, the transfer can be resumed from where it left off (see the browser support table below).
-- **Files and Folders**: Send individual files or whole folders — the directory structure is preserved on the receiving side.
+- **Files and Folders**: Send individual files and whole folders.
 
 ## Browser support
 
 The webapp needs WebRTC, which every current browser has. What differs is
-where received files are written.
+where received files are written and if transfers can be resumed.
 
-| | Chromium (Chrome, Edge, Opera) | Firefox, Safari |
-| --- | --- | --- |
-| Receives into | a folder you pick, streamed to disk | memory, saved at the end |
-| Folders | kept as folders | delivered as a zip |
-| Limited by | free disk space | free RAM |
-| Resume an interrupted transfer | yes | no |
-
-The difference is the [File System Access API](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API); the webapp detects it and says which mode you are in.
+| Save mode | Browsers | Size limit | Resume |
+| ---------------- | --- | --- | --- |
+| Save to folder ([File System Access API](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API)) | Chromium (Chrome, Edge, Opera) | free disk space | yes |
+| Save to browser storage ([origin private file system](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API/Origin_private_file_system)) | Firefox, Safari | the browser's storage quota, which depends on the browser | yes |
+| Download as zip | all | free RAM | no |
 
 ## Installation
 
@@ -60,28 +57,31 @@ cargo install fsend-cli
         1. Drag and Drop or select the file(s)/folder(s) you want to send.
         2. Share the generated code, the link, or the QR code with the receiver.
     * As a receiver:
-        1. Enter the code or link provided by the sender.
-        2. Select the download location (if your browser supports it).
-        2. Accept the offer and the file(s)/folder(s) will start downloading.
+        1. Enter the code or open the link provided by the sender.
+        2. Choose how to save the files: depending on your browser, either directly to disk, in browser storage, or as a zip download.
+        3. Accept the offer and the file(s)/folder(s) will start downloading.
 
 Both tabs have to stay open during the transfer.
-The transfer speed should be within 80-90% of `min(sender_up, receiver_down)`.
 
 ### CLI
 
 #### Sending files
 ```bash
 $ fsend send <file_path>
-Session code: 123456
+Code: K7Q29XMV4P
 
 On the other peer, run:
 
-  fsend receive 123456
+  fsend receive K7Q29XMV4P
+
+or open in a browser:
+
+  https://fsend.sh/receive#K7Q29XMV4P
 ```
 
 #### Receiving files
 ```bash
-$ fsend receive 123456
+$ fsend receive K7Q29XMV4P
 ```
 
 ## Licenses

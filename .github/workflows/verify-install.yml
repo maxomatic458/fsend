@@ -65,11 +65,11 @@ jobs:
         working-directory: fsend-site/install
 
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Only the `source` scenario needs a toolchain
       - if: contains(matrix.ids, 'source')
-        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
       # unix: check install, uninstalls
       - name: Verify
@@ -82,9 +82,14 @@ jobs:
           failed=""
           for id in $IDS; do
             echo "::group::$id"
-            if bash -e "$id.install.sh" \
+            # The install script runs piped, as the site shows it; apt and cargo have their own commands.
+            case $id in
+              apt | source) install="bash -e $id.install.sh"; uninstall="bash -e $id.uninstall.sh" ;;
+              *) install="sh -s < ../public/install.sh"; uninstall="sh -s -- --uninstall < ../public/install.sh" ;;
+            esac
+            if bash -c "$install" \
               && bash -c 'set -e; command -v fsend; fsend version; fsend --help >/dev/null' \
-              && bash -e "$id.uninstall.sh" \
+              && bash -c "$uninstall" \
               && bash -c 'if command -v fsend; then exit 1; fi'
             then
               echo "$id: ok"
@@ -104,24 +109,24 @@ jobs:
       - name: Verify
         if: runner.os == 'Windows'
         shell: pwsh
-        env:
-          ID: ${{ matrix.ids }}
         run: |
           $ErrorActionPreference = 'Stop'
-          & "./$env:ID.install.ps1"
+          $script = Get-Content ../public/install.ps1 -Raw
+          # As the site shows them: piped into iex, and with -Uninstall.
+          $script | Invoke-Expression
 
-          $exe = "$env:LOCALAPPDATA\fsend\fsend-x86_64-pc-windows-msvc\fsend.exe"
+          $exe = "$env:LOCALAPPDATA\Programs\fsend\fsend.exe"
           if (-not (Test-Path $exe)) { throw "fsend.exe not found at $exe" }
-          & $exe version
-          & $exe --help | Out-Null
+          fsend version
+          fsend --help | Out-Null
 
           $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
           if ($userPath -notlike "*fsend*") { throw "install did not add fsend to the user PATH" }
 
-          & "./$env:ID.uninstall.ps1"
+          Invoke-Expression "& {$script} -Uninstall"
 
-          $root = "$env:LOCALAPPDATA\fsend"
-          if (Test-Path $root) { throw "$root still exists after uninstall" }
+          if (Test-Path $exe) { throw "$exe still exists after uninstall" }
           $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
           if ($userPath -like "*fsend*") { throw "uninstall left fsend on the user PATH" }
-          Write-Host "$env:ID : ok"
+          if (Get-Command fsend -ErrorAction SilentlyContinue) { throw "fsend is still on this session's PATH" }
+          Write-Host "windows-x86_64: ok"

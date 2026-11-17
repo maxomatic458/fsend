@@ -6,16 +6,15 @@ import { ReceivePage } from "./pages/ReceivePage";
 import { DownloadPage } from "./pages/DownloadPage";
 
 const page = (Component: () => JSX.Element) => () => (
-  <Layout>
-    <Component />
-  </Layout>
+    <Layout>
+        <Component />
+    </Layout>
 );
 
 /// Shared by the client router and the build-time prerender.
 export const routes = [
-  { path: "/", component: page(HomePage) },
-  { path: "/send", component: page(SendPage) },
-  { path: "/download", component: page(DownloadPage) },
-  { path: "/receive", component: page(ReceivePage) },
-  { path: "/receive/:code", component: page(ReceivePage) },
+    { path: "/", component: page(HomePage) },
+    { path: "/send", component: page(SendPage) },
+    { path: "/download", component: page(DownloadPage) },
+    { path: "/receive", component: page(ReceivePage) },
 ];

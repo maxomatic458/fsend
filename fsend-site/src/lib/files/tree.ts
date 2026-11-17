@@ -1,176 +1,80 @@
-import type {
-  FilesAvailable,
-  FilesToSkip,
-  FileSendRecvTree,
-  SelectedEntry,
-} from "../types";
+import { fingerprint, fingerprintRanges, type Entry, type Fingerprint } from "../proto";
+import type { SelectedEntry } from "../types";
 
-export async function buildFileTree(
-  entries: SelectedEntry[],
-): Promise<FilesAvailable[]> {
-  const result: FilesAvailable[] = [];
-  for (const entry of entries) {
-    if (entry.kind === "file") {
-      if (entry.handle) {
-        const file = await (entry.handle as FileSystemFileHandle).getFile();
-        result.push({ type: "File", name: entry.name, size: file.size });
-      } else if (entry.file) {
-        result.push({ type: "File", name: entry.name, size: entry.file.size });
-      }
-    } else {
-      if (entry.handle) {
-        result.push(
-          await dirTreeFromHandle(
-            entry.handle as FileSystemDirectoryHandle,
-            entry.name,
-          ),
-        );
-      } else if (entry.files) {
-        result.push(dirTreeFromFileList(entry.name, entry.files));
-      }
-    }
-  }
-  return result;
+/** What a file entry reads from; only its size and slices are used. */
+export type Source = Pick<Blob, "size" | "slice">;
+
+/** The offer for a selection, parents first, and the source of each file by id. */
+export interface Outgoing {
+    entries: Entry[];
+    files: (Source | null)[];
 }
 
-async function dirTreeFromHandle(
-  handle: FileSystemDirectoryHandle,
-  name: string,
-): Promise<FilesAvailable> {
-  const children: FilesAvailable[] = [];
-  for await (const [, childHandle] of handle.entries()) {
-    if (childHandle.kind === "file") {
-      const file = await (childHandle as FileSystemFileHandle).getFile();
-      children.push({ type: "File", name: childHandle.name, size: file.size });
-    } else {
-      children.push(
-        await dirTreeFromHandle(
-          childHandle as FileSystemDirectoryHandle,
-          childHandle.name,
-        ),
-      );
-    }
-  }
-  return { type: "Dir", name, files: children };
-}
-
-function dirTreeFromFileList(
-  name: string,
-  files: { relativePath: string; file: File }[],
-): FilesAvailable {
-  const dirs: Map<string, FilesAvailable[]> = new Map();
-
-  for (const { relativePath, file } of files) {
-    const parts = relativePath.split("/");
-    let currentChildren = dirs.get("") ?? [];
-    if (!dirs.has("")) dirs.set("", currentChildren);
-
-    for (let i = 0; i < parts.length - 1; i++) {
-      const dirPath = parts.slice(0, i + 1).join("/");
-      if (!dirs.has(dirPath)) {
-        dirs.set(dirPath, []);
-        const parentPath = i === 0 ? "" : parts.slice(0, i).join("/");
-        const parentChildren = dirs.get(parentPath)!;
-        const dirEntry: FilesAvailable = {
-          type: "Dir",
-          name: parts[i],
-          files: dirs.get(dirPath)!,
-        };
-        parentChildren.push(dirEntry);
-      }
-    }
-
-    const parentPath = parts.length > 1 ? parts.slice(0, -1).join("/") : "";
-    const parentChildren = dirs.get(parentPath)!;
-    parentChildren.push({ type: "File", name: file.name, size: file.size });
-  }
-
-  return { type: "Dir", name, files: dirs.get("") ?? [] };
-}
-
-export function totalSizeBytes(files: FilesAvailable[]): number {
-  let total = 0;
-  for (const f of files) {
-    if (f.type === "File") total += f.size;
-    else total += totalSizeBytes(f.files);
-  }
-  return total;
-}
-
-export function entrySizeBytes(entry: FilesAvailable): number {
-  if (entry.type === "File") return entry.size;
-  return totalSizeBytes(entry.files);
-}
-
-export function flattenTree(
-  trees: FileSendRecvTree[],
-  prefix = "",
-): Array<{ path: string; skipBytes: number; sizeBytes: number }> {
-  const result: Array<{ path: string; skipBytes: number; sizeBytes: number }> =
-    [];
-  for (const tree of trees) {
-    const path = prefix ? `${prefix}/${tree.name}` : tree.name;
-    if (tree.type === "File") {
-      result.push({ path, skipBytes: tree.skip, sizeBytes: tree.size });
-    } else {
-      result.push(...flattenTree(tree.files, path));
-    }
-  }
-  return result;
-}
-
-export function applySkip(
-  available: FilesAvailable,
-  skip: FilesToSkip | null,
-): FileSendRecvTree | null {
-  if (!skip) return toSendRecvTree(available);
-
-  if (available.type === "File" && skip.type === "File") {
-    if (available.size <= skip.skip) return null; // fully transferred
-    return {
-      type: "File",
-      name: available.name,
-      skip: skip.skip,
-      size: available.size,
+export async function buildOffer(selected: SelectedEntry[]): Promise<Outgoing> {
+    const out: Outgoing = { entries: [], files: [] };
+    const addFile = (path: string[], file: Source) => {
+        out.entries.push({ kind: "file", path, size: file.size });
+        out.files.push(file);
     };
-  }
-
-  if (available.type === "Dir" && skip.type === "Dir") {
-    const remaining: FileSendRecvTree[] = [];
-    for (const child of available.files) {
-      const childSkip = skip.files.find((s) => s.name === child.name) ?? null;
-      const result = applySkip(child, childSkip);
-      if (result) remaining.push(result);
-    }
-    if (remaining.length === 0) return null;
-    return { type: "Dir", name: available.name, files: remaining };
-  }
-
-  return toSendRecvTree(available);
-}
-
-export function treeSizeBytes(tree: FileSendRecvTree): number {
-  if (tree.type === "File") return tree.size;
-  return tree.files.reduce((sum, f) => sum + treeSizeBytes(f), 0);
-}
-
-export function treeSkipBytes(tree: FileSendRecvTree): number {
-  if (tree.type === "File") return tree.skip;
-  return tree.files.reduce((sum, f) => sum + treeSkipBytes(f), 0);
-}
-
-export function toSendRecvTree(available: FilesAvailable): FileSendRecvTree {
-  if (available.type === "File") {
-    return {
-      type: "File",
-      name: available.name,
-      skip: 0,
-      size: available.size,
+    const addDir = (path: string[]) => {
+        out.entries.push({ kind: "dir", path });
+        out.files.push(null);
     };
-  }
-  return {
-    type: "Dir",
-    name: available.name,
-    files: available.files.map(toSendRecvTree),
-  };
+
+    const walk = async (dir: FileSystemDirectoryHandle, path: string[]) => {
+        addDir(path);
+        for await (const [, child] of dir.entries()) {
+            const childPath = [...path, child.name];
+            if (child.kind === "file") {
+                addFile(childPath, await (child as FileSystemFileHandle).getFile());
+            } else {
+                await walk(child as FileSystemDirectoryHandle, childPath);
+            }
+        }
+    };
+
+    for (const entry of selected) {
+        if (entry.kind === "file") {
+            const file = "file" in entry ? entry.file : await entry.handle.getFile();
+            addFile([entry.name], file);
+        } else if ("handle" in entry) {
+            await walk(entry.handle, [entry.name]);
+        } else {
+            addDir([entry.name]);
+            const dirs = new Set<string>();
+            for (const { relativePath, file } of entry.files) {
+                const parts = relativePath.split("/");
+                for (let depth = 1; depth < parts.length; depth++) {
+                    const dir = parts.slice(0, depth);
+                    if (dirs.has(dir.join("/"))) continue;
+                    dirs.add(dir.join("/"));
+                    addDir([entry.name, ...dir]);
+                }
+                addFile([entry.name, ...parts], file);
+            }
+        }
+    }
+    return out;
+}
+
+/** Zero for a directory. */
+export const entrySize = (entry: Entry): number => (entry.kind === "file" ? entry.size : 0);
+
+export const offerSizeBytes = (entries: Entry[]): number =>
+    entries.reduce((total, entry) => total + entrySize(entry), 0);
+
+/** The fingerprint of the first `len` bytes of `source`. */
+export async function fingerprintOf(source: Source, len: number): Promise<Fingerprint> {
+    const ranges = fingerprintRanges(len);
+    const sampled = new Uint8Array(ranges.reduce((n, [start, end]) => n + end - start, 0));
+    let offset = 0;
+    for (const [start, end] of ranges) {
+        const part = new Uint8Array(await source.slice(start, end).arrayBuffer());
+        if (part.length !== end - start) {
+            throw new Error("A file is shorter than expected");
+        }
+        sampled.set(part, offset);
+        offset += part.length;
+    }
+    return fingerprint(sampled);
 }

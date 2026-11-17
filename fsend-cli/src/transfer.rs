@@ -1,470 +1,114 @@
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::fmt::Debug;
+use std::io;
+use std::marker::PhantomData;
+use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use async_compression::tokio::write::GzipEncoder;
 use async_trait::async_trait;
-use bytes::Bytes;
 use colored::Colorize;
-use futures_util::{SinkExt, StreamExt};
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use fsend_proto::peer::block::{self, BlockDecoder};
+use fsend_proto::peer::frame::{self, FrameDecoder};
+use fsend_proto::peer::limits::{
+    ACK_INTERVAL, ACK_STEP, GOODBYE_TIMEOUT, HELLO_TIMEOUT, IDLE_TIMEOUT, MAX_BLOCK_BYTES,
+    MAX_DEPTH, MIN_RECV_WINDOW, RECV_WINDOW,
+};
+use fsend_proto::peer::offer::{self, EntryError, OfferError};
+use fsend_proto::peer::progress::{self, Progress, TopEntry};
+use fsend_proto::peer::resume::{self, Conflict, ConflictPolicy, Fingerprint, Local};
+use fsend_proto::peer::{
+    self, AcceptedFile, Cancel, CheckedFile, Entry, ErrorCode, ErrorReport, Hello, Message,
+    ReceiverMessage, SenderMessage,
+};
+use futures_util::StreamExt;
+use futures_util::stream::FuturesOrdered;
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tokio::fs::File;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
+use tokio::time::timeout;
 
-/// Read/write chunk on the data stream.
-pub const BUF_SIZE: usize = 64 * 1024;
-pub const PROTO_VERSION: &str = "3";
-pub const FSEND_ALPN: &[u8] = b"fsend";
-pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
-/// How long a incompatible peer gets to read our last packet.
-const GOODBYE_TIMEOUT: Duration = Duration::from_secs(5);
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Chunk size for stream reads and writes.
+pub(crate) const BUF_SIZE: usize = 64 * 1024;
+/// Data blocks compressed at once.
+const COMPRESS_WORKERS: usize = 4;
 
-#[derive(Debug, PartialEq, Clone, Hash, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum FileSendRecvTree {
-    File {
-        name: String,
-        skip: u64,
-        size: u64,
-    },
-    Dir {
-        name: String,
-        files: Vec<FileSendRecvTree>,
-    },
-}
-
-impl FileSendRecvTree {
-    pub fn name(&self) -> &str {
-        match self {
-            Self::File { name, .. } | Self::Dir { name, .. } => name,
-        }
-    }
-
-    pub fn size(&self) -> u64 {
-        match self {
-            Self::File { size, .. } => *size,
-            Self::Dir { files, .. } => files.iter().map(|f| f.size()).sum(),
-        }
-    }
-
-    pub fn skip(&self) -> u64 {
-        match self {
-            Self::File { skip, .. } => *skip,
-            Self::Dir { files, .. } => files.iter().map(|f| f.skip()).sum(),
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Clone, Hash, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum FilesAvailable {
-    File {
-        name: String,
-        size: u64,
-    },
-    Dir {
-        name: String,
-        files: Vec<FilesAvailable>,
-    },
-}
-
-impl FilesAvailable {
-    pub fn name(&self) -> &str {
-        match self {
-            Self::File { name, .. } | Self::Dir { name, .. } => name,
-        }
-    }
-
-    pub fn size(&self) -> u64 {
-        match self {
-            Self::File { size, .. } => *size,
-            Self::Dir { files, .. } => files.iter().map(|f| f.size()).sum(),
-        }
-    }
-
-    pub fn to_send_recv_tree(&self) -> FileSendRecvTree {
-        match self {
-            Self::File { name, size } => FileSendRecvTree::File {
-                name: name.clone(),
-                skip: 0,
-                size: *size,
-            },
-            Self::Dir { name, files } => FileSendRecvTree::Dir {
-                name: name.clone(),
-                files: files.iter().map(|f| f.to_send_recv_tree()).collect(),
-            },
-        }
-    }
-
-    pub fn remove_skipped(&self, to_skip: &FilesToSkip) -> Option<FileSendRecvTree> {
-        match (self, to_skip) {
-            (Self::File { name, size }, FilesToSkip::File { name: sn, skip }) => {
-                if name == sn && size <= skip {
-                    None
-                } else {
-                    Some(FileSendRecvTree::File {
-                        name: name.clone(),
-                        skip: if name == sn { *skip } else { 0 },
-                        size: *size,
-                    })
-                }
-            }
-            (
-                Self::Dir { name, files },
-                FilesToSkip::Dir {
-                    name: sn,
-                    files: sf,
-                },
-            ) => {
-                if name != sn {
-                    return Some(self.to_send_recv_tree());
-                }
-                let mut remaining = Vec::new();
-                for file in files {
-                    if let Some(skip_file) = sf.iter().find(|s| s.name() == file.name()) {
-                        if let Some(r) = file.remove_skipped(skip_file) {
-                            remaining.push(r);
-                        }
-                    } else {
-                        remaining.push(file.to_send_recv_tree());
-                    }
-                }
-                if remaining.is_empty() {
-                    None
-                } else {
-                    Some(FileSendRecvTree::Dir {
-                        name: name.clone(),
-                        files: remaining,
-                    })
-                }
-            }
-            // A file offered where a directory exists locally (e.g file.txt offered, but file.txt/ exists, or vice versa)
-            // cannot be resumed; transfer it in full.
-            _ => Some(self.to_send_recv_tree()),
-        }
-    }
-
-    pub fn get_skippable(&self, local: &FilesAvailable) -> Option<FilesToSkip> {
-        match (self, local) {
-            (Self::File { name, size }, Self::File { name: ln, size: ls }) => {
-                if name == ln {
-                    Some(FilesToSkip::File {
-                        name: name.clone(),
-                        skip: if ls > size { 0 } else { *ls },
-                    })
-                } else {
-                    None
-                }
-            }
-            (
-                Self::Dir { name, files },
-                Self::Dir {
-                    name: ln,
-                    files: lf,
-                },
-            ) => {
-                if name != ln {
-                    return None;
-                }
-                let mut skippable = Vec::new();
-                for file in files {
-                    if let Some(lm) = lf.iter().find(|l| l.name() == file.name())
-                        && let Some(s) = file.get_skippable(lm)
-                    {
-                        skippable.push(s);
-                    }
-                }
-                if skippable.is_empty() {
-                    None
-                } else {
-                    Some(FilesToSkip::Dir {
-                        name: name.clone(),
-                        files: skippable,
-                    })
-                }
-            }
-            _ => None,
-        }
-    }
-}
-
-/// The name a path is announced under.
-fn entry_name(path: &Path) -> std::io::Result<String> {
-    let name = match path.file_name() {
-        Some(name) => name.to_owned(),
-        None => std::fs::canonicalize(path)?
-            .file_name()
-            .map(|n| n.to_owned())
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("cannot send {}: it has no name", path.display()),
-                )
-            })?,
-    };
-    Ok(name.to_string_lossy().into_owned())
-}
-
-pub fn get_files_available(path: &Path) -> std::io::Result<FilesAvailable> {
-    let name = entry_name(path)?;
-    if path.is_file() {
-        Ok(FilesAvailable::File {
-            name,
-            size: path.metadata()?.len(),
-        })
-    } else {
-        let mut files = Vec::new();
-        for entry in std::fs::read_dir(path)? {
-            files.push(get_files_available(&entry?.path())?);
-        }
-        Ok(FilesAvailable::Dir { name, files })
-    }
-}
-
-#[derive(Debug, PartialEq, Clone)]
-pub enum TransferEntry {
-    Dir { path: PathBuf },
-    File { path: PathBuf, skip: u64, size: u64 },
-}
-
-/// Flattens the trees into the order of the wire bytes.
-pub fn flatten_trees(trees: &[FileSendRecvTree], root: &Path) -> Vec<TransferEntry> {
-    fn walk(tree: &FileSendRecvTree, parent: &Path, out: &mut Vec<TransferEntry>) {
-        match tree {
-            FileSendRecvTree::File { name, skip, size } => out.push(TransferEntry::File {
-                path: parent.join(name),
-                skip: *skip,
-                size: *size,
-            }),
-            FileSendRecvTree::Dir { name, files } => {
-                let dir = parent.join(name);
-                out.push(TransferEntry::Dir { path: dir.clone() });
-                for file in files {
-                    walk(file, &dir, out);
-                }
-            }
-        }
-    }
-
-    let mut out = Vec::new();
-    for tree in trees {
-        match tree {
-            FileSendRecvTree::File { skip, size, .. } => out.push(TransferEntry::File {
-                path: root.to_path_buf(),
-                skip: *skip,
-                size: *size,
-            }),
-            FileSendRecvTree::Dir { files, .. } => {
-                out.push(TransferEntry::Dir {
-                    path: root.to_path_buf(),
-                });
-                for file in files {
-                    walk(file, root, &mut out);
-                }
-            }
-        }
-    }
-    out
-}
-
-/// What the receiver keeps of the offer, after skip is applied.
-pub struct TransferPlan {
-    pub to_transfer: Vec<Option<FileSendRecvTree>>,
-    /// `(name, bytes present locally, total bytes)` per offered entry.
-    pub progress: Vec<(String, u64, u64)>,
-}
-
-pub fn plan_transfer(offered: &[FilesAvailable], to_skip: &[Option<FilesToSkip>]) -> TransferPlan {
-    let to_transfer = offered
-        .iter()
-        .zip(to_skip)
-        .map(|(file, skip)| match skip {
-            Some(s) => file.remove_skipped(s),
-            None => Some(file.to_send_recv_tree()),
-        })
-        .collect();
-
-    let progress = offered
-        .iter()
-        .zip(to_skip)
-        .map(|(file, skip)| {
-            (
-                file.name().to_string(),
-                skip.as_ref().map(|s| s.skip()).unwrap_or(0),
-                file.size(),
-            )
-        })
-        .collect();
-
-    TransferPlan {
-        to_transfer,
-        progress,
-    }
-}
-
-/// What the receiver want's to skip based on whats locally available.
-pub fn skip_list(
-    offered: &[FilesAvailable],
-    output_dir: &Path,
-    resume: bool,
-) -> Vec<Option<FilesToSkip>> {
-    if !resume {
-        return vec![None; offered.len()];
-    }
-    offered
-        .iter()
-        .map(|offer| {
-            get_files_available(&output_dir.join(offer.name()))
-                .ok()
-                .and_then(|local| offer.get_skippable(&local))
-        })
-        .collect()
-}
-
-/// Opens a file for receiving.
-pub async fn open_for_receive(path: &Path, skip: u64) -> std::io::Result<tokio::fs::File> {
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .await?;
-    file.seek(std::io::SeekFrom::Start(skip)).await?;
-    Ok(file)
-}
-
-/// Finishes a received file.
-pub async fn finish_received_file(file: &mut tokio::fs::File, size: u64) -> std::io::Result<()> {
-    file.set_len(size).await?;
-    file.sync_all().await?;
-    file.shutdown().await
-}
-
-#[derive(Debug, PartialEq, Clone, Hash, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum FilesToSkip {
-    File {
-        name: String,
-        skip: u64,
-    },
-    Dir {
-        name: String,
-        files: Vec<FilesToSkip>,
-    },
-}
-
-impl FilesToSkip {
-    pub fn name(&self) -> &str {
-        match self {
-            Self::File { name, .. } | Self::Dir { name, .. } => name,
-        }
-    }
-
-    pub fn skip(&self) -> u64 {
-        match self {
-            Self::File { skip, .. } => *skip,
-            Self::Dir { files, .. } => files.iter().map(|f| f.skip()).sum(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum SenderToReceiver {
-    ConnRequest { version: String },
-    FileInfo { files: Vec<FilesAvailable> },
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum ReceiverToSender {
-    WrongVersion { expected: String },
-    Ok,
-    RejectFiles,
-    AcceptFilesSkip { files: Vec<Option<FilesToSkip>> },
-}
-
-pub async fn compress_gzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut encoder = GzipEncoder::new(&mut out);
-    encoder.write_all(data).await?;
-    encoder.shutdown().await?;
-    Ok(out)
-}
-
-pub async fn decompress_gzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut decoder = async_compression::tokio::write::GzipDecoder::new(&mut out);
-    decoder.write_all(data).await?;
-    decoder.shutdown().await?;
-    Ok(out)
-}
+const SENDER_HELLO: &str = "the sender did not say hello in time";
+const RECEIVER_HELLO: &str = "the receiver did not say hello in time";
+const SENDER_IDLE: &str = "the sender stopped sending";
+const RECEIVER_IDLE: &str = "the receiver stopped responding";
 
 #[derive(Debug, Error)]
 pub enum TransferError {
     #[error("io: {0}")]
-    Io(std::io::Error),
-    #[error("connection: {0}")]
-    Connection(#[from] iroh::endpoint::ConnectionError),
-    #[error("wrong version: expected {0}, got {1}")]
-    WrongVersion(String, String),
+    Io(io::Error),
+    #[error("connection to the peer lost: {0}")]
+    Disconnected(String),
+    #[error("{} of the given paths do not exist", .0.len())]
+    PathsNotFound(Vec<PathBuf>),
+    /// The selection breaks the offer rules.
+    #[error("cannot send these files: {0}")]
+    Unsendable(OfferError),
+    #[error(
+        "no common protocol version: the peer speaks {} to {}, this client {} to {}",
+        .min_version, .version, peer::MIN_VERSION, peer::VERSION
+    )]
+    Version { version: u32, min_version: u32 },
+    /// We declined the offer.
     #[error("transfer declined")]
     Declined,
     #[error("the peer declined the files")]
-    PeerDeclined,
-    #[error("{} of the given paths do not exist", .0.len())]
-    PathsNotFound(Vec<PathBuf>),
-    #[error("unexpected packet")]
-    UnexpectedPacket,
-    #[error("file does not exist: {0}")]
-    FileNotFound(PathBuf),
-    #[error("connection to the peer lost: {0}")]
-    Disconnected(String),
+    PeerDeclined(Option<String>),
+    #[error("the peer cancelled the transfer")]
+    PeerCancelled(Option<String>),
+    #[error("the peer failed ({code:?}): {message}")]
+    Peer { code: ErrorCode, message: String },
+    #[error("the peer sent an invalid offer: {0}")]
+    InvalidOffer(OfferError),
+    /// Traffic from the peer that the protocol does not allow.
+    #[error("protocol: {0}")]
+    Protocol(String),
+    #[error("timed out: {0}")]
+    Timeout(&'static str),
     #[error("bind: {0}")]
     Bind(#[from] iroh::endpoint::BindError),
     #[error("connect: {0}")]
     Connect(#[from] iroh::endpoint::ConnectError),
-    #[error("accept: {0}")]
-    Accept(#[from] iroh::endpoint::ConnectingError),
     #[error("node id: {0}")]
     NodeId(#[from] iroh::KeyParsingError),
     #[error("the peer did not connect in time")]
     PeerTimeout,
-    #[error("the peer did not complete the handshake in time")]
-    HandshakeTimeout,
     #[error("the endpoint closed while waiting for the peer")]
     EndpointClosed,
-    #[error("the relay handed over connection info for another transport")]
+    #[error("the peer sent connection info for another transport")]
     UnexpectedConnectionInfo,
     #[error("webrtc: {0}")]
     WebRtc(#[from] webrtc::error::Error),
-    #[error("json: {0}")]
-    Json(#[from] serde_json::Error),
-    /// Traffic from the peer that the framing does not allow.
-    #[error("protocol: {0}")]
-    Protocol(String),
     #[error("internal: {0}")]
     Internal(&'static str),
 }
 
 impl TransferError {
-    /// Generate a user-facing error messages for user-facing "errors"
+    /// A message for the errors a user can act on.
     pub fn user_error(&self) -> Option<String> {
-        match self {
-            Self::Declined => Some("Transfer declined.".to_owned()),
-            Self::PeerDeclined => Some(format!("{} the peer declined the files", "error:".red())),
-            Self::Disconnected(reason) => Some(format!(
-                "{} the connection to the peer was lost ({reason}).\n\
-                 Start a new session to resume the transfer where it stopped.",
-                "error:".red()
-            )),
-            Self::WrongVersion(expected, got) => Some(format!(
-                "{} protocol version mismatch: this client speaks {got}, the peer expects {expected}.\n\
-                 Update fsend on both sides.",
-                "error:".red()
-            )),
+        let error = "error:".red();
+        let update = "Update fsend on both sides.";
+        Some(match self {
+            Self::Declined => "Transfer declined.".to_owned(),
+            Self::PeerDeclined(_)
+            | Self::PeerCancelled(_)
+            | Self::Unsendable(_)
+            | Self::Timeout(_) => {
+                format!("{error} {self}")
+            }
+            Self::Disconnected(reason) => format!(
+                "{error} the connection to the peer was lost ({reason}).\n\
+                 Start a new session to resume the transfer where it stopped."
+            ),
+            Self::Version { .. } => format!("{error} {self}.\n{update}"),
+            Self::Peer {
+                code: ErrorCode::Version,
+                message,
+            } => format!("{error} the peer speaks another protocol version ({message}).\n{update}"),
+            Self::Peer { message, .. } => format!("{error} the peer failed: {message}"),
             Self::PathsNotFound(paths) => {
                 let noun = if paths.len() == 1 {
                     "path does"
@@ -475,46 +119,57 @@ impl TransferError {
                     .iter()
                     .map(|p| format!("\n - {}", p.display().to_string().blue()))
                     .collect();
-
-                Some(format!(
-                    "{} {} {} not exist:{}",
-                    "error:".red(),
-                    paths.len(),
-                    noun,
-                    list
-                ))
+                format!("{error} {} {noun} not exist:{list}", paths.len())
             }
-            Self::HandshakeTimeout => Some(format!(
-                "{} the peer did not answer the handshake. It may run an incompatible version of fsend; update both sides.",
-                "error:".red()
-            )),
-            Self::PeerTimeout => Some(format!(
-                "{} the peer did not connect in time. Check that both sides are online and try again.",
-                "error:".red()
-            )),
+            Self::PeerTimeout => format!(
+                "{error} the peer did not connect in time. Check that both sides are online and try again."
+            ),
             Self::Io(_)
-            | Self::Connection(_)
-            | Self::UnexpectedPacket
-            | Self::FileNotFound(_)
+            | Self::InvalidOffer(_)
+            | Self::Protocol(_)
             | Self::Bind(_)
             | Self::Connect(_)
-            | Self::Accept(_)
             | Self::NodeId(_)
             | Self::EndpointClosed
             | Self::UnexpectedConnectionInfo
             | Self::WebRtc(_)
-            | Self::Json(_)
-            | Self::Protocol(_)
-            | Self::Internal(_) => None,
-        }
+            | Self::Internal(_) => return None,
+        })
+    }
+
+    /// The `error` that tells the peer about a failure on this side.
+    fn report(&self) -> Option<ErrorReport> {
+        let (code, message) = match self {
+            Self::Io(e) => (ErrorCode::Io, e.to_string()),
+            Self::Version { .. } => (
+                ErrorCode::Version,
+                format!(
+                    "versions {} to {} are supported",
+                    peer::MIN_VERSION,
+                    peer::VERSION
+                ),
+            ),
+            Self::InvalidOffer(e) => (ErrorCode::InvalidOffer, e.to_string()),
+            Self::Protocol(message) => (ErrorCode::Protocol, message.clone()),
+            Self::Timeout(what) => (ErrorCode::Timeout, what.to_string()),
+            Self::Internal(what) => (ErrorCode::Internal, what.to_string()),
+            _ => return None,
+        };
+        Some(ErrorReport { code, message })
     }
 }
 
-/// A stream that reports the peer as gone is a lost connection, not an I/O
-/// fault; the transports mark those with `ConnectionAborted`/`NotConnected`.
-impl From<std::io::Error> for TransferError {
-    fn from(e: std::io::Error) -> Self {
-        use std::io::ErrorKind::*;
+/// A QUIC connection that fails has lost the peer.
+impl From<iroh::endpoint::ConnectionError> for TransferError {
+    fn from(e: iroh::endpoint::ConnectionError) -> Self {
+        Self::Disconnected(e.to_string())
+    }
+}
+
+/// The transports report a peer that is gone as `ConnectionAborted`, `ConnectionReset` or `NotConnected`.
+impl From<io::Error> for TransferError {
+    fn from(e: io::Error) -> Self {
+        use io::ErrorKind::*;
         match e.kind() {
             ConnectionAborted | ConnectionReset | NotConnected => Self::Disconnected(e.to_string()),
             _ => Self::Io(e),
@@ -522,18 +177,44 @@ impl From<std::io::Error> for TransferError {
     }
 }
 
-pub struct SendArgs {
-    pub files: Vec<PathBuf>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Event<'a> {
+    /// Sender: the offer is out, the receiver is deciding.
+    Offered,
+    /// The offer was accepted; `present` counts the bytes of each entry already there.
+    Started {
+        entries: &'a [TopEntry],
+        present: &'a [u64],
+    },
+    /// `bytes` more of the entry at `entry` moved.
+    Progress { entry: usize, bytes: u64 },
 }
 
-pub struct ReceiveArgs {
-    pub resume: bool,
+pub type EventCb<'a> = &'a mut (dyn FnMut(Event<'_>) + Send);
+/// The directory to receive into, or `None` to decline.
+pub type AcceptCb<'a> = &'a mut (dyn FnMut(&[TopEntry]) -> Option<PathBuf> + Send);
+/// What to do with the entries of the offer that conflict with local ones.
+pub type ConflictCb<'a> = &'a mut (dyn FnMut(&[Entry], &[Conflict]) -> ConflictPolicy + Send);
+
+/// How the peers are connected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionKind {
+    Direct,
+    Relay,
+    WebRtc,
+    Unknown,
 }
 
-pub type ProgressCb<'a> = &'a mut (dyn FnMut(&[(String, u64, u64)]) + Send);
-pub type WaitingCb<'a> = &'a mut (dyn FnMut() + Send);
-pub type DataCb<'a> = &'a mut (dyn FnMut(u64) + Send);
-pub type AcceptFilesCb<'a> = &'a mut (dyn FnMut(&[FilesAvailable]) -> Option<PathBuf> + Send);
+impl std::fmt::Display for ConnectionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Direct => "Direct",
+            Self::Relay => "Relay",
+            Self::WebRtc => "WebRTC",
+            Self::Unknown => "Unknown",
+        })
+    }
+}
 
 /// A bidirectional bytestream.
 pub trait ByteStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -541,8 +222,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + ?Sized> ByteStream for T {}
 
 #[async_trait]
 pub trait Transport: Send {
-    fn connection_type_name(&self) -> String;
-    /// The control stream. Packets are length-prefixed frames of gzipped JSON.
+    fn connection_kind(&self) -> ConnectionKind;
+    /// The control stream, carrying peer protocol frames.
     async fn control(&mut self) -> Result<Box<dyn ByteStream>, TransferError>;
     /// The data stream, opened once the offer has been accepted.
     async fn data(&mut self) -> Result<Box<dyn ByteStream>, TransferError>;
@@ -551,293 +232,835 @@ pub trait Transport: Send {
     async fn close(&mut self, ok: bool);
 }
 
-pub(crate) type Control = Framed<Box<dyn ByteStream>, LengthDelimitedCodec>;
-
-pub(crate) fn frame(stream: Box<dyn ByteStream>) -> Control {
-    Framed::new(
-        stream,
-        LengthDelimitedCodec::builder()
-            .max_frame_length(MAX_FRAME_BYTES)
-            .new_codec(),
-    )
+/// The offer for the paths to send, and where each entry comes from.
+#[derive(Debug, Default)]
+pub struct Outgoing {
+    pub entries: Vec<Entry>,
+    sources: Vec<PathBuf>,
+    frame: Vec<u8>,
 }
 
-pub(crate) async fn send_packet<P: Serialize + std::fmt::Debug>(
-    control: &mut Control,
-    packet: &P,
+/// Walks `paths` into a valid offer.
+pub fn build_offer(paths: &[PathBuf]) -> Result<Outgoing, TransferError> {
+    let missing: Vec<_> = paths.iter().filter(|p| !p.exists()).cloned().collect();
+    if !missing.is_empty() {
+        return Err(TransferError::PathsNotFound(missing));
+    }
+    let mut outgoing = Outgoing::default();
+    for path in paths {
+        outgoing.add(path, vec![entry_name(path)?])?;
+    }
+    outgoing.frame = offer::encode(&outgoing.entries).map_err(TransferError::Unsendable)?;
+    Ok(outgoing)
+}
+
+impl Outgoing {
+    /// Adds `source` under `path`, parents before children.
+    fn add(&mut self, source: &Path, path: Vec<String>) -> Result<(), TransferError> {
+        // Symlinked directories can loop.
+        if path.len() > MAX_DEPTH {
+            return Err(TransferError::Unsendable(OfferError::Entry {
+                id: self.entries.len(),
+                reason: EntryError::TooDeep,
+            }));
+        }
+        let metadata = std::fs::metadata(source)?;
+        self.sources.push(source.to_path_buf());
+        if metadata.is_file() {
+            self.entries.push(Entry::File {
+                path,
+                size: metadata.len(),
+            });
+            return Ok(());
+        }
+        self.entries.push(Entry::Dir { path: path.clone() });
+        let mut children = std::fs::read_dir(source)?.collect::<io::Result<Vec<_>>>()?;
+        children.sort_by_key(|child| child.file_name());
+        for child in children {
+            let mut child_path = path.clone();
+            child_path.push(child.file_name().to_string_lossy().into_owned());
+            self.add(&child.path(), child_path)?;
+        }
+        Ok(())
+    }
+}
+
+/// The name a path is announced under.
+fn entry_name(path: &Path) -> io::Result<String> {
+    let name = match path.file_name() {
+        Some(name) => name.to_owned(),
+        None => std::fs::canonicalize(path)?
+            .file_name()
+            .map(|n| n.to_owned())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("cannot send {}: it has no name", path.display()),
+                )
+            })?,
+    };
+    Ok(name.to_string_lossy().into_owned())
+}
+
+/// Where an offered path lands under `root`; each name must be a plain file name here.
+pub(crate) fn local_path(root: &Path, path: &[String]) -> io::Result<PathBuf> {
+    let mut out = root.to_path_buf();
+    for name in path {
+        let mut components = Path::new(name).components();
+        match (components.next(), components.next()) {
+            (Some(Component::Normal(_)), None) => out.push(name),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{name:?} is not a valid file name on this system"),
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Opens a file for receiving; at offset 0 whatever was there is dropped.
+pub(crate) async fn open_for_receive(path: &Path, offset: u64) -> io::Result<File> {
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(offset == 0)
+        .open(path)
+        .await?;
+    if offset > 0 {
+        file.seek(io::SeekFrom::Start(offset)).await?;
+    }
+    Ok(file)
+}
+
+/// The fingerprint of the first `len` bytes of each file.
+async fn fingerprints(files: Vec<(PathBuf, u64)>) -> io::Result<Vec<Fingerprint>> {
+    tokio::task::spawn_blocking(move || {
+        files
+            .iter()
+            .map(|(path, len)| fingerprint(path, *len))
+            .collect()
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+fn fingerprint(path: &Path, len: u64) -> io::Result<Fingerprint> {
+    use std::io::{Read, Seek};
+    let mut file = std::fs::File::open(path)?;
+    let mut sampled = Vec::new();
+    for (start, end) in Fingerprint::ranges(len) {
+        file.seek(io::SeekFrom::Start(start))?;
+        let want = end - start;
+        if (&mut file).take(want).read_to_end(&mut sampled)? as u64 != want {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("{} is shorter than {len} bytes", path.display()),
+            ));
+        }
+    }
+    Ok(Fingerprint::of(&sampled))
+}
+
+/// Finishes a received file.
+pub(crate) async fn finish_received_file(file: &mut File, size: u64) -> io::Result<()> {
+    file.set_len(size).await?;
+    file.shutdown().await
+}
+
+/// A message the peer sends.
+pub(crate) trait PeerMessage: Message + Debug {
+    /// What it means where the flow expects another one.
+    fn unexpected(self) -> TransferError;
+    /// Whether it is the peer's last word.
+    fn is_final(&self) -> bool;
+}
+
+impl PeerMessage for SenderMessage {
+    fn unexpected(self) -> TransferError {
+        match self {
+            Self::Error(report) => report.into(),
+            Self::Cancel(Cancel { reason }) => TransferError::PeerCancelled(reason),
+            other => TransferError::Protocol(format!("unexpected {} message", other.kind())),
+        }
+    }
+
+    fn is_final(&self) -> bool {
+        matches!(self, Self::Cancel(_) | Self::Error(_))
+    }
+}
+
+impl PeerMessage for ReceiverMessage {
+    fn unexpected(self) -> TransferError {
+        match self {
+            Self::Error(report) => report.into(),
+            Self::Cancel(Cancel { reason }) => TransferError::PeerCancelled(reason),
+            other => TransferError::Protocol(format!("unexpected {} message", other.kind())),
+        }
+    }
+
+    fn is_final(&self) -> bool {
+        matches!(
+            self,
+            Self::Done | Self::Reject { .. } | Self::Cancel(_) | Self::Error(_)
+        )
+    }
+}
+
+impl From<ErrorReport> for TransferError {
+    fn from(ErrorReport { code, message }: ErrorReport) -> Self {
+        Self::Peer { code, message }
+    }
+}
+
+/// The control stream, one message per frame: we send `Out`, the peer sends `In`.
+pub(crate) struct Control<Out, In> {
+    stream: Box<dyn ByteStream>,
+    decoder: FrameDecoder,
+    buf: Vec<u8>,
+    messages: PhantomData<fn(Out) -> In>,
+}
+
+pub(crate) type SenderControl = Control<SenderMessage, ReceiverMessage>;
+pub(crate) type ReceiverControl = Control<ReceiverMessage, SenderMessage>;
+
+impl<Out: Message + Debug, In: PeerMessage> Control<Out, In> {
+    pub fn new(stream: Box<dyn ByteStream>) -> Self {
+        Self {
+            stream,
+            decoder: FrameDecoder::default(),
+            buf: vec![0; BUF_SIZE],
+            messages: PhantomData,
+        }
+    }
+
+    pub async fn send(&mut self, message: &Out) -> Result<(), TransferError> {
+        tracing::debug!("sending {message:?}");
+        let frame = frame::encode(message)
+            .map_err(|_| TransferError::Internal("a message does not fit in a frame"))?;
+        self.send_frame(&frame).await
+    }
+
+    async fn send_frame(&mut self, frame: &[u8]) -> Result<(), TransferError> {
+        self.stream.write_all(frame).await?;
+        self.stream.flush().await?;
+        Ok(())
+    }
+
+    /// The next message; one the peer may not send is a protocol error. Cancel safe.
+    pub async fn recv(&mut self) -> Result<In, TransferError> {
+        loop {
+            match self.decoder.next_message() {
+                Ok(Some(message)) => {
+                    tracing::debug!("received {message:?}");
+                    return Ok(message);
+                }
+                Ok(None) => {
+                    let n = self.stream.read(&mut self.buf).await?;
+                    if n == 0 {
+                        return Err(TransferError::Disconnected(
+                            "the control stream ended".into(),
+                        ));
+                    }
+                    self.decoder.push(&self.buf[..n]);
+                }
+                Err(e) => return Err(TransferError::Protocol(e.to_string())),
+            }
+        }
+    }
+
+    async fn recv_within(
+        &mut self,
+        limit: Duration,
+        what: &'static str,
+    ) -> Result<In, TransferError> {
+        timeout(limit, self.recv())
+            .await
+            .map_err(|_| TransferError::Timeout(what))?
+    }
+}
+
+/// Checks that the peer's `hello` leaves a common version.
+fn check_version(hello: &Hello) -> Result<(), TransferError> {
+    match peer::negotiate(hello.version, hello.min_version) {
+        Some(_) => Ok(()),
+        None => Err(TransferError::Version {
+            version: hello.version,
+            min_version: hello.min_version,
+        }),
+    }
+}
+
+/// Gives the peer a moment to read our last message, until it hangs up or says its last word.
+async fn goodbye<Out: Message + Debug, In: PeerMessage>(
+    transport: &mut dyn Transport,
+    control: &mut Control<Out, In>,
+) {
+    let last_word = async {
+        loop {
+            match control.recv().await {
+                Ok(message) if message.is_final() => return,
+                Ok(_) => {}
+                // A broken stream has nothing more to say; wait for the hang-up.
+                Err(TransferError::Protocol(_)) => std::future::pending().await,
+                Err(_) => return,
+            }
+        }
+    };
+    let _ = timeout(GOODBYE_TIMEOUT, async {
+        tokio::select! {
+            _ = transport.closed() => {}
+            () = last_word => {}
+        }
+    })
+    .await;
+}
+
+/// Tells the peer why `result` failed, if it should know, as `error(report)`.
+async fn explain<Out: Message + Debug, In: PeerMessage>(
+    transport: &mut dyn Transport,
+    control: &mut Control<Out, In>,
+    result: Result<(), TransferError>,
+    error: fn(ErrorReport) -> Out,
 ) -> Result<(), TransferError> {
-    tracing::debug!("sending packet: {packet:?}");
-    let json = serde_json::to_vec(packet)?;
-    let compressed = compress_gzip(&json).await?;
-    control.send(Bytes::from(compressed)).await?;
-    Ok(())
-}
-
-pub(crate) async fn recv_packet<P: DeserializeOwned + std::fmt::Debug>(
-    control: &mut Control,
-) -> Result<P, TransferError> {
-    let frame = control
-        .next()
-        .await
-        .ok_or_else(|| TransferError::Disconnected("the control stream ended".into()))??;
-    let json = decompress_gzip(&frame).await?;
-    let packet: P = serde_json::from_slice(&json)?;
-    tracing::debug!("received packet: {packet:?}");
-    Ok(packet)
-}
-
-/// Copies `skip..size` of `file` into `stream`.
-async fn send_file_data<S, R>(
-    stream: &mut S,
-    file: &mut R,
-    skip: u64,
-    size: u64,
-    write_cb: &mut (dyn FnMut(u64) + Send),
-) -> std::io::Result<()>
-where
-    S: AsyncWrite + Unpin,
-    R: AsyncRead + AsyncSeek + Unpin,
-{
-    file.seek(std::io::SeekFrom::Start(skip)).await?;
-    let mut buf = vec![0u8; BUF_SIZE];
-    let mut read = skip;
-    while read < size {
-        let to_read = std::cmp::min(BUF_SIZE as u64, size - read) as usize;
-        let n = file.read(&mut buf[..to_read]).await?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "unexpected eof",
-            ));
-        }
-        stream.write_all(&buf[..n]).await?;
-        read += n as u64;
-        write_cb(n as u64);
+    if let Err(failure) = &result
+        && let Some(report) = failure.report()
+        && control.send(&error(report)).await.is_ok()
+    {
+        goodbye(transport, control).await;
     }
-    Ok(())
+    result
 }
 
-/// Reads `skip..size` from `stream` into `file`.
-async fn receive_file_data<S, W>(
-    stream: &mut S,
-    file: &mut W,
-    skip: u64,
-    size: u64,
-    read_cb: &mut (dyn FnMut(u64) + Send),
-) -> std::io::Result<()>
-where
-    S: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut buf = vec![0u8; BUF_SIZE];
-    let mut written = skip;
-    while written < size {
-        let to_read = std::cmp::min(BUF_SIZE as u64, size - written) as usize;
-        let n = stream.read(&mut buf[..to_read]).await?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "the stream ended before the file was complete",
-            ));
-        }
-        file.write_all(&buf[..n]).await?;
-        written += n as u64;
-        read_cb(n as u64);
-    }
-    Ok(())
+/// Bytes of the accepted files still to move.
+fn remaining(entries: &[Entry], files: &[AcceptedFile]) -> u64 {
+    files
+        .iter()
+        .map(|file| entries[file.id as usize].size() - file.offset)
+        .sum()
 }
 
-/// Gives the peer a moment to read our last packet before we close on it.
-async fn goodbye(transport: &mut dyn Transport) {
-    let _ = tokio::time::timeout(GOODBYE_TIMEOUT, transport.closed()).await;
-}
-
+/// Sends `outgoing`, zstd-compressing the data where that helps if `compress`.
 pub async fn send_files(
     transport: &mut dyn Transport,
-    args: SendArgs,
-    initial_progress_cb: ProgressCb<'_>,
-    waiting_cb: WaitingCb<'_>,
-    write_cb: DataCb<'_>,
+    outgoing: &Outgoing,
+    compress: bool,
+    on_event: EventCb<'_>,
 ) -> Result<(), TransferError> {
-    let result = run_send(transport, args, initial_progress_cb, waiting_cb, write_cb).await;
+    let result = match transport.control().await {
+        Ok(stream) => {
+            let mut control = Control::new(stream);
+            let result = send(transport, &mut control, outgoing, compress, on_event).await;
+            explain(transport, &mut control, result, SenderMessage::Error).await
+        }
+        Err(e) => Err(e),
+    };
     transport.close(result.is_ok()).await;
     result
 }
 
-async fn run_send(
+async fn send(
     transport: &mut dyn Transport,
-    args: SendArgs,
-    initial_progress_cb: ProgressCb<'_>,
-    waiting_cb: WaitingCb<'_>,
-    write_cb: DataCb<'_>,
+    control: &mut SenderControl,
+    outgoing: &Outgoing,
+    compress: bool,
+    on_event: EventCb<'_>,
 ) -> Result<(), TransferError> {
-    let mut control = frame(transport.control().await?);
-
-    send_packet(
-        &mut control,
-        &SenderToReceiver::ConnRequest {
-            version: PROTO_VERSION.to_string(),
-        },
-    )
-    .await?;
-
-    let reply = tokio::time::timeout(HANDSHAKE_TIMEOUT, recv_packet(&mut control))
-        .await
-        .map_err(|_| TransferError::HandshakeTimeout)??;
-    match reply {
-        ReceiverToSender::Ok => {}
-        ReceiverToSender::WrongVersion { expected } => {
-            return Err(TransferError::WrongVersion(expected, PROTO_VERSION.into()));
-        }
-        _ => return Err(TransferError::UnexpectedPacket),
-    }
-
-    let mut files_available = Vec::new();
-    for path in &args.files {
-        if !path.exists() {
-            return Err(TransferError::FileNotFound(path.clone()));
-        }
-        files_available.push(get_files_available(path)?);
-    }
-
-    send_packet(
-        &mut control,
-        &SenderToReceiver::FileInfo {
-            files: files_available.clone(),
-        },
-    )
-    .await?;
-
-    waiting_cb();
-
-    let to_skip = match recv_packet::<ReceiverToSender>(&mut control).await? {
-        ReceiverToSender::AcceptFilesSkip { files } => files,
-        ReceiverToSender::RejectFiles => return Err(TransferError::PeerDeclined),
-        _ => return Err(TransferError::UnexpectedPacket),
+    control
+        .send(&SenderMessage::Hello(peer::hello(None)))
+        .await?;
+    let hello = match control.recv_within(HELLO_TIMEOUT, RECEIVER_HELLO).await? {
+        ReceiverMessage::Hello(hello) => hello,
+        other => return Err(other.unexpected()),
     };
-    if to_skip.len() != files_available.len() {
-        return Err(TransferError::UnexpectedPacket);
+    check_version(&hello)?;
+    let size = hello
+        .recv_window
+        .filter(|size| *size >= MIN_RECV_WINDOW)
+        .ok_or_else(|| TransferError::Protocol("the receiver announced no usable window".into()))?;
+    let mut window = Window {
+        size,
+        sent: 0,
+        acked: 0,
+    };
+
+    control.send_frame(&outgoing.frame).await?;
+    on_event(Event::Offered);
+    let entries = &outgoing.entries;
+    let mut answer = control.recv().await?;
+    if let ReceiverMessage::Check { files } = answer {
+        offer::check_lengths(entries, &files)
+            .map_err(|e| TransferError::Protocol(e.to_string()))?;
+        let sources = files
+            .iter()
+            .map(|file| (outgoing.sources[file.id as usize].clone(), file.len))
+            .collect();
+        let hashes = fingerprints(sources).await?;
+        control.send(&SenderMessage::Hashes { hashes }).await?;
+        answer = control.recv().await?;
+    }
+    let files = match answer {
+        ReceiverMessage::Accept { files } => files,
+        ReceiverMessage::Reject { reason } => return Err(TransferError::PeerDeclined(reason)),
+        other => return Err(other.unexpected()),
+    };
+    offer::check_accept(entries, &files).map_err(|e| TransferError::Protocol(e.to_string()))?;
+    let (tops, top_of) = progress::top_entries(entries);
+    on_event(Event::Started {
+        entries: &tops,
+        present: &progress::present(entries, &files),
+    });
+
+    let mut reader = BlockReader::new(outgoing, &files);
+    let mut progress = Progress::new(entries, &files, &top_of);
+    if !reader.is_done() {
+        let mut data = transport.data().await?;
+        // Blocks in order, compressed a few at a time.
+        let mut encoding = FuturesOrdered::new();
+        loop {
+            while encoding.len() < COMPRESS_WORKERS && !reader.is_done() && window.room() > 0 {
+                let bytes = reader.read(window.room()).await?;
+                window.sent += bytes.len() as u64;
+                encoding.push_back(tokio::task::spawn_blocking(move || {
+                    (block::encode(&bytes, compress), bytes.len() as u64)
+                }));
+            }
+            let Some(encoded) = encoding.next().await else {
+                if reader.is_done() {
+                    break;
+                }
+                window.ack(control.recv_within(IDLE_TIMEOUT, RECEIVER_IDLE).await?)?;
+                continue;
+            };
+            let (frame, raw) =
+                encoded.map_err(|_| TransferError::Internal("encoding a block failed"))?;
+            // The block's file bytes count in proportion to its bytes written.
+            let mut counted = 0;
+            let mut on_written = |written: usize| {
+                let now = raw * written as u64 / frame.len() as u64;
+                for (entry, bytes) in progress.advance(now - counted) {
+                    on_event(Event::Progress { entry, bytes });
+                }
+                counted = now;
+            };
+            let write = window.write(data.as_mut(), &frame, control, &mut on_written);
+            timeout(IDLE_TIMEOUT, write)
+                .await
+                .map_err(|_| TransferError::Timeout(RECEIVER_IDLE))??;
+        }
+        timeout(IDLE_TIMEOUT, data.shutdown())
+            .await
+            .map_err(|_| TransferError::Timeout(RECEIVER_IDLE))??;
     }
 
-    let plan = plan_transfer(&files_available, &to_skip);
-    initial_progress_cb(&plan.progress);
+    loop {
+        match control.recv_within(IDLE_TIMEOUT, RECEIVER_IDLE).await? {
+            ReceiverMessage::Done => return Ok(()),
+            message => window.ack(message)?,
+        }
+    }
+}
 
-    let mut data = transport.data().await?;
-    for (path, tree) in args.files.iter().zip(plan.to_transfer) {
-        let Some(tree) = tree else { continue };
-        for entry in flatten_trees(std::slice::from_ref(&tree), path) {
-            if let TransferEntry::File { path, skip, size } = entry {
-                let mut file = tokio::fs::File::open(&path).await?;
-                send_file_data(&mut data, &mut file, skip, size, write_cb).await?;
+/// Reads the accepted bytes of the offered files in order, a block at a time.
+struct BlockReader<'a> {
+    outgoing: &'a Outgoing,
+    files: std::slice::Iter<'a, AcceptedFile>,
+    /// The file being read and the bytes left in it.
+    current: Option<(File, u64)>,
+    left: u64,
+}
+
+impl<'a> BlockReader<'a> {
+    fn new(outgoing: &'a Outgoing, files: &'a [AcceptedFile]) -> Self {
+        Self {
+            outgoing,
+            files: files.iter(),
+            current: None,
+            left: remaining(&outgoing.entries, files),
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        self.left == 0
+    }
+
+    /// Up to `max` (and a block's worth of) bytes.
+    async fn read(&mut self, max: u64) -> io::Result<Vec<u8>> {
+        let len = max.min(self.left).min(MAX_BLOCK_BYTES as u64) as usize;
+        let mut bytes = vec![0; len];
+        let mut filled = 0;
+        while filled < len {
+            let (file, left) = match &mut self.current {
+                Some((file, left)) if *left > 0 => (file, left),
+                _ => {
+                    let next = self.files.next().expect("bytes are left");
+                    let id = next.id as usize;
+                    let mut file = File::open(&self.outgoing.sources[id]).await?;
+                    if next.offset > 0 {
+                        file.seek(io::SeekFrom::Start(next.offset)).await?;
+                    }
+                    let left = self.outgoing.entries[id].size() - next.offset;
+                    self.current = Some((file, left));
+                    continue;
+                }
+            };
+            let n = (*left).min((len - filled) as u64);
+            file.read_exact(&mut bytes[filled..filled + n as usize])
+                .await?;
+            filled += n as usize;
+            *left -= n;
+        }
+        self.left -= len as u64;
+        Ok(bytes)
+    }
+}
+
+/// Keeps the bytes the receiver has not acknowledged within its window.
+struct Window {
+    size: u64,
+    sent: u64,
+    acked: u64,
+}
+
+impl Window {
+    fn room(&self) -> u64 {
+        self.size - (self.sent - self.acked)
+    }
+
+    /// Writes `frame` to the data stream a piece at a time, taking acks as
+    /// they arrive and telling `on_written` how much of it is written.
+    async fn write(
+        &mut self,
+        data: &mut dyn ByteStream,
+        frame: &[u8],
+        control: &mut SenderControl,
+        on_written: &mut (dyn FnMut(usize) + Send),
+    ) -> Result<(), TransferError> {
+        let mut written = 0;
+        while written < frame.len() {
+            let piece = &frame[written..frame.len().min(written + BUF_SIZE)];
+            tokio::select! {
+                n = data.write(piece) => match n? {
+                    0 => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
+                    n => {
+                        written += n;
+                        on_written(written);
+                    }
+                },
+                message = control.recv() => self.ack(message?)?,
             }
         }
+        Ok(())
     }
-    data.shutdown().await?;
 
-    // The receiver hangs up once everything is on disk.
-    transport.closed().await
+    fn ack(&mut self, message: ReceiverMessage) -> Result<(), TransferError> {
+        match message {
+            ReceiverMessage::Ack { bytes } if (self.acked..=self.sent).contains(&bytes) => {
+                self.acked = bytes;
+                Ok(())
+            }
+            ReceiverMessage::Ack { .. } => Err(TransferError::Protocol(
+                "an ack outside the bytes sent".into(),
+            )),
+            other => Err(other.unexpected()),
+        }
+    }
 }
 
 pub async fn receive_files(
     transport: &mut dyn Transport,
-    args: ReceiveArgs,
-    initial_progress_cb: ProgressCb<'_>,
-    accept_files_cb: AcceptFilesCb<'_>,
-    read_cb: DataCb<'_>,
+    accept: AcceptCb<'_>,
+    on_conflict: ConflictCb<'_>,
+    on_event: EventCb<'_>,
 ) -> Result<(), TransferError> {
-    let result = run_receive(
-        transport,
-        args,
-        initial_progress_cb,
-        accept_files_cb,
-        read_cb,
-    )
-    .await;
+    // Over iroh the stream only shows up once the sender has written to it.
+    let result = match timeout(HELLO_TIMEOUT, transport.control()).await {
+        Ok(Ok(stream)) => {
+            let mut control = Control::new(stream);
+            let result = receive(transport, &mut control, accept, on_conflict, on_event).await;
+            explain(transport, &mut control, result, ReceiverMessage::Error).await
+        }
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(TransferError::Timeout(SENDER_HELLO)),
+    };
     transport.close(result.is_ok()).await;
     result
 }
 
-async fn run_receive(
+async fn receive(
     transport: &mut dyn Transport,
-    args: ReceiveArgs,
-    initial_progress_cb: ProgressCb<'_>,
-    accept_files_cb: AcceptFilesCb<'_>,
-    read_cb: DataCb<'_>,
+    control: &mut ReceiverControl,
+    accept: AcceptCb<'_>,
+    on_conflict: ConflictCb<'_>,
+    on_event: EventCb<'_>,
 ) -> Result<(), TransferError> {
-    let handshake = async {
-        let mut control = frame(transport.control().await?);
-        let request: SenderToReceiver = recv_packet(&mut control).await?;
-        Ok::<_, TransferError>((control, request))
+    control
+        .send(&ReceiverMessage::Hello(peer::hello(Some(RECV_WINDOW))))
+        .await?;
+    match control.recv_within(HELLO_TIMEOUT, SENDER_HELLO).await? {
+        SenderMessage::Hello(hello) => check_version(&hello)?,
+        other => return Err(other.unexpected()),
+    }
+    let entries = match control
+        .recv_within(HELLO_TIMEOUT, "the sender did not make an offer in time")
+        .await?
+    {
+        SenderMessage::Offer { entries } => entries,
+        other => return Err(other.unexpected()),
     };
-    let (mut control, request) = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
-        .await
-        .map_err(|_| TransferError::HandshakeTimeout)??;
+    offer::validate(&entries).map_err(TransferError::InvalidOffer)?;
+    let (tops, top_of) = progress::top_entries(&entries);
 
-    match request {
-        SenderToReceiver::ConnRequest { version } => {
-            if version != PROTO_VERSION {
-                send_packet(
-                    &mut control,
-                    &ReceiverToSender::WrongVersion {
-                        expected: PROTO_VERSION.into(),
-                    },
-                )
-                .await?;
-                goodbye(transport).await;
-                return Err(TransferError::WrongVersion(PROTO_VERSION.into(), version));
+    let Some(out) = accept(&tops) else {
+        control
+            .send(&ReceiverMessage::Reject { reason: None })
+            .await?;
+        goodbye(transport, control).await;
+        return Err(TransferError::Declined);
+    };
+    tokio::fs::create_dir_all(&out).await?;
+    let paths = entries
+        .iter()
+        .map(|entry| local_path(&out, entry.path()))
+        .collect::<io::Result<Vec<_>>>()?;
+    let local = local_entries(&paths).await?;
+    let checked = resume::to_check(&entries, &local);
+    let verified = if checked.is_empty() {
+        Vec::new()
+    } else {
+        verify(control, &paths, checked).await?
+    };
+    let plan = resume::plan(&entries, &local, &verified);
+    let policy = match plan.conflicts.is_empty() {
+        true => ConflictPolicy::Skip,
+        false => on_conflict(&entries, &plan.conflicts),
+    };
+    let files = plan.accept(policy);
+    control
+        .send(&ReceiverMessage::Accept {
+            files: files.clone(),
+        })
+        .await?;
+    on_event(Event::Started {
+        entries: &tops,
+        present: &progress::present(&entries, &files),
+    });
+
+    for &id in &plan.dirs {
+        tokio::fs::create_dir_all(&paths[id as usize]).await?;
+    }
+    let mut incoming = if remaining(&entries, &files) > 0 {
+        let stream = tokio::select! {
+            stream = timeout(IDLE_TIMEOUT, transport.data()) => {
+                stream.map_err(|_| TransferError::Timeout(SENDER_IDLE))??
             }
-            send_packet(&mut control, &ReceiverToSender::Ok).await?;
-        }
-        _ => return Err(TransferError::UnexpectedPacket),
+            message = control.recv() => return Err(message?.unexpected()),
+        };
+        Some(Incoming::new(stream))
+    } else {
+        None
+    };
+    let mut progress = Progress::new(&entries, &files, &top_of);
+    for &AcceptedFile { id, offset } in &files {
+        let id = id as usize;
+        let size = entries[id].size();
+        let mut file = open_for_receive(&paths[id], offset).await?;
+        let received = match &mut incoming {
+            Some(incoming) => {
+                let mut on_arrived = |bytes| {
+                    for (entry, bytes) in progress.advance(bytes) {
+                        on_event(Event::Progress { entry, bytes });
+                    }
+                };
+                incoming
+                    .write_to(&mut file, size - offset, control, &mut on_arrived)
+                    .await
+            }
+            None => Ok(()),
+        };
+        // Hands even a partial file to the OS, for a later session to resume.
+        let flushed = file.flush().await;
+        received?;
+        flushed?;
+        finish_received_file(&mut file, size).await?;
+    }
+    if incoming.is_some_and(|incoming| !incoming.is_empty()) {
+        return Err(TransferError::Protocol(
+            "the sender sent more bytes than accepted".into(),
+        ));
     }
 
-    let files_offered = match recv_packet::<SenderToReceiver>(&mut control).await? {
-        SenderToReceiver::FileInfo { files } => files,
-        _ => return Err(TransferError::UnexpectedPacket),
-    };
+    control.send(&ReceiverMessage::Done).await?;
+    goodbye(transport, control).await;
+    Ok(())
+}
 
-    let output_path = match accept_files_cb(&files_offered) {
-        Some(p) => p,
-        None => {
-            send_packet(&mut control, &ReceiverToSender::RejectFiles).await?;
-            goodbye(transport).await;
-            return Err(TransferError::Declined);
+/// What is already at each path, looked up in one blocking task.
+async fn local_entries(paths: &[PathBuf]) -> io::Result<Vec<Local>> {
+    let paths = paths.to_vec();
+    tokio::task::spawn_blocking(move || {
+        paths
+            .iter()
+            .map(|path| match std::fs::metadata(path) {
+                Err(_) => Local::Missing,
+                Ok(m) if m.is_file() => Local::File { size: m.len() },
+                Ok(m) if m.is_dir() => Local::Dir,
+                Ok(_) => Local::Other,
+            })
+            .collect()
+    })
+    .await
+    .map_err(io::Error::other)
+}
+
+/// Asks the sender for fingerprints of the `checked` files; returns the ids of those that match ours.
+async fn verify(
+    control: &mut ReceiverControl,
+    paths: &[PathBuf],
+    checked: Vec<CheckedFile>,
+) -> Result<Vec<u32>, TransferError> {
+    control
+        .send(&ReceiverMessage::Check {
+            files: checked.clone(),
+        })
+        .await?;
+    let hashes = match control.recv().await? {
+        SenderMessage::Hashes { hashes } if hashes.len() == checked.len() => hashes,
+        SenderMessage::Hashes { .. } => {
+            return Err(TransferError::Protocol(
+                "the hashes do not match the check".into(),
+            ));
         }
+        other => return Err(other.unexpected()),
     };
-
-    let files_to_skip = skip_list(&files_offered, &output_path, args.resume);
-    let plan = plan_transfer(&files_offered, &files_to_skip);
-    initial_progress_cb(&plan.progress);
-
-    send_packet(
-        &mut control,
-        &ReceiverToSender::AcceptFilesSkip {
-            files: files_to_skip,
-        },
+    let ours = fingerprints(
+        checked
+            .iter()
+            .map(|file| (paths[file.id as usize].clone(), file.len))
+            .collect(),
     )
     .await?;
+    Ok(checked
+        .iter()
+        .zip(ours.iter().zip(&hashes))
+        .filter(|(_, (ours, theirs))| ours == theirs)
+        .map(|(file, _)| file.id)
+        .collect())
+}
 
-    let mut data = transport.data().await?;
-    tokio::fs::create_dir_all(&output_path).await?;
-    for tree in plan.to_transfer.into_iter().flatten() {
-        let entries = flatten_trees(std::slice::from_ref(&tree), &output_path.join(tree.name()));
-        for entry in entries {
-            match entry {
-                TransferEntry::Dir { path } => tokio::fs::create_dir_all(path).await?,
-                TransferEntry::File { path, skip, size } => {
-                    let mut file = open_for_receive(&path, skip).await?;
-                    let received =
-                        receive_file_data(&mut data, &mut file, skip, size, read_cb).await;
-                    // Even a partial file must be on disk before the next session resumes it.
-                    file.flush().await?;
-                    received?;
-                    finish_received_file(&mut file, size).await?;
-                }
-            }
+/// The receiving end of the data stream, acking what it wrote.
+struct Incoming {
+    stream: Box<dyn ByteStream>,
+    buf: Vec<u8>,
+    decoder: BlockDecoder,
+    /// The block being written, and how much of it is.
+    block: Vec<u8>,
+    taken: usize,
+    /// File bytes of the blocks decoded so far, and of those counted as arrived.
+    decoded: u64,
+    arrived: u64,
+    written: u64,
+    acked: u64,
+    acked_at: Instant,
+}
+
+impl Incoming {
+    fn new(stream: Box<dyn ByteStream>) -> Self {
+        Self {
+            stream,
+            buf: vec![0; BUF_SIZE],
+            decoder: BlockDecoder::default(),
+            block: Vec::new(),
+            taken: 0,
+            decoded: 0,
+            arrived: 0,
+            written: 0,
+            acked: 0,
+            acked_at: Instant::now(),
         }
     }
 
-    Ok(())
+    /// Whether nothing past the accepted bytes arrived.
+    fn is_empty(&self) -> bool {
+        self.taken == self.block.len() && self.decoder.is_empty()
+    }
+
+    /// Decodes the next block once the current one is written, telling
+    /// `on_arrived` about file bytes as their blocks arrive, in proportion.
+    async fn fill(
+        &mut self,
+        control: &mut ReceiverControl,
+        on_arrived: &mut (dyn FnMut(u64) + Send),
+    ) -> Result<(), TransferError> {
+        while self.taken == self.block.len() {
+            if let Some(block) = self
+                .decoder
+                .next_block()
+                .map_err(|e| TransferError::Protocol(e.to_string()))?
+            {
+                self.decoded += block.len() as u64;
+                self.block = block;
+                self.taken = 0;
+                self.count_arrived(on_arrived);
+                return Ok(());
+            }
+            let n = tokio::select! {
+                read = timeout(IDLE_TIMEOUT, self.stream.read(&mut self.buf)) => {
+                    read.map_err(|_| TransferError::Timeout(SENDER_IDLE))??
+                }
+                // The sender says nothing while it sends.
+                message = control.recv() => return Err(message?.unexpected()),
+            };
+            if n == 0 {
+                // The sender may say why it stopped.
+                return Err(match timeout(GOODBYE_TIMEOUT, control.recv()).await {
+                    Ok(Ok(message)) => message.unexpected(),
+                    _ => TransferError::Disconnected("the data stream ended early".into()),
+                });
+            }
+            self.decoder.push(&self.buf[..n]);
+            self.count_arrived(on_arrived);
+        }
+        Ok(())
+    }
+
+    fn count_arrived(&mut self, on_arrived: &mut (dyn FnMut(u64) + Send)) {
+        let arrived = self.decoded + self.decoder.partial();
+        if arrived > self.arrived {
+            on_arrived(arrived - self.arrived);
+            self.arrived = arrived;
+        }
+    }
+
+    /// Writes the next `len` bytes of the stream to `file`.
+    async fn write_to(
+        &mut self,
+        file: &mut File,
+        mut len: u64,
+        control: &mut ReceiverControl,
+        on_arrived: &mut (dyn FnMut(u64) + Send),
+    ) -> Result<(), TransferError> {
+        while len > 0 {
+            self.fill(control, on_arrived).await?;
+            let n = len.min((self.block.len() - self.taken) as u64) as usize;
+            file.write_all(&self.block[self.taken..self.taken + n])
+                .await?;
+            self.taken += n;
+            len -= n as u64;
+            self.written += n as u64;
+            if self.written - self.acked >= ACK_STEP || self.acked_at.elapsed() >= ACK_INTERVAL {
+                control
+                    .send(&ReceiverMessage::Ack {
+                        bytes: self.written,
+                    })
+                    .await?;
+                self.acked = self.written;
+                self.acked_at = Instant::now();
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

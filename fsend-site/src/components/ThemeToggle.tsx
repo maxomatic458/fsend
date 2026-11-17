@@ -2,30 +2,34 @@ import { createSignal, onMount } from "solid-js";
 import { FiSun, FiMoon } from "solid-icons/fi";
 
 export function ThemeToggle() {
-  const [dark, setDark] = createSignal(true);
+    const [dark, setDark] = createSignal(true);
 
-  onMount(() => {
-    // index.html already applied the class before paint.
-    setDark(document.documentElement.classList.contains("dark"));
-  });
+    onMount(() => {
+        // index.html already applied the class before paint.
+        setDark(document.documentElement.classList.contains("dark"));
+    });
 
-  const toggle = () => {
-    const next = !dark();
-    setDark(next);
-    document.documentElement.classList.toggle("dark", next);
-    document
-      .querySelector('meta[name="theme-color"]')
-      ?.setAttribute("content", next ? "#151515" : "#f7f5f2");
-    localStorage.setItem("theme", next ? "dark" : "light");
-  };
+    const toggle = () => {
+        const next = !dark();
+        setDark(next);
+        document.documentElement.classList.toggle("dark", next);
+        document
+            .querySelector('meta[name="theme-color"]')
+            ?.setAttribute("content", next ? "#151515" : "#f7f5f2");
+        try {
+            localStorage.setItem("theme", next ? "dark" : "light");
+        } catch {
+            // Site data is blocked; the choice lasts until the page is left.
+        }
+    };
 
-  return (
-    <button
-      onClick={toggle}
-      class="p-2 rounded-lg text-ink-dim hover:text-ink hover:bg-surface-2 transition-colors cursor-pointer"
-      aria-label={dark() ? "Switch to light theme" : "Switch to dark theme"}
-    >
-      {dark() ? <FiSun class="w-5 h-5" /> : <FiMoon class="w-5 h-5" />}
-    </button>
-  );
+    return (
+        <button
+            onClick={toggle}
+            class="p-2 rounded-lg text-ink-dim hover:text-ink hover:bg-surface-2 transition-colors cursor-pointer"
+            aria-label={dark() ? "Switch to light theme" : "Switch to dark theme"}
+        >
+            {dark() ? <FiSun class="w-5 h-5" /> : <FiMoon class="w-5 h-5" />}
+        </button>
+    );
 }

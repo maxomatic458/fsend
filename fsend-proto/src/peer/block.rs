@@ -1,0 +1,339 @@
+use zstd::bulk::Decompressor;
+
+use super::frame::{self, Deframer, FrameError, ZSTD};
+use super::limits::MAX_BLOCK_BYTES;
+
+/// Ahead of a compressed payload: the `u32 BE` count of file bytes in it.
+const RAW_LEN_BYTES: usize = 4;
+
+/// A data stream block of `data`, 1 to [`MAX_BLOCK_BYTES`] file bytes, framed
+/// like a control message. If `compress` and that helps, its payload is the
+/// count of file bytes and their zstd compression.
+pub fn encode(data: &[u8], compress: bool) -> Vec<u8> {
+    assert!(
+        (1..=MAX_BLOCK_BYTES).contains(&data.len()),
+        "a block holds 1 to {MAX_BLOCK_BYTES} bytes"
+    );
+    if compress {
+        frame::compact(&(data.len() as u32).to_be_bytes(), data)
+    } else {
+        frame::frame(0, &[data])
+    }
+}
+
+/// Reassembles the file bytes of blocks from data stream bytes split anywhere.
+pub struct BlockDecoder {
+    deframer: Deframer,
+    decompressor: Option<Decompressor<'static>>,
+}
+
+impl Default for BlockDecoder {
+    fn default() -> Self {
+        Self {
+            // A compressed payload is smaller than the bytes it holds.
+            deframer: Deframer::new(MAX_BLOCK_BYTES + 1),
+            decompressor: None,
+        }
+    }
+}
+
+impl BlockDecoder {
+    pub fn push(&mut self, data: &[u8]) {
+        self.deframer.push(data);
+    }
+
+    /// Whether no partial block is buffered.
+    pub fn is_empty(&self) -> bool {
+        self.deframer.is_empty()
+    }
+
+    /// The file bytes of the first buffered block, in proportion to how much of it arrived.
+    pub fn partial(&self) -> u64 {
+        let Some((len, arrived)) = self.deframer.first() else {
+            return 0;
+        };
+        let raw = match arrived {
+            [ZSTD, raw_len @ ..] => match raw_len.first_chunk::<RAW_LEN_BYTES>() {
+                Some(raw_len) => u32::from_be_bytes(*raw_len) as usize,
+                None => return 0,
+            },
+            _ => len.saturating_sub(1),
+        };
+        let raw = raw.min(MAX_BLOCK_BYTES) as u64;
+        raw * arrived.len() as u64 / len.max(1) as u64
+    }
+
+    /// The file bytes of the next complete block; after an error the stream is unusable.
+    pub fn next_block(&mut self) -> Result<Option<Vec<u8>>, FrameError> {
+        let Some((flags, payload)) = self.deframer.next()? else {
+            return Ok(None);
+        };
+        let data = match flags {
+            0 => payload,
+            ZSTD => {
+                let (raw_len, compressed) = payload
+                    .split_first_chunk::<RAW_LEN_BYTES>()
+                    .ok_or(FrameError::Compression)?;
+                let raw_len = u32::from_be_bytes(*raw_len) as usize;
+                if raw_len > MAX_BLOCK_BYTES {
+                    return Err(FrameError::TooLarge(raw_len));
+                }
+                let data = self.decompress(compressed, raw_len)?;
+                if data.len() != raw_len {
+                    return Err(FrameError::Compression);
+                }
+                data
+            }
+            other => return Err(FrameError::Flags(other)),
+        };
+        if data.is_empty() {
+            return Err(FrameError::Empty);
+        }
+        Ok(Some(data))
+    }
+
+    /// Fails on more than `capacity` bytes, whatever the payload claims.
+    fn decompress(&mut self, payload: &[u8], capacity: usize) -> Result<Vec<u8>, FrameError> {
+        if self.decompressor.is_none() {
+            self.decompressor = Some(Decompressor::new().map_err(|_| FrameError::Compression)?);
+        }
+        let decompressor = self.decompressor.as_mut().expect("just created");
+        decompressor
+            .decompress(payload, capacity)
+            .map_err(|_| FrameError::Compression)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decode_all(bytes: &[u8]) -> Result<Vec<Vec<u8>>, FrameError> {
+        let mut decoder = BlockDecoder::default();
+        decoder.push(bytes);
+        let mut out = Vec::new();
+        while let Some(block) = decoder.next_block()? {
+            out.push(block);
+        }
+        assert!(decoder.is_empty());
+        Ok(out)
+    }
+
+    fn noise(len: usize) -> Vec<u8> {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect()
+    }
+
+    fn raw_block(flags: u8, payload: &[u8]) -> Vec<u8> {
+        let mut block = ((payload.len() + 1) as u32).to_be_bytes().to_vec();
+        block.push(flags);
+        block.extend_from_slice(payload);
+        block
+    }
+
+    #[test]
+    fn a_block_that_compresses_a_little_is_still_compressed() {
+        // Noise after a run of zeros, so compression saves anything from nothing to a few bytes.
+        for zeros in 0..64 {
+            let mut data = vec![0; zeros];
+            data.extend(noise(1000));
+            let compressed = zstd::bulk::compress(&data, 1).unwrap();
+            let helps = RAW_LEN_BYTES + compressed.len() < data.len();
+            let block = encode(&data, true);
+            assert_eq!(block[4] == ZSTD, helps, "{zeros} zeros");
+            assert_eq!(decode_all(&block).unwrap(), [data]);
+        }
+    }
+
+    #[test]
+    fn compressible_blocks_shrink_and_noise_goes_raw() {
+        let text = b"fsend ".repeat(MAX_BLOCK_BYTES / 6);
+        let packed = encode(&text, true);
+        assert_eq!(packed[4], ZSTD);
+        assert_eq!(packed[5..9], (text.len() as u32).to_be_bytes());
+        assert!(packed.len() < text.len() / 10);
+
+        let random = noise(MAX_BLOCK_BYTES);
+        let stored = encode(&random, true);
+        assert_eq!(stored, raw_block(0, &random));
+        assert_eq!(encode(&text, false), raw_block(0, &text));
+
+        assert_eq!(
+            decode_all(&[packed, stored].concat()),
+            Ok(vec![text, random])
+        );
+    }
+
+    #[test]
+    fn blocks_split_anywhere_reassemble() {
+        let blocks = [b"abc".repeat(1000), noise(5000), vec![7]];
+        let bytes: Vec<u8> = blocks.iter().flat_map(|b| encode(b, true)).collect();
+        let mut decoder = BlockDecoder::default();
+        let mut out = Vec::new();
+        for chunk in bytes.chunks(333) {
+            decoder.push(chunk);
+            while let Some(block) = decoder.next_block().unwrap() {
+                out.push(block);
+            }
+        }
+        assert_eq!(out, blocks);
+        assert!(decoder.is_empty());
+    }
+
+    #[test]
+    fn a_partial_block_counts_in_proportion() {
+        let text = b"fsend ".repeat(100_000);
+        for block in [encode(&text, true), encode(&noise(600_000), true)] {
+            let raw = if block[4] == ZSTD {
+                text.len()
+            } else {
+                600_000
+            } as u64;
+            let mut decoder = BlockDecoder::default();
+            assert_eq!(decoder.partial(), 0);
+            let half = block.len() / 2;
+            decoder.push(&block[..half]);
+            let expected = raw * (half - 4) as u64 / (block.len() - 4) as u64;
+            assert_eq!(decoder.partial(), expected);
+            decoder.push(&block[half..]);
+            assert_eq!(decoder.partial(), raw);
+            assert!(decoder.next_block().unwrap().is_some());
+            assert_eq!(decoder.partial(), 0);
+        }
+    }
+
+    #[test]
+    fn hostile_blocks_are_rejected() {
+        assert_eq!(decode_all(&raw_block(0, b"")), Err(FrameError::Empty));
+        assert_eq!(decode_all(&raw_block(2, b"x")), Err(FrameError::Flags(2)));
+        assert_eq!(
+            decode_all(&raw_block(ZSTD, b"\0\0\0\x08not zstd")),
+            Err(FrameError::Compression)
+        );
+        let too_large = (MAX_BLOCK_BYTES as u32 + 2).to_be_bytes();
+        assert_eq!(
+            decode_all(&too_large),
+            Err(FrameError::TooLarge(MAX_BLOCK_BYTES + 2))
+        );
+        let compressed = |raw_len: u32, data: &[u8]| {
+            let mut payload = raw_len.to_be_bytes().to_vec();
+            payload.extend(zstd::bulk::compress(data, 1).unwrap());
+            raw_block(ZSTD, &payload)
+        };
+        // More than it says once decompressed, less, or more than a block may hold.
+        let zeros = vec![0; 1000];
+        assert_eq!(
+            decode_all(&compressed(999, &zeros)),
+            Err(FrameError::Compression)
+        );
+        assert_eq!(
+            decode_all(&compressed(1001, &zeros)),
+            Err(FrameError::Compression)
+        );
+        let bomb = vec![0; MAX_BLOCK_BYTES + 1];
+        assert_eq!(
+            decode_all(&compressed(bomb.len() as u32, &bomb)),
+            Err(FrameError::TooLarge(MAX_BLOCK_BYTES + 1))
+        );
+        assert_eq!(
+            decode_all(&raw_block(ZSTD, &[0, 0])),
+            Err(FrameError::Compression)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "a block holds")]
+    fn empty_blocks_are_not_encoded() {
+        encode(&[], true);
+    }
+}
+
+#[cfg(test)]
+mod speed {
+    use std::time::Instant;
+
+    use super::*;
+
+    const MIB: f64 = 1024.0 * 1024.0;
+    /// On one core, more than browsers send over WebRTC; the CLI compresses
+    /// on four, which beats iroh on a 2.5 Gbit/s link.
+    const MIN_MIB_PER_SEC: f64 = 150.0;
+
+    /// Lorem ipsum in random order, which zstd shrinks a few times.
+    fn text(len: usize) -> Vec<u8> {
+        let words: Vec<_> = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua enim ad minim veniam quis nostrud exercitation ullamco laboris nisi aliquip ex ea commodo consequat duis aute irure in reprehenderit voluptate velit esse cillum fugiat nulla pariatur excepteur sint occaecat cupidatat non proident sunt culpa qui officia deserunt mollit anim id est laborum"
+            .split(' ')
+            .collect();
+        let mut state = 0x2545_F491u32;
+        let mut out = Vec::with_capacity(len + 16);
+        while out.len() < len {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            out.extend_from_slice(words[state as usize % words.len()].as_bytes());
+            out.push(b' ');
+        }
+        out.truncate(len);
+        out
+    }
+
+    fn noise(len: usize) -> Vec<u8> {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        (0..len / 8)
+            .flat_map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()
+            })
+            .collect()
+    }
+
+    /// MiB/s of encoding then decoding `data` a block at a time.
+    fn rates(data: &[u8]) -> (f64, f64, f64) {
+        let start = Instant::now();
+        let blocks: Vec<_> = data
+            .chunks(MAX_BLOCK_BYTES)
+            .map(|block| encode(block, true))
+            .collect();
+        let encode_rate = data.len() as f64 / MIB / start.elapsed().as_secs_f64();
+        let wire: usize = blocks.iter().map(Vec::len).sum();
+
+        let start = Instant::now();
+        let mut decoder = BlockDecoder::default();
+        let mut out = 0;
+        for block in &blocks {
+            decoder.push(block);
+            out += decoder.next_block().unwrap().unwrap().len();
+        }
+        let decode_rate = data.len() as f64 / MIB / start.elapsed().as_secs_f64();
+        assert_eq!(out, data.len());
+        (encode_rate, decode_rate, data.len() as f64 / wire as f64)
+    }
+
+    #[test]
+    #[ignore = "timing: cargo test --release -p fsend-proto -- --ignored"]
+    fn compression_keeps_up_with_fast_links() {
+        for (name, data) in [("text", text(256 << 20)), ("noise", noise(256 << 20))] {
+            let (encode, decode, ratio) = rates(&data);
+            println!(
+                "{name}: encode {encode:.0} MiB/s, decode {decode:.0} MiB/s, ratio {ratio:.2}"
+            );
+            assert!(
+                encode >= MIN_MIB_PER_SEC,
+                "{name}: encode {encode:.0} MiB/s"
+            );
+            assert!(
+                decode >= MIN_MIB_PER_SEC,
+                "{name}: decode {decode:.0} MiB/s"
+            );
+        }
+    }
+}

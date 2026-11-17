@@ -1,8 +1,9 @@
-//! Throughput of a cli transfer over both iroh and WebRTC.
-//!
-//!     cargo bench
-//!     FSEND_BENCH_MIB=1024 FSEND_BENCH_RUNS=5 cargo bench
-//!     cargo bench -- webrtc
+// Throughput of a CLI transfer over iroh and WebRTC:
+//
+//     cargo bench
+//     FSEND_BENCH_MIB=1024 FSEND_BENCH_RUNS=5 cargo bench
+//     cargo bench -- webrtc
+//     FSEND_BENCH_ZSTD=0 cargo bench
 
 use std::future::Future;
 use std::io::Write;
@@ -13,9 +14,10 @@ use std::thread;
 use std::time::Instant;
 
 use fsend_cli::iroh::IrohTransfer;
-use fsend_cli::relay::ConnectionInfo;
-use fsend_cli::transfer::{ReceiveArgs, SendArgs, Transport, receive_files, send_files};
+use fsend_cli::transfer::{Event, Transport, build_offer, receive_files, send_files};
 use fsend_cli::webrtc::{WebRtcConfig, WebRtcTransfer};
+use fsend_proto::pairing::ConnectionInfo;
+use fsend_proto::peer::resume::ConflictPolicy;
 use iroh::Endpoint;
 use iroh::endpoint::presets;
 
@@ -48,24 +50,22 @@ fn write_payload(path: &Path, bytes: u64) {
     file.flush().unwrap();
 }
 
+/// Whether the sender tries to compress.
+fn compress() -> bool {
+    env_or("FSEND_BENCH_ZSTD", 1) != 0
+}
+
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().unwrap()
 }
 
 fn send_harness(payload: PathBuf, transfer: impl Future<Output = Box<dyn Transport>>) {
     runtime().block_on(async {
+        let outgoing = build_offer(&[payload]).expect("offer");
         let mut transfer = transfer.await;
-        send_files(
-            transfer.as_mut(),
-            SendArgs {
-                files: vec![payload],
-            },
-            &mut |_| {},
-            &mut || {},
-            &mut |_| {},
-        )
-        .await
-        .expect("send");
+        send_files(transfer.as_mut(), &outgoing, compress(), &mut |_| {})
+            .await
+            .expect("send");
     });
 }
 
@@ -80,10 +80,13 @@ fn receive_harness(
         let out_dir = out.clone();
         receive_files(
             transfer.as_mut(),
-            ReceiveArgs { resume: false },
-            &mut |_| started = Some(Instant::now()),
             &mut |_| Some(out_dir.clone()),
-            &mut |_| {},
+            &mut |_, _| ConflictPolicy::Replace,
+            &mut |event| {
+                if matches!(event, Event::Started { .. }) {
+                    started = Some(Instant::now());
+                }
+            },
         )
         .await
         .expect("receive");
@@ -102,17 +105,19 @@ fn loopback_info(endpoint: &Endpoint) -> ConnectionInfo {
             } else {
                 Ipv6Addr::LOCALHOST.into()
             };
-            SocketAddr::new(ip, bound.port()).to_string()
+            SocketAddr::new(ip, bound.port())
         })
         .collect();
     ConnectionInfo::Iroh {
         node_id: endpoint.id().to_string(),
         addrs,
+        relays: vec![],
     }
 }
 
 fn bench_iroh(payload: &Path, out: &Path, bytes: u64) -> f64 {
     let (addr_tx, addr_rx) = mpsc::channel();
+    let (peer_tx, peer_rx) = mpsc::channel();
 
     let sender = thread::spawn({
         let payload = payload.to_path_buf();
@@ -120,7 +125,8 @@ fn bench_iroh(payload: &Path, out: &Path, bytes: u64) -> f64 {
             send_harness(payload, async {
                 let endpoint = IrohTransfer::bind(presets::Minimal).await.unwrap();
                 addr_tx.send(loopback_info(&endpoint)).unwrap();
-                Box::new(IrohTransfer::accept(endpoint).await.unwrap()) as Box<dyn Transport>
+                let peer = peer_rx.recv().unwrap();
+                Box::new(IrohTransfer::accept(endpoint, &peer).await.unwrap()) as Box<dyn Transport>
             })
         }
     });
@@ -129,8 +135,10 @@ fn bench_iroh(payload: &Path, out: &Path, bytes: u64) -> f64 {
         move || {
             receive_harness(out, bytes, async {
                 let endpoint = IrohTransfer::bind(presets::Minimal).await.unwrap();
+                peer_tx.send(loopback_info(&endpoint)).unwrap();
                 let peer = addr_rx.recv().unwrap();
-                Box::new(IrohTransfer::connect(endpoint, peer).await.unwrap()) as Box<dyn Transport>
+                Box::new(IrohTransfer::connect(endpoint, &peer).await.unwrap())
+                    as Box<dyn Transport>
             })
         }
     });
@@ -143,7 +151,7 @@ fn bench_iroh(payload: &Path, out: &Path, bytes: u64) -> f64 {
 fn bench_webrtc(payload: &Path, out: &Path, bytes: u64) -> f64 {
     let config = WebRtcConfig {
         stun_servers: vec![],
-        bind_addrs: vec!["127.0.0.1:0".into()],
+        bind_addrs: vec!["127.0.0.1:0".parse().unwrap()],
         loopback: true,
         ice_timeouts: None,
     };

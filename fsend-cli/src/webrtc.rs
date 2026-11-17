@@ -1,44 +1,56 @@
 use std::future::Future;
 use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use rtc::peer_connection::configuration::setting_engine::SctpMaxMessageSize;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Notify, mpsc, watch};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::io::StreamReader;
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelState};
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder,
     RTCIceGatheringState, RTCIceServer, RTCPeerConnectionState, RTCSessionDescription,
-    SettingEngine,
+    SettingEngineBuilder,
 };
 use webrtc::runtime::TokioRuntime;
 
 use crate::transfer::*;
+use fsend_proto::peer::limits::RECV_WINDOW;
 
-pub const DEFAULT_STUN_SERVERS: &[&str] = &[
+pub(crate) const DEFAULT_STUN_SERVERS: &[&str] = &[
     "stun:stun.l.google.com:19302",
     "stun:stun1.l.google.com:19302",
 ];
 
-pub const DEFAULT_BIND_ADDRS: &[&str] = &["0.0.0.0:0", "[::]:0"];
-pub const MAX_MESSAGE_BYTES: usize = 16384;
+pub(crate) const DEFAULT_BIND_ADDRS: [SocketAddr; 2] = [
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+    SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+];
+/// Largest data channel message sent: every peer takes it, and Chromium takes it fastest.
+pub(crate) const MAX_MESSAGE_BYTES: usize = 16384;
+/// Largest data channel message taken: browsers send larger messages faster.
+const MAX_INCOMING_MESSAGE_BYTES: u32 = 256 * 1024;
 
 /// Per-channel send buffer.
 const MAX_BUFFERED_BYTES: usize = 1024 * 1024;
+/// Received bytes a channel queues; the peer protocol's window keeps a well-behaved peer below it.
+const MAX_QUEUED_BYTES: usize = 2 * RECV_WINDOW as usize;
 const ICE_GATHERING_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct WebRtcConfig {
     pub stun_servers: Vec<String>,
     /// Local UDP addresses to bind.
-    pub bind_addrs: Vec<String>,
-    /// If loopback candidates are offered.
+    pub bind_addrs: Vec<SocketAddr>,
+    /// Whether to offer loopback candidates.
     pub loopback: bool,
     /// ICE `(disconnected, failed, keep-alive)` timeouts.
     /// `None` keeps the webrtc crate defaults.
@@ -49,7 +61,7 @@ impl Default for WebRtcConfig {
     fn default() -> Self {
         Self {
             stun_servers: DEFAULT_STUN_SERVERS.iter().map(|s| s.to_string()).collect(),
-            bind_addrs: DEFAULT_BIND_ADDRS.iter().map(|s| s.to_string()).collect(),
+            bind_addrs: DEFAULT_BIND_ADDRS.to_vec(),
             loopback: false,
             ice_timeouts: None,
         }
@@ -96,7 +108,9 @@ struct DcStream {
     dc: Arc<dyn DataChannel>,
     link: Link,
     opened: Arc<Notify>,
-    reader: StreamReader<ReceiverStream<io::Result<Bytes>>, Bytes>,
+    reader: StreamReader<UnboundedReceiverStream<io::Result<Bytes>>, Bytes>,
+    /// Bytes received but not read yet.
+    queued: Arc<AtomicUsize>,
     /// The send in progress.
     inflight: Option<Pin<Box<dyn Future<Output = io::Result<()>> + Send>>>,
 }
@@ -108,11 +122,14 @@ impl DcStream {
         link_tx: Arc<watch::Sender<LinkState>>,
         link: Link,
     ) -> Self {
-        let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(256);
+        // The poller must never wait on the reader: a blocked poller stalls the channel for good.
+        let (tx, rx) = mpsc::unbounded_channel::<io::Result<Bytes>>();
         let opened = Arc::new(Notify::new());
+        let queued = Arc::new(AtomicUsize::new(0));
 
         let poller = dc.clone();
         let opened_tx = opened.clone();
+        let queued_tx = queued.clone();
         let mut link_rx = link.clone();
         tokio::spawn(async move {
             let label = poller.label().await.unwrap_or_default();
@@ -126,7 +143,12 @@ impl DcStream {
                 match event {
                     Some(DataChannelEvent::OnOpen) => opened_tx.notify_one(),
                     Some(DataChannelEvent::OnMessage(msg)) => {
-                        if tx.send(Ok(msg.data.freeze())).await.is_err() {
+                        let len = msg.data.len();
+                        if queued_tx.fetch_add(len, Ordering::Relaxed) + len > MAX_QUEUED_BYTES {
+                            mark_closed(&link_tx, format!("{label} channel overrun by the peer"));
+                            break;
+                        }
+                        if tx.send(Ok(msg.data.freeze())).is_err() {
                             return;
                         }
                     }
@@ -144,14 +166,15 @@ impl DcStream {
                     }
                 }
             }
-            let _ = tx.send(Err(lost(closed(&mut link_rx).await))).await;
+            let _ = tx.send(Err(lost(closed(&mut link_rx).await)));
         });
 
         Self {
             dc,
             link,
             opened,
-            reader: StreamReader::new(ReceiverStream::new(rx)),
+            reader: StreamReader::new(UnboundedReceiverStream::new(rx)),
+            queued,
             inflight: None,
         }
     }
@@ -174,7 +197,11 @@ impl AsyncRead for DcStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.reader).poll_read(cx, buf)
+        let before = buf.filled().len();
+        std::task::ready!(Pin::new(&mut self.reader).poll_read(cx, buf))?;
+        let read = buf.filled().len() - before;
+        self.queued.fetch_sub(read, Ordering::Relaxed);
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -279,11 +306,14 @@ impl WebRtcTransfer {
         let link_tx = Arc::new(link_tx);
         let gathered = Arc::new(Notify::new());
 
-        let mut settings = SettingEngine::default();
-        settings.set_include_loopback_candidate(config.loopback);
+        let mut settings = SettingEngineBuilder::new()
+            .with_include_loopback_candidate(config.loopback)
+            .with_sctp_max_message_size(SctpMaxMessageSize::Bounded(MAX_INCOMING_MESSAGE_BYTES));
         if let Some((disconnected, failed, keep_alive)) = config.ice_timeouts {
-            settings.set_ice_timeouts(Some(disconnected), Some(failed), Some(keep_alive));
+            settings =
+                settings.with_ice_timeouts(Some(disconnected), Some(failed), Some(keep_alive));
         }
+        let settings = settings.build();
 
         let ice_servers = if config.stun_servers.is_empty() {
             vec![]
@@ -434,8 +464,8 @@ impl WebRtcTransfer {
 
 #[async_trait]
 impl Transport for WebRtcTransfer {
-    fn connection_type_name(&self) -> String {
-        "WebRTC".into()
+    fn connection_kind(&self) -> ConnectionKind {
+        ConnectionKind::WebRtc
     }
 
     async fn control(&mut self) -> Result<Box<dyn ByteStream>, TransferError> {
@@ -454,7 +484,7 @@ impl Transport for WebRtcTransfer {
         Ok(Box::new(stream))
     }
 
-    /// A remote close arrives as a disconnect.
+    /// Always Ok: WebRTC cannot tell a hang-up from a lost link.
     async fn closed(&mut self) -> Result<(), TransferError> {
         let reason = closed(&mut self.link).await;
         tracing::debug!("peer hung up: {reason}");

@@ -1,326 +1,381 @@
+use std::time::Duration;
+
+use colored::Colorize;
+use fsend_proto::{
+    code::Code,
+    pairing::{Channel, ConnectionInfo, PairingError, Pake, Role, Sealed, Signal},
+    relay::{ClientMessage, ErrorCode, PATH, ServerMessage, Transport, VERSION},
+};
 use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio::{net::TcpStream, time::timeout};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+use url::Url;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Protocol {
-    WebRtc,
-    Iroh,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "type")]
-pub enum ConnectionInfo {
-    WebRtc {
-        sdp: String,
-        ice_candidates: Vec<String>,
-    },
-    Iroh {
-        node_id: String,
-        addrs: Vec<String>,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CreateSessionRequest {
-    capabilities: Vec<Protocol>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct JoinSessionRequest {
-    code: String,
-    capabilities: Vec<Protocol>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ExchangeRequest {
-    connection_info: ConnectionInfo,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "type")]
-enum ClientMessage {
-    CreateSession(CreateSessionRequest),
-    JoinSession(JoinSessionRequest),
-    Exchange(ExchangeRequest),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CreateSessionAnswer {
-    code: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct JoinSessionAnswer {
-    protocol: Protocol,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PeerJoinedAnswer {
-    protocol: Protocol,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ExchangeAnswer {
-    connection_info: ConnectionInfo,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ErrorAnswer {
-    message: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "type")]
-enum ServerMessage {
-    CreateSession(CreateSessionAnswer),
-    JoinSession(JoinSessionAnswer),
-    PeerJoined(PeerJoinedAnswer),
-    Exchange(ExchangeAnswer),
-    Error(ErrorAnswer),
-}
+/// For connecting and for each reply of the relay.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// For each signal from the peer; the relay gives the two sides a minute.
+pub(crate) const PEER_TIMEOUT: Duration = Duration::from_secs(60);
+/// In order of preference.
+pub(crate) const TRANSPORTS: [Transport; 2] = [Transport::Iroh, Transport::Webrtc];
+pub(crate) const APP: &str = concat!("fsend-cli ", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Error)]
 pub enum RelayError {
-    #[error("websocket error: {0}")]
+    #[error("could not reach the relay: {0}")]
+    Connect(tokio_tungstenite::tungstenite::Error),
+    #[error("timed out connecting to the relay")]
+    ConnectTimeout,
+    #[error("relay connection: {0}")]
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
-    #[error("json error: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error("relay error: {0}")]
-    Relay(String),
-    #[error("unexpected message from relay")]
-    UnexpectedMessage,
-    #[error("connection closed")]
-    ConnectionClosed,
+    #[error("the relay connection closed")]
+    Closed,
+    #[error("timed out waiting for the relay or the other side")]
+    Timeout,
+    #[error("relay error ({code:?}): {message}")]
+    Relay { code: ErrorCode, message: String },
+    #[error("pairing failed: {0}")]
+    Pairing(#[from] PairingError),
+    #[error("protocol error: {0}")]
+    Protocol(&'static str),
 }
 
-type WsStream =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
-pub struct RelayClient {
-    ws: WsStream,
-}
-
-impl RelayClient {
-    pub async fn connect(relay_url: &str) -> Result<Self, RelayError> {
-        let (ws, _) = connect_async(relay_url).await?;
-        Ok(Self { ws })
-    }
-
-    async fn send(&mut self, msg: &ClientMessage) -> Result<(), RelayError> {
-        let text = serde_json::to_string(msg)?;
-        self.ws.send(Message::Text(text.into())).await?;
-        Ok(())
-    }
-
-    async fn recv(&mut self) -> Result<ServerMessage, RelayError> {
-        loop {
-            match self.ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let msg: ServerMessage = serde_json::from_str(&text)?;
-                    return Ok(msg);
+impl RelayError {
+    /// A message for the errors a user can act on.
+    pub fn user_error(&self) -> Option<String> {
+        let message = match self {
+            Self::Connect(_) | Self::ConnectTimeout | Self::Timeout => self.to_string(),
+            Self::Pairing(PairingError::WrongCode) => {
+                "the codes did not match. A code works only once, so start a new session and try again.".into()
+            }
+            Self::Relay { code, .. } => match code {
+                ErrorCode::NotFound => {
+                    "no session with this code. Check the code; a code works only once.".into()
                 }
-                Some(Ok(Message::Close(_))) | None => return Err(RelayError::ConnectionClosed),
-                Some(Err(e)) => return Err(RelayError::WebSocket(e)),
-                _ => continue,
+                ErrorCode::Expired => "the code expired. Start a new session.".into(),
+                ErrorCode::Version => {
+                    "the relay speaks another protocol version. Update fsend.".into()
+                }
+                ErrorCode::Busy => "the relay is busy. Try again later.".into(),
+                ErrorCode::PeerLeft => "the other side left.".into(),
+                ErrorCode::NoCommonTransport => {
+                    "the two sides have no connection type in common. Update fsend on both sides.".into()
+                }
+                ErrorCode::Protocol => return None,
+            },
+            Self::WebSocket(_) | Self::Closed | Self::Pairing(_) | Self::Protocol(_) => {
+                return None;
+            }
+        };
+        Some(format!("{} {message}", "error:".red()))
+    }
+}
+
+type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// The relay connection once both sides proved they hold the same code.
+pub struct Relay {
+    ws: WsStream,
+    channel: Channel,
+    pub transport: Transport,
+}
+
+/// Creates a session at the relay at `base_url` and pairs with whoever joins
+/// it; `show_code` gets the code for the receiver.
+pub async fn pair_as_sender(
+    base_url: &Url,
+    show_code: impl FnOnce(&Code),
+) -> Result<Relay, RelayError> {
+    let mut ws = connect(base_url).await?;
+    send(
+        &mut ws,
+        &ClientMessage::Create {
+            version: VERSION,
+            transports: TRANSPORTS.to_vec(),
+        },
+    )
+    .await?;
+    let ServerMessage::Created {
+        nameplate,
+        expires_in,
+    } = recv_message(&mut ws, CONNECT_TIMEOUT).await?
+    else {
+        return Err(RelayError::Protocol("expected created"));
+    };
+    let code = Code::with_random_password(&nameplate);
+    show_code(&code);
+
+    let wait = Duration::from_secs(expires_in.into()) + CONNECT_TIMEOUT;
+    let transport = recv_paired(&mut ws, wait).await?;
+    handshake(ws, &code, Role::Sender, transport).await
+}
+
+/// Joins the session of `code` at the relay at `base_url`.
+pub async fn pair_as_receiver(base_url: &Url, code: &Code) -> Result<Relay, RelayError> {
+    let mut ws = connect(base_url).await?;
+    send(
+        &mut ws,
+        &ClientMessage::Join {
+            version: VERSION,
+            nameplate: code.nameplate(),
+            transports: TRANSPORTS.to_vec(),
+        },
+    )
+    .await?;
+    let transport = recv_paired(&mut ws, CONNECT_TIMEOUT).await?;
+    handshake(ws, code, Role::Receiver, transport).await
+}
+
+/// SPAKE2, then each side's sealed confirm proves both used the same code.
+async fn handshake(
+    mut ws: WsStream,
+    code: &Code,
+    role: Role,
+    transport: Transport,
+) -> Result<Relay, RelayError> {
+    let (pake, message) = Pake::start(code);
+    send_signal(&mut ws, Signal::Pake(message)).await?;
+    let Signal::Pake(peer_message) = recv_signal(&mut ws).await? else {
+        return Err(PairingError::UnexpectedSignal.into());
+    };
+    let mut channel = pake.finish(&peer_message, role)?;
+
+    let confirm = Sealed::Confirm { app: APP.into() };
+    send_signal(&mut ws, Signal::Sealed(channel.seal(&confirm))).await?;
+    let Signal::Sealed(peer_confirm) = recv_signal(&mut ws).await? else {
+        return Err(PairingError::UnexpectedSignal.into());
+    };
+    let Sealed::Confirm { app } = channel.open(&peer_confirm)? else {
+        return Err(RelayError::Protocol("expected a confirm message"));
+    };
+    tracing::info!("paired with {app} via {transport:?}");
+    Ok(Relay {
+        ws,
+        channel,
+        transport,
+    })
+}
+
+impl Relay {
+    pub async fn send_connection(&mut self, info: ConnectionInfo) -> Result<(), RelayError> {
+        let sealed = self.channel.seal(&Sealed::Connection { info });
+        send_signal(&mut self.ws, Signal::Sealed(sealed)).await
+    }
+
+    pub async fn connection(&mut self) -> Result<ConnectionInfo, RelayError> {
+        let Signal::Sealed(sealed) = recv_signal(&mut self.ws).await? else {
+            return Err(PairingError::UnexpectedSignal.into());
+        };
+        match self.channel.open(&sealed)? {
+            Sealed::Connection { info } => Ok(info),
+            Sealed::Confirm { .. } => Err(RelayError::Protocol("repeated confirm message")),
+        }
+    }
+}
+
+/// Connects to the relay at `base_url` (`/relay` is appended).
+async fn connect(base_url: &Url) -> Result<WsStream, RelayError> {
+    let mut url = base_url.clone();
+    url.set_path(&format!("{}{PATH}", url.path().trim_end_matches('/')));
+    let (ws, _) = timeout(CONNECT_TIMEOUT, connect_async(url.as_str()))
+        .await
+        .map_err(|_| RelayError::ConnectTimeout)?
+        .map_err(RelayError::Connect)?;
+    Ok(ws)
+}
+
+async fn send(ws: &mut WsStream, message: &ClientMessage) -> Result<(), RelayError> {
+    let text = serde_json::to_string(message).expect("client messages serialize");
+    Ok(ws.send(Message::text(text)).await?)
+}
+
+async fn send_signal(ws: &mut WsStream, signal: Signal) -> Result<(), RelayError> {
+    Ok(ws.send(Message::binary(signal.encode())).await?)
+}
+
+enum Frame {
+    Message(ServerMessage),
+    Signal(Signal),
+}
+
+/// The next relay message or peer signal within `wait`; a relay error fails.
+async fn recv(ws: &mut WsStream, wait: Duration) -> Result<Frame, RelayError> {
+    let next = async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => match serde_json::from_str(&text) {
+                    Ok(ServerMessage::Error { code, message }) => {
+                        return Err(RelayError::Relay { code, message });
+                    }
+                    Ok(message) => return Ok(Frame::Message(message)),
+                    Err(_) => return Err(RelayError::Protocol("invalid relay message")),
+                },
+                Some(Ok(Message::Binary(data))) => {
+                    let signal = Signal::decode(&data).ok_or(PairingError::UnexpectedSignal)?;
+                    return Ok(Frame::Signal(signal));
+                }
+                Some(Ok(Message::Close(_))) | None => return Err(RelayError::Closed),
+                Some(Ok(_)) => {}
+                Some(Err(error)) => return Err(error.into()),
             }
         }
+    };
+    timeout(wait, next).await.map_err(|_| RelayError::Timeout)?
+}
+
+async fn recv_message(ws: &mut WsStream, wait: Duration) -> Result<ServerMessage, RelayError> {
+    match recv(ws, wait).await? {
+        Frame::Message(message) => Ok(message),
+        Frame::Signal(_) => Err(PairingError::UnexpectedSignal.into()),
     }
+}
 
-    pub async fn create_session(
-        &mut self,
-        capabilities: Vec<Protocol>,
-    ) -> Result<String, RelayError> {
-        self.send(&ClientMessage::CreateSession(CreateSessionRequest {
-            capabilities,
-        }))
-        .await?;
-
-        match self.recv().await? {
-            ServerMessage::CreateSession(answer) => Ok(answer.code),
-            ServerMessage::Error(e) => Err(RelayError::Relay(e.message)),
-            _ => Err(RelayError::UnexpectedMessage),
-        }
+async fn recv_paired(ws: &mut WsStream, wait: Duration) -> Result<Transport, RelayError> {
+    match recv_message(ws, wait).await? {
+        ServerMessage::Paired { transport } => Ok(transport),
+        _ => Err(RelayError::Protocol("expected paired")),
     }
+}
 
-    pub async fn wait_for_peer(&mut self) -> Result<Protocol, RelayError> {
-        match self.recv().await? {
-            ServerMessage::PeerJoined(answer) => Ok(answer.protocol),
-            ServerMessage::Error(e) => Err(RelayError::Relay(e.message)),
-            _ => Err(RelayError::UnexpectedMessage),
-        }
-    }
-
-    pub async fn join_session(
-        &mut self,
-        code: String,
-        capabilities: Vec<Protocol>,
-    ) -> Result<Protocol, RelayError> {
-        self.send(&ClientMessage::JoinSession(JoinSessionRequest {
-            code,
-            capabilities,
-        }))
-        .await?;
-
-        match self.recv().await? {
-            ServerMessage::JoinSession(answer) => Ok(answer.protocol),
-            ServerMessage::Error(e) => Err(RelayError::Relay(e.message)),
-            _ => Err(RelayError::UnexpectedMessage),
-        }
-    }
-
-    pub async fn send_exchange(&mut self, info: ConnectionInfo) -> Result<(), RelayError> {
-        self.send(&ClientMessage::Exchange(ExchangeRequest {
-            connection_info: info,
-        }))
-        .await
-    }
-
-    pub async fn recv_exchange(&mut self) -> Result<ConnectionInfo, RelayError> {
-        match self.recv().await? {
-            ServerMessage::Exchange(answer) => Ok(answer.connection_info),
-            ServerMessage::Error(e) => Err(RelayError::Relay(e.message)),
-            _ => Err(RelayError::UnexpectedMessage),
-        }
+async fn recv_signal(ws: &mut WsStream) -> Result<Signal, RelayError> {
+    match recv(ws, PEER_TIMEOUT).await? {
+        Frame::Signal(signal) => Ok(signal),
+        Frame::Message(_) => Err(RelayError::Protocol("unexpected relay message")),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::TcpListener;
-    use tokio_tungstenite::accept_async;
+    use fsend_relay::Config;
+    use tokio::{net::TcpListener, sync::oneshot};
+
+    fn ws(listener: &TcpListener) -> Url {
+        Url::parse(&format!("ws://{}", listener.local_addr().unwrap())).unwrap()
+    }
+
+    async fn start_relay() -> Url {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = ws(&listener);
+        tokio::spawn(fsend_relay::serve(listener, Config::default()));
+        url
+    }
 
     fn iroh_info(id: &str) -> ConnectionInfo {
         ConnectionInfo::Iroh {
             node_id: id.into(),
-            addrs: vec!["10.0.0.1:1234".into()],
+            addrs: vec!["10.0.0.1:1234".parse().unwrap()],
+            relays: vec![],
         }
     }
 
-    /// What the relay does with each client message.
-    type Script = Box<dyn Fn(ClientMessage) -> Vec<Message> + Send + Sync>;
-
-    fn reply(msg: &ServerMessage) -> Message {
-        Message::Text(serde_json::to_string(msg).unwrap().into())
+    /// Pairs a sender with a receiver that uses `receiver_code(code)`.
+    async fn pair(
+        url: &Url,
+        receiver_code: impl FnOnce(Code) -> Code,
+    ) -> (Result<Relay, RelayError>, Result<Relay, RelayError>) {
+        let (code_tx, code_rx) = oneshot::channel();
+        tokio::join!(
+            pair_as_sender(url, |code| code_tx.send(code.clone()).unwrap()),
+            async {
+                let code = receiver_code(code_rx.await.unwrap());
+                pair_as_receiver(url, &code).await
+            }
+        )
     }
 
-    /// A relay that runs `script` for one client.
-    async fn mock_relay(script: Script) -> String {
+    #[tokio::test]
+    async fn both_sides_pair_through_the_relay_and_swap_connection_info() {
+        let url = start_relay().await;
+        let (sender, receiver) = pair(&url, |code| code).await;
+        let (mut sender, mut receiver) = (sender.unwrap(), receiver.unwrap());
+        assert_eq!(sender.transport, Transport::Iroh);
+        assert_eq!(receiver.transport, Transport::Iroh);
+
+        let (sent, received) = tokio::join!(
+            async {
+                sender.send_connection(iroh_info("sender")).await.unwrap();
+                sender.connection().await.unwrap()
+            },
+            async {
+                let info = receiver.connection().await.unwrap();
+                receiver
+                    .send_connection(iroh_info("receiver"))
+                    .await
+                    .unwrap();
+                info
+            }
+        );
+        assert_eq!(sent, iroh_info("receiver"));
+        assert_eq!(received, iroh_info("sender"));
+    }
+
+    #[tokio::test]
+    async fn a_wrong_code_fails_on_both_sides() {
+        let url = start_relay().await;
+        let (sender, receiver) =
+            pair(&url, |code| Code::new(&code.nameplate(), "000000").unwrap()).await;
+        for result in [sender, receiver] {
+            let err = result.err().unwrap();
+            assert!(
+                matches!(err, RelayError::Pairing(PairingError::WrongCode)),
+                "{err}"
+            );
+            assert!(err.user_error().unwrap().contains("did not match"));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_code_is_reported() {
+        let url = start_relay().await;
+        let code = "ZZZZ000000".parse().unwrap();
+        let err = pair_as_receiver(&url, &code).await.err().unwrap();
+        assert!(
+            err.user_error()
+                .unwrap()
+                .contains("no session with this code"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_relay_message_is_a_protocol_error() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+        let url = ws(&listener);
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut ws = accept_async(stream).await.unwrap();
-            while let Some(Ok(msg)) = ws.next().await {
-                let Message::Text(text) = msg else { continue };
-                let client: ClientMessage = serde_json::from_str(&text).unwrap();
-                for frame in script(client) {
-                    if ws.send(frame).await.is_err() {
-                        return;
-                    }
-                }
-            }
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = ws.next().await;
+            let _ = ws
+                .send(Message::text(r#"{"type":"motd","text":"hi"}"#))
+                .await;
+            let _ = ws.next().await;
         });
-        url
-    }
 
-    #[tokio::test]
-    async fn sender_flow_creates_a_session_and_exchanges_info() {
-        let url = mock_relay(Box::new(|msg| match msg {
-            ClientMessage::CreateSession(req) => {
-                assert_eq!(req.capabilities, [Protocol::Iroh, Protocol::WebRtc]);
-                // The relay answers with the code, then with the peer.
-                vec![
-                    reply(&ServerMessage::CreateSession(CreateSessionAnswer {
-                        code: "AB12CD34".into(),
-                    })),
-                    reply(&ServerMessage::PeerJoined(PeerJoinedAnswer {
-                        protocol: Protocol::Iroh,
-                    })),
-                ]
-            }
-            ClientMessage::Exchange(req) => {
-                assert_eq!(req.connection_info, iroh_info("sender"));
-                vec![reply(&ServerMessage::Exchange(ExchangeAnswer {
-                    connection_info: iroh_info("receiver"),
-                }))]
-            }
-            other => panic!("unexpected {other:?}"),
-        }))
-        .await;
-
-        let mut relay = RelayClient::connect(&url).await.unwrap();
-        let code = relay
-            .create_session(vec![Protocol::Iroh, Protocol::WebRtc])
-            .await
-            .unwrap();
-        assert_eq!(code, "AB12CD34");
-        assert_eq!(relay.wait_for_peer().await.unwrap(), Protocol::Iroh);
-        relay.send_exchange(iroh_info("sender")).await.unwrap();
-        assert_eq!(relay.recv_exchange().await.unwrap(), iroh_info("receiver"));
-    }
-
-    #[tokio::test]
-    async fn receiver_flow_joins_and_exchanges_info() {
-        let url = mock_relay(Box::new(|msg| match msg {
-            ClientMessage::JoinSession(req) => {
-                assert_eq!(req.code, "AB12CD34");
-                assert_eq!(req.capabilities, [Protocol::WebRtc]);
-                vec![
-                    reply(&ServerMessage::JoinSession(JoinSessionAnswer {
-                        protocol: Protocol::WebRtc,
-                    })),
-                    reply(&ServerMessage::Exchange(ExchangeAnswer {
-                        connection_info: ConnectionInfo::WebRtc {
-                            sdp: "v=0 offer".into(),
-                            ice_candidates: vec![],
-                        },
-                    })),
-                ]
-            }
-            ClientMessage::Exchange(req) => {
-                assert!(matches!(req.connection_info, ConnectionInfo::WebRtc { ref sdp, .. } if sdp == "v=0 answer"));
-                vec![]
-            }
-            other => panic!("unexpected {other:?}"),
-        }))
-        .await;
-
-        let mut relay = RelayClient::connect(&url).await.unwrap();
-        let protocol = relay
-            .join_session("AB12CD34".into(), vec![Protocol::WebRtc])
-            .await
-            .unwrap();
-        assert_eq!(protocol, Protocol::WebRtc);
-        let offer = relay.recv_exchange().await.unwrap();
-        assert!(matches!(offer, ConnectionInfo::WebRtc { ref sdp, .. } if sdp == "v=0 offer"));
-        relay
-            .send_exchange(ConnectionInfo::WebRtc {
-                sdp: "v=0 answer".into(),
-                ice_candidates: vec![],
-            })
-            .await
-            .unwrap();
+        let err = pair_as_sender(&url, |_| {}).await.err().unwrap();
+        assert!(matches!(err, RelayError::Protocol(_)), "{err}");
     }
 
     #[tokio::test]
     async fn a_relay_that_hangs_up_is_a_closed_connection() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+        let url = ws(&listener);
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut ws = accept_async(stream).await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
             let _ = ws.close(None).await;
         });
 
-        let mut relay = RelayClient::connect(&url).await.unwrap();
-        let err = relay.wait_for_peer().await.unwrap_err();
-        assert!(
-            matches!(err, RelayError::ConnectionClosed | RelayError::WebSocket(_)),
-            "{err}"
-        );
+        let err = pair_as_sender(&url, |_| {}).await.err().unwrap();
+        assert!(matches!(err, RelayError::Closed), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_relay_is_reported() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = ws(&listener);
+        drop(listener);
+        let result = pair_as_sender(&url, |_| {}).await;
+        assert!(matches!(result, Err(RelayError::Connect(_))));
     }
 }

@@ -1,142 +1,131 @@
-import { RELAY_URL } from "../../config";
-import { RelayClient } from "./relay";
+import { Relay } from "./relay";
 import {
-  createOfferer,
-  createAnswerer,
-  applyAnswer,
-  waitConnected,
-  watchDisconnect,
-  type DisconnectWatcher,
+    createOfferer,
+    createAnswerer,
+    applyAnswer,
+    waitConnected,
+    watchDisconnect,
 } from "./webrtc";
-import { createControlChannel, type ControlChannel } from "./control";
-import type {
-  SenderToReceiver,
-  ReceiverToSender,
-  ConnectionInfo,
-} from "../types";
+import { loadProto, parseCode, type ConnectionInfo } from "../proto";
 
-/// Live peer to peer session
-export interface Session<In, Out> {
-  control: ControlChannel<In, Out>;
-  dataChannel: RTCDataChannel;
-  pc: RTCPeerConnection;
-  peer: DisconnectWatcher;
-  /// Rejects the moment the peer disconnects
-  disconnected: Promise<never>;
-  close(): void;
+/// A live connection to the peer.
+export interface Link {
+    controlChannel: RTCDataChannel;
+    dataChannel: RTCDataChannel;
+    pc: RTCPeerConnection;
+    /// Rejects once the peer is gone.
+    disconnected: Promise<never>;
+    close(): void;
 }
 
-export type SenderSession = Session<ReceiverToSender, SenderToReceiver>;
-export type ReceiverSession = Session<SenderToReceiver, ReceiverToSender>;
-
-function exchange(sdp: string): ConnectionInfo {
-  return { type: "web_rtc", sdp, ice_candidates: [] };
+function webRtcInfo(sdp: string): ConnectionInfo {
+    return { type: "web_rtc", sdp };
 }
 
-function assemble<In, Out>(
-  relay: RelayClient,
-  pc: RTCPeerConnection,
-  controlChannel: RTCDataChannel,
-  dataChannel: RTCDataChannel,
-): Session<In, Out> {
-  const peer = watchDisconnect(pc, [controlChannel, dataChannel]);
-  return {
-    control: createControlChannel<In, Out>(controlChannel, peer.promise),
-    dataChannel,
-    pc,
-    peer,
-    disconnected: peer.promise,
-    close() {
-      peer.stop();
-      relay.close();
-      pc.close();
-    },
-  };
+function sdpOf(info: ConnectionInfo): string {
+    if (info.type !== "web_rtc") {
+        throw new Error("The peer sent connection details for another transport");
+    }
+    return info.sdp;
+}
+
+function assemble(
+    pc: RTCPeerConnection,
+    controlChannel: RTCDataChannel,
+    dataChannel: RTCDataChannel,
+): Link {
+    const watcher = watchDisconnect(pc, [controlChannel, dataChannel]);
+    return {
+        controlChannel,
+        dataChannel,
+        pc,
+        disconnected: watcher.promise,
+        close() {
+            watcher.stop();
+            pc.close();
+        },
+    };
 }
 
 export interface SenderSessionHooks {
-  onCode(code: string): void;
-  onWaitingPeer(): void;
-  onHandshaking(): void;
+    onCode(code: string, expiresInSecs: number): void;
+    onWaitingPeer(): void;
+    onHandshaking(): void;
+}
+
+/** Runs `connect`, closing `pc` if it fails or is cancelled; once connected, the transfer tells the peer instead. */
+async function settingUp<T>(
+    pc: RTCPeerConnection,
+    abort: AbortSignal,
+    connect: () => Promise<T>,
+): Promise<T> {
+    const closeOnAbort = () => pc.close();
+    abort.addEventListener("abort", closeOnAbort);
+    try {
+        return await connect();
+    } catch (err) {
+        pc.close();
+        throw err;
+    } finally {
+        abort.removeEventListener("abort", closeOnAbort);
+    }
 }
 
 export async function openSenderSession(
-  abort: AbortSignal,
-  hooks: SenderSessionHooks,
-): Promise<SenderSession | null> {
-  const relay = await RelayClient.connect(RELAY_URL);
-  if (abort.aborted) {
-    relay.close();
-    return null;
-  }
+    abort: AbortSignal,
+    hooks: SenderSessionHooks,
+): Promise<Link> {
+    await loadProto();
+    const relay = await Relay.connect(abort);
+    try {
+        await relay.pairAsSender((code, expiresInSecs) => {
+            hooks.onCode(code, expiresInSecs);
+            hooks.onWaitingPeer();
+        });
+        hooks.onHandshaking();
 
-  const code = await relay.createSession();
-  hooks.onCode(code);
-  hooks.onWaitingPeer();
-
-  await relay.waitForPeer();
-  if (abort.aborted) {
-    relay.close();
-    return null;
-  }
-  hooks.onHandshaking();
-
-  const { connection, offerSdp } = await createOfferer();
-  const { pc, controlChannel, dataChannel } = connection;
-  abort.addEventListener("abort", () => {
-    relay.close();
-    pc.close();
-  });
-
-  relay.sendExchange(exchange(offerSdp));
-  const peerInfo = await relay.recvExchange();
-  await applyAnswer(pc, peerInfo.sdp);
-  await waitConnected(pc, [controlChannel, dataChannel]);
-  if (abort.aborted) {
-    relay.close();
-    pc.close();
-    return null;
-  }
-
-  return assemble(relay, pc, controlChannel, dataChannel);
+        const { connection, offerSdp } = await createOfferer();
+        const { pc, controlChannel, dataChannel } = connection;
+        return await settingUp(pc, abort, async () => {
+            relay.sendConnection(webRtcInfo(offerSdp));
+            await applyAnswer(pc, sdpOf(await relay.connection()));
+            await waitConnected(pc, [controlChannel, dataChannel], abort);
+            return assemble(pc, controlChannel, dataChannel);
+        });
+    } finally {
+        relay.close();
+    }
 }
 
 export async function openReceiverSession(
-  code: string,
-  abort: AbortSignal,
-  hooks: { onHandshaking(): void },
-): Promise<ReceiverSession | null> {
-  const relay = await RelayClient.connect(RELAY_URL);
-  if (abort.aborted) {
-    relay.close();
-    return null;
-  }
+    code: string,
+    abort: AbortSignal,
+    hooks: { onHandshaking(): void },
+): Promise<Link> {
+    await loadProto();
+    const parsed = parseCode(code);
+    if ("error" in parsed) throw new Error(`Invalid code: ${parsed.message}`);
 
-  await relay.joinSession(code.toUpperCase());
+    const relay = await Relay.connect(abort);
+    try {
+        await relay.pairAsReceiver(parsed.code);
 
-  const senderInfo = await relay.recvExchange();
-  if (abort.aborted) {
-    relay.close();
-    return null;
-  }
-
-  const answerer = await createAnswerer(senderInfo.sdp);
-  const pc = answerer.pc;
-  abort.addEventListener("abort", () => {
-    relay.close();
-    pc.close();
-  });
-
-  relay.sendExchange(exchange(answerer.answerSdp));
-
-  const { controlChannel, dataChannel } = await answerer.channelsReady;
-  await waitConnected(pc, [controlChannel, dataChannel]);
-  if (abort.aborted) {
-    relay.close();
-    pc.close();
-    return null;
-  }
-  hooks.onHandshaking();
-
-  return assemble(relay, pc, controlChannel, dataChannel);
+        const answerer = await createAnswerer(sdpOf(await relay.connection()));
+        const { pc } = answerer;
+        return await settingUp(pc, abort, async () => {
+            relay.sendConnection(webRtcInfo(answerer.answerSdp));
+            // The channels only arrive once the peers connect, which may never happen.
+            const channels = answerer.channelsReady;
+            await waitConnected(
+                pc,
+                channels.then((c) => [c.controlChannel, c.dataChannel]),
+                abort,
+            );
+            const { controlChannel, dataChannel } = await channels;
+            hooks.onHandshaking();
+            return assemble(pc, controlChannel, dataChannel);
+        });
+    } finally {
+        relay.close();
+    }
 }

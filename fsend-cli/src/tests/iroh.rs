@@ -1,9 +1,9 @@
 use std::future::Future;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 
 use super::*;
-use crate::transfer::test_support::{Peers, suite};
+use crate::transfer::test_support::{Peers, transport_suite};
 
 async fn local_endpoint() -> Endpoint {
     IrohTransfer::bind(presets::Minimal).await.unwrap()
@@ -20,22 +20,23 @@ fn loopback_info(endpoint: &Endpoint) -> ConnectionInfo {
             } else {
                 Ipv6Addr::LOCALHOST.into()
             };
-            SocketAddr::new(ip, bound.port()).to_string()
+            SocketAddr::new(ip, bound.port())
         })
         .collect();
     ConnectionInfo::Iroh {
         node_id: endpoint.id().to_string(),
         addrs,
+        relays: vec![],
     }
 }
 
 async fn connected_pair() -> (IrohTransfer, IrohTransfer) {
     let sender = local_endpoint().await;
     let receiver = local_endpoint().await;
-    let info = loopback_info(&sender);
+    let (info, receiver_info) = (loopback_info(&sender), loopback_info(&receiver));
     let (sender, receiver) = tokio::join!(
-        IrohTransfer::accept(sender),
-        IrohTransfer::connect(receiver, info)
+        IrohTransfer::accept(sender, &receiver_info),
+        IrohTransfer::connect(receiver, &info)
     );
     (sender.unwrap(), receiver.unwrap())
 }
@@ -57,103 +58,43 @@ fn pair() -> Pin<Box<dyn Future<Output = Peers> + Send>> {
     })
 }
 
-// The behaviour every transport must have, shared with the WebRTC tests.
-#[tokio::test]
-async fn sends_a_single_file() {
-    suite::sends_a_single_file(pair).await
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "timing: cargo test --release -p fsend-cli -- --ignored"]
+async fn compression_is_no_bottleneck() {
+    crate::transfer::test_support::suite::compression_is_no_bottleneck(pair).await
 }
-#[tokio::test]
-async fn sends_an_empty_file() {
-    suite::sends_an_empty_file(pair).await
-}
-#[tokio::test]
-async fn sends_a_file_larger_than_the_buffers() {
-    suite::sends_a_file_larger_than_the_buffers(pair).await
-}
-#[tokio::test]
-async fn sends_a_directory_tree() {
-    suite::sends_a_directory_tree(pair).await
-}
-#[tokio::test]
-async fn sends_several_entries_at_once() {
-    suite::sends_several_entries_at_once(pair).await
-}
-#[tokio::test]
-async fn sends_the_current_directory() {
-    suite::sends_the_current_directory(pair).await
-}
-#[tokio::test]
-async fn receiver_can_decline() {
-    suite::receiver_can_decline(pair).await
-}
-#[tokio::test]
-async fn resumes_a_partial_file() {
-    suite::resumes_a_partial_file(pair).await
-}
-#[tokio::test]
-async fn resumes_a_partial_directory() {
-    suite::resumes_a_partial_directory(pair).await
-}
-#[tokio::test]
-async fn resume_skips_complete_files() {
-    suite::resume_skips_complete_files(pair).await
-}
-#[tokio::test]
-async fn resume_starts_over_when_the_local_file_is_larger() {
-    suite::resume_starts_over_when_the_local_file_is_larger(pair).await
-}
-#[tokio::test]
-async fn overwrite_ignores_partial_files() {
-    suite::overwrite_ignores_partial_files(pair).await
-}
-#[tokio::test]
-async fn overwrite_truncates_a_larger_stale_file() {
-    suite::overwrite_truncates_a_larger_stale_file(pair).await
-}
-#[tokio::test]
-async fn interrupted_by_the_receiver_then_resumed() {
-    suite::interrupted_by_the_receiver_then_resumed(pair).await
-}
-#[tokio::test]
-async fn interrupted_by_the_sender_then_resumed() {
-    suite::interrupted_by_the_sender_then_resumed(pair).await
-}
-#[tokio::test]
-async fn a_missing_file_fails_the_transfer() {
-    suite::a_missing_file_fails_the_transfer(pair).await
-}
-#[tokio::test]
-async fn receiver_rejects_another_protocol_version() {
-    suite::receiver_rejects_another_protocol_version(pair).await
-}
-#[tokio::test]
-async fn sender_stops_when_the_receiver_wants_another_version() {
-    suite::sender_stops_when_the_receiver_wants_another_version(pair).await
-}
-#[tokio::test]
-async fn unexpected_packets_are_errors() {
-    suite::unexpected_packets_are_errors(pair).await
-}
-#[tokio::test]
-async fn a_skip_list_of_the_wrong_length_is_rejected() {
-    suite::a_skip_list_of_the_wrong_length_is_rejected(pair).await
-}
-#[tokio::test]
-async fn packets_survive_the_wire() {
-    suite::packets_survive_the_wire(pair).await
-}
-#[tokio::test]
-async fn a_closed_peer_fails_the_control_stream() {
-    suite::a_closed_peer_fails_the_control_stream(pair).await
-}
+
+// The behaviour every transport must have.
+transport_suite!();
 
 // iroh specifics.
 
 #[tokio::test]
 async fn connection_over_loopback_is_direct() {
     let (sender, receiver) = connected_pair().await;
-    assert_eq!(sender.connection_type_name(), "Direct");
-    assert_eq!(receiver.connection_type_name(), "Direct");
+    assert_eq!(sender.connection_kind(), ConnectionKind::Direct);
+    assert_eq!(receiver.connection_kind(), ConnectionKind::Direct);
+}
+
+#[tokio::test]
+async fn only_the_paired_receiver_gets_the_connection() {
+    let sender = local_endpoint().await;
+    let (receiver, stranger) = (local_endpoint().await, local_endpoint().await);
+    let (info, receiver_info) = (loopback_info(&sender), loopback_info(&receiver));
+    let receiver_id = receiver.id();
+    let accepting = tokio::spawn(async move { IrohTransfer::accept(sender, &receiver_info).await });
+
+    // Someone who found the sender's address gets in first, and is turned away.
+    let stranger = IrohTransfer::connect(stranger, &info).await.unwrap();
+    assert!(matches!(
+        stranger.conn.closed().await,
+        ConnectionError::ApplicationClosed(close) if close.error_code == VarInt::from(CLOSE_ERR)
+    ));
+
+    let receiver = IrohTransfer::connect(receiver, &info).await.unwrap();
+    let sender = accepting.await.unwrap().unwrap();
+    assert_eq!(sender.conn.remote_id(), receiver_id);
+    assert_eq!(receiver.conn.remote_id(), sender.endpoint.id());
 }
 
 #[tokio::test]
@@ -183,13 +124,17 @@ fn connection_info_round_trips_addresses_and_relays() {
     );
 
     let info = IrohTransfer::connection_info_from_addr(&addr);
-    let ConnectionInfo::Iroh { node_id, addrs } = &info else {
+    let ConnectionInfo::Iroh {
+        node_id,
+        addrs,
+        relays,
+    } = &info
+    else {
         panic!("expected iroh info");
     };
     assert_eq!(node_id, &id.to_string());
-    assert_eq!(addrs.len(), 2);
-    assert!(addrs.contains(&ip.to_string()));
-    assert!(addrs.contains(&relay.to_string()));
+    assert_eq!(addrs, &[ip]);
+    assert_eq!(relays, &[relay.to_string()]);
 
     let back = IrohTransfer::addr_from_connection_info(&info).unwrap();
     assert_eq!(back, addr);
@@ -200,30 +145,25 @@ fn connection_info_ignores_what_it_cannot_parse() {
     let id = iroh::SecretKey::generate().public();
     let info = ConnectionInfo::Iroh {
         node_id: id.to_string(),
-        addrs: vec![
-            "10.0.0.1:1".into(),
-            "not an address".into(),
-            "[::1]:2".into(),
-        ],
+        addrs: vec!["10.0.0.1:1".parse().unwrap(), "[::1]:2".parse().unwrap()],
+        relays: vec!["not a url".into(), "https://relay.example.org./".into()],
     };
     let addr = IrohTransfer::addr_from_connection_info(&info).unwrap();
     assert_eq!(addr.id, id);
     assert_eq!(addr.ip_addrs().count(), 2);
-    assert_eq!(addr.relay_urls().count(), 0);
+    assert_eq!(addr.relay_urls().count(), 1);
 
     let bad_id = ConnectionInfo::Iroh {
         node_id: "zzz".into(),
         addrs: vec![],
+        relays: vec![],
     };
     assert!(matches!(
         IrohTransfer::addr_from_connection_info(&bad_id),
         Err(TransferError::NodeId(_))
     ));
 
-    let webrtc = ConnectionInfo::WebRtc {
-        sdp: String::new(),
-        ice_candidates: vec![],
-    };
+    let webrtc = ConnectionInfo::WebRtc { sdp: String::new() };
     assert!(matches!(
         IrohTransfer::addr_from_connection_info(&webrtc),
         Err(TransferError::UnexpectedConnectionInfo)

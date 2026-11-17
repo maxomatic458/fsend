@@ -6,23 +6,16 @@ import "solid-devtools";
 
 import App from "./App";
 
-const root = document.getElementById("root");
+const root = document.getElementById("root")!;
 
-if (import.meta.env.DEV && !(root instanceof HTMLElement)) {
-  throw new Error(
-    "Root element not found. Did you forget to add it to your index.html? Or maybe the id attribute got misspelled?",
-  );
-}
-
-// The prerendered markup is only there for crawlers and first paint; Solid
-// appends rather than replaces, so clear it before mounting.
-root!.textContent = "";
+// Solid appends, so clear the prerendered markup.
+root.textContent = "";
 
 render(
-  () => (
-    <MetaProvider>
-      <App />
-    </MetaProvider>
-  ),
-  root!,
+    () => (
+        <MetaProvider>
+            <App />
+        </MetaProvider>
+    ),
+    root,
 );

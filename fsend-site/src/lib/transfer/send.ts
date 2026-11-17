@@ -1,131 +1,238 @@
+import { CONCURRENT_FILES, MAX_BUFFERED_BYTES } from "../../config";
+import { openSenderSession, type Link } from "../transport/session";
+import { dataMessageBytes, getConnectionType } from "../transport/webrtc";
+import { buildOffer, entrySize, fingerprintOf, type Outgoing, type Source } from "../files/tree";
 import {
-  PROTO_VERSION,
-  DATA_CHUNK_BYTES,
-  MAX_BUFFERED_BYTES,
-} from "../../config";
-import { openSenderSession } from "../transport/session";
-import { getConnectionType } from "../transport/webrtc";
+    IDLE_TIMEOUT_MS,
+    MAX_BLOCK_BYTES,
+    MIN_RECV_WINDOW,
+    checkAccept,
+    checkLengths,
+    Progress,
+    encodeOffer,
+    loadProto,
+    presentBytes,
+    topEntries,
+    type AcceptedFile,
+    type Bytes,
+    type Entry,
+    type ReceiverMessage,
+} from "../proto";
 import {
-  buildFileTree,
-  flattenTree,
-  applySkip,
-  treeSizeBytes,
-  treeSkipBytes,
-} from "../files/tree";
-import { collectFiles } from "../files/source";
+    Peer,
+    TransferFailure,
+    type SenderPeer,
+    messageOf,
+    protocolError,
+    transferring,
+    unexpected,
+} from "./peer";
 import type { TransferListener } from "./events";
-import type {
-  SelectedEntry,
-  FileSendRecvTree,
-  SenderToReceiver,
-} from "../types";
+import { eachAtOnce } from "../parallel";
+import { createCodec } from "./codec";
+import type { SelectedEntry } from "../types";
+
+const RECEIVER_IDLE = "the receiver stopped responding";
+/// Blocks compressing while one is sent.
+const ENCODING_AHEAD = 3;
 
 export async function runSend(
-  entries: SelectedEntry[],
-  emit: TransferListener,
-  abort: AbortSignal,
+    entries: SelectedEntry[],
+    emit: TransferListener,
+    abort: AbortSignal,
 ): Promise<void> {
-  let session: Awaited<ReturnType<typeof openSenderSession>> = null;
+    let link: Link | null = null;
 
-  try {
-    const fileTree = await buildFileTree(entries);
-    const files = await collectFiles(entries);
-
-    session = await openSenderSession(abort, {
-      onCode: (code) => emit({ type: "code", code }),
-      onWaitingPeer: () => emit({ type: "waitingPeer" }),
-      onHandshaking: () => emit({ type: "handshaking" }),
-    });
-    if (!session) return;
-    const { control, dataChannel, peer, disconnected } = session;
-
-    // cosmetic: fetched in the background, ignored if it fails.
-    getConnectionType(session.pc)
-      .then((kind) => emit({ type: "connectionType", kind }))
-      .catch(() => {});
-
-    // handshake
-    await control.send({
-      type: "ConnRequest",
-      version: PROTO_VERSION,
-    } as SenderToReceiver);
-
-    const version = await control.next();
-    if (version.type === "WrongVersion") {
-      throw new Error(`Version mismatch: peer expects ${version.expected}`);
-    }
-    if (version.type !== "Ok") {
-      throw new Error("Unexpected response to version handshake");
-    }
-
-    // offer files
-    await control.send({
-      type: "FileInfo",
-      files: fileTree,
-    } as SenderToReceiver);
-    emit({ type: "waitingAccept" });
-
-    const answer = await control.next();
-    if (answer.type === "RejectFiles") {
-      throw new Error("Receiver rejected the files");
-    }
-    if (answer.type !== "AcceptFilesSkip") {
-      throw new Error("Unexpected response");
-    }
-
-    // data
-    const trees: FileSendRecvTree[] = [];
-    for (let i = 0; i < fileTree.length; i++) {
-      const tree = applySkip(fileTree[i], answer.files[i] ?? null);
-      if (tree) trees.push(tree);
-    }
-
-    const flat = flattenTree(trees);
-    emit({
-      type: "transferring",
-      entries: trees.map((t) => ({
-        name: t.name,
-        sizeBytes: treeSizeBytes(t),
-        skipBytes: treeSkipBytes(t),
-        isDir: t.type === "Dir",
-      })),
-    });
-
-    dataChannel.bufferedAmountLowThreshold = MAX_BUFFERED_BYTES / 2;
-
-    for (const { path, skipBytes, sizeBytes } of flat) {
-      const file = files.get(path);
-      if (!file) throw new Error(`File not found: ${path}`);
-
-      let sentBytes = skipBytes;
-      while (sentBytes < sizeBytes) {
-        if (abort.aborted) return;
-        if (peer.isDown()) throw new Error("Peer disconnected");
-
-        if (dataChannel.bufferedAmount > MAX_BUFFERED_BYTES) {
-          await Promise.race([
-            new Promise<void>((resolve) => {
-              dataChannel.onbufferedamountlow = () => resolve();
-            }),
-            disconnected,
-          ]);
+    try {
+        const outgoing = await buildOffer(entries);
+        await loadProto();
+        let offer: Bytes;
+        try {
+            offer = encodeOffer(outgoing.entries);
+        } catch (err) {
+            throw new Error(`Cannot send these files: ${messageOf(err)}`);
         }
 
-        const endBytes = Math.min(sentBytes + DATA_CHUNK_BYTES, sizeBytes);
-        dataChannel.send(await file.slice(sentBytes, endBytes).arrayBuffer());
-        emit({ type: "progress", bytes: endBytes - sentBytes });
-        sentBytes = endBytes;
-      }
+        link = await openSenderSession(abort, {
+            onCode: (code, expiresInSecs) => emit({ type: "code", code, expiresInSecs }),
+            onWaitingPeer: () => emit({ type: "waitingPeer" }),
+            onHandshaking: () => emit({ type: "handshaking" }),
+        });
+        const { dataChannel } = link;
+
+        // cosmetic: fetched in the background, ignored if it fails.
+        getConnectionType(link.pc)
+            .then((kind) => emit({ type: "connectionType", kind }))
+            .catch(() => {});
+
+        const peer = Peer.sender(link, abort);
+        const messageBytes = dataMessageBytes(link.pc);
+        await peer.explained(() => send(peer, dataChannel, messageBytes, outgoing, offer, emit));
+        emit({ type: "complete" });
+    } catch (err) {
+        if (!abort.aborted) emit({ type: "error", message: messageOf(err) });
+    } finally {
+        link?.close();
+    }
+}
+
+async function send(
+    peer: SenderPeer,
+    channel: RTCDataChannel,
+    messageBytes: number,
+    { entries, files: sources }: Outgoing,
+    offer: Bytes,
+    emit: TransferListener,
+): Promise<void> {
+    const window = await peer.hello("the receiver did not say hello in time");
+    if (window === undefined || window < MIN_RECV_WINDOW) {
+        throw protocolError("the receiver announced no usable window");
     }
 
-    // The receiver closes once it has consumed everything.
-    await disconnected.catch(() => {});
-    emit({ type: "complete" });
-  } catch (err: any) {
-    if (!abort.aborted) {
-      emit({ type: "error", message: err?.message ?? String(err) });
+    peer.sendFrame(offer);
+    emit({ type: "waitingAccept" });
+    let answer = await peer.next();
+    if (answer.type === "check") {
+        try {
+            checkLengths(entries, answer.files);
+        } catch (err) {
+            throw protocolError(messageOf(err));
+        }
+        const hashes = [];
+        for (const { id, len } of answer.files) {
+            hashes.push(await fingerprintOf(sources[id]!, len));
+        }
+        peer.send({ type: "hashes", hashes });
+        answer = await peer.next();
     }
-  } finally {
-    session?.close();
-  }
+    if (answer.type === "reject") {
+        throw new TransferFailure("The receiver rejected the files");
+    }
+    if (answer.type !== "accept") throw unexpected(answer);
+    const { files } = answer;
+    try {
+        checkAccept(entries, files);
+    } catch (err) {
+        throw protocolError(messageOf(err));
+    }
+    const [tops, topOf] = topEntries(entries);
+    emit(transferring(tops, presentBytes(entries, files)));
+
+    let sent = 0;
+    let acked = 0;
+    const ack = (message: ReceiverMessage) => {
+        if (message.type !== "ack") throw unexpected(message);
+        if (message.bytes < acked || message.bytes > sent) {
+            throw protocolError("an ack outside the bytes sent");
+        }
+        acked = message.bytes;
+    };
+
+    channel.bufferedAmountLowThreshold = MAX_BUFFERED_BYTES / 2;
+    const reader = new BlockReader(entries, sources, files);
+    const progress = new Progress(entries, files, topOf);
+    const codec = reader.done ? undefined : await createCodec();
+    try {
+        const encoding: { size: number; frame: Promise<Bytes> }[] = [];
+        while (!reader.done || encoding.length > 0) {
+            for (let m = peer.poll(); m; m = peer.poll()) ack(m);
+            while (encoding.length < ENCODING_AHEAD && !reader.done && sent - acked < window) {
+                const bytes = await reader.read(window - (sent - acked));
+                sent += bytes.length;
+                const frame = codec!.encode(bytes);
+                frame.catch(() => {});
+                encoding.push({ size: bytes.length, frame });
+            }
+            const next = encoding.shift();
+            if (!next) {
+                ack(await peer.next(IDLE_TIMEOUT_MS, RECEIVER_IDLE));
+                continue;
+            }
+            await sendBlock(next.size, await next.frame);
+        }
+    } finally {
+        codec?.close();
+    }
+
+    /** Sends a block of `size` file bytes, which count in proportion to its bytes sent. */
+    async function sendBlock(size: number, block: Bytes) {
+        let counted = 0;
+        for (let offset = 0; offset < block.length; offset += messageBytes) {
+            if (channel.bufferedAmount > MAX_BUFFERED_BYTES) {
+                await Promise.race([
+                    new Promise((resolve) => (channel.onbufferedamountlow = resolve)),
+                    peer.stopped,
+                ]);
+            }
+            const end = Math.min(offset + messageBytes, block.length);
+            channel.send(block.subarray(offset, end));
+            const now = Math.floor((size * end) / block.length);
+            for (const [entry, n] of progress.advance(now - counted)) {
+                emit({ type: "progress", entry, bytes: n });
+            }
+            counted = now;
+        }
+    }
+
+    for (;;) {
+        const message = await peer.next(IDLE_TIMEOUT_MS, RECEIVER_IDLE);
+        if (message.type === "done") return;
+        ack(message);
+    }
+}
+
+/** Reads the accepted bytes of the offered files in order, a block at a time. */
+class BlockReader {
+    /** Bytes still to read. */
+    private left: number;
+    private file = 0;
+    private position: number;
+
+    constructor(
+        private entries: Entry[],
+        private sources: (Source | null)[],
+        private files: AcceptedFile[],
+    ) {
+        this.left = files.reduce((n, { id, offset }) => n + entrySize(entries[id]) - offset, 0);
+        this.position = files[0]?.offset ?? 0;
+    }
+
+    get done(): boolean {
+        return this.left === 0;
+    }
+
+    /** Up to `max` (and a block's worth of) bytes, reading a few files at once. */
+    async read(max: number): Promise<Uint8Array> {
+        const length = Math.min(max, this.left, MAX_BLOCK_BYTES);
+        this.left -= length;
+        // Where each file's part of the block comes from and goes.
+        const slices: { source: Source; start: number; end: number; at: number }[] = [];
+        for (let filled = 0; filled < length;) {
+            const { id } = this.files[this.file];
+            const size = entrySize(this.entries[id]);
+            if (this.position === size) {
+                this.position = this.files[++this.file].offset;
+                continue;
+            }
+            const n = Math.min(size - this.position, length - filled);
+            const start = this.position;
+            slices.push({
+                source: this.sources[id]!,
+                start,
+                end: start + n,
+                at: filled,
+            });
+            filled += n;
+            this.position += n;
+        }
+        const sliceBytes = async ({ source, start, end }: (typeof slices)[0]) =>
+            new Uint8Array(await source.slice(start, end).arrayBuffer());
+        // Part of one file: its bytes are the block.
+        if (slices.length === 1) return sliceBytes(slices[0]);
+        const bytes = new Uint8Array(length);
+        await eachAtOnce(slices, CONCURRENT_FILES, async (slice) =>
+            bytes.set(await sliceBytes(slice), slice.at),
+        );
+        return bytes;
+    }
 }

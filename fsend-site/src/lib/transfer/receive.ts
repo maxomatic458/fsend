@@ -1,189 +1,317 @@
-import { PROTO_VERSION } from "../../config";
-import { openReceiverSession } from "../transport/session";
+import { CONCURRENT_FILES } from "../../config";
+import { openReceiverSession, type Link } from "../transport/session";
 import { getConnectionType } from "../transport/webrtc";
+import { entrySize, fingerprintOf } from "../files/tree";
 import {
-  flattenTree,
-  applySkip,
-  treeSizeBytes,
-  treeSkipBytes,
-} from "../files/tree";
-import type { TransferSink } from "./sinks";
+    ACK_INTERVAL_MS,
+    ACK_STEP,
+    HELLO_TIMEOUT_MS,
+    IDLE_TIMEOUT_MS,
+    RECV_WINDOW,
+    Progress,
+    acceptPlan,
+    filesToCheck,
+    planReceive,
+    presentBytes,
+    topEntries,
+    validateOffer,
+    type AcceptedFile,
+    type Bytes,
+    type CheckedFile,
+    type ConflictPolicy,
+    type Entry,
+    type Local,
+    type TopEntry,
+} from "../proto";
+import {
+    Peer,
+    TransferFailure,
+    type ReceiverPeer,
+    messageOf,
+    protocolError,
+    transferring,
+    unexpected,
+} from "./peer";
+import { NotEnoughRoom, type Asking, type TransferSink } from "./sinks";
 import type { TransferListener } from "./events";
-import type { FilesToSkip, FileSendRecvTree, ReceiverToSender } from "../types";
+import { createCodec, type BlockCodec } from "./codec";
 
-/// Receives a transfer into `sink`.
+const SENDER_IDLE = "the sender stopped sending";
+
+export interface ReceiveOptions {
+    /// Where the transfer goes instead if `sink` has no room for it.
+    fallback?: () => TransferSink;
+    /// Resolves once the user would rather not wait for the browser to allow more room.
+    skipAsking?: Promise<void>;
+}
+
+/// Receives a transfer into `sink`; files there that differ from the offer are handled by `policy`.
 export async function runReceive(
-  code: string,
-  sink: TransferSink,
-  resume: boolean,
-  emit: TransferListener,
-  abort: AbortSignal,
+    code: string,
+    sink: TransferSink,
+    policy: ConflictPolicy,
+    emit: TransferListener,
+    abort: AbortSignal,
+    options: ReceiveOptions = {},
 ): Promise<void> {
-  let session: Awaited<ReturnType<typeof openReceiverSession>> = null;
+    let link: Link | null = null;
+    // The sink in use, which the fallback may replace before anything is written.
+    let current = sink;
 
-  try {
-    emit({ type: "connecting" });
+    try {
+        emit({ type: "connecting" });
 
-    session = await openReceiverSession(code, abort, {
-      onHandshaking: () => emit({ type: "handshaking" }),
-    });
-    if (!session) return;
-    const { control, dataChannel, disconnected } = session;
+        link = await openReceiverSession(code, abort, {
+            onHandshaking: () => emit({ type: "handshaking" }),
+        });
 
-    getConnectionType(session.pc)
-      .then((kind) => emit({ type: "connectionType", kind }))
-      .catch(() => {});
+        getConnectionType(link.pc)
+            .then((kind) => emit({ type: "connectionType", kind }))
+            .catch(() => {});
 
-    // handshake
-    const request = await control.next();
-    if (request.type !== "ConnRequest") throw new Error("Expected ConnRequest");
-    if (request.version !== PROTO_VERSION) {
-      await control.send({ type: "WrongVersion", expected: PROTO_VERSION });
-      await control.flush();
-      throw new Error(
-        `Version mismatch: sender has ${request.version}, we need ${PROTO_VERSION}`,
-      );
+        const peer = Peer.receiver(link, abort);
+        const { entries, tops } = await peer.explained(() =>
+            receive(peer, sink, policy, emit, options, (next) => (current = next)),
+        );
+        link.close();
+
+        await current.finish(entries, tops, (percent) => emit({ type: "packing", percent }));
+        emit({ type: "complete" });
+    } catch (err) {
+        await current.abandon();
+        if (!abort.aborted) emit({ type: "error", message: messageOf(err) });
+    } finally {
+        link?.close();
     }
-    await control.send({ type: "Ok" } as ReceiverToSender);
+}
 
-    // Offer file info
-    const info = await control.next();
-    if (info.type !== "FileInfo") throw new Error("Expected FileInfo");
-    const offered = info.files;
+/** Returns the offer received, and its top-level entries. */
+async function receive(
+    peer: ReceiverPeer,
+    sink: TransferSink,
+    policy: ConflictPolicy,
+    emit: TransferListener,
+    { fallback, skipAsking }: ReceiveOptions,
+    use: (sink: TransferSink) => void,
+): Promise<{ entries: Entry[]; tops: TopEntry[] }> {
+    await peer.hello("the sender did not say hello in time", RECV_WINDOW);
+    const offer = await peer.next(HELLO_TIMEOUT_MS, "the sender did not make an offer in time");
+    if (offer.type !== "offer") throw unexpected(offer);
+    const { entries } = offer;
+    try {
+        validateOffer(entries);
+    } catch (err) {
+        throw new TransferFailure(`Invalid offer: ${messageOf(err)}`, {
+            code: "invalid_offer",
+            message: messageOf(err),
+        });
+    }
+    const [tops, topOf] = topEntries(entries);
 
     const accepted = await Promise.race([
-      new Promise<boolean>((resolve) => {
-        emit({
-          type: "offered",
-          files: offered,
-          accept: () => resolve(true),
-          reject: () => resolve(false),
-        });
-      }),
-      disconnected,
+        new Promise<boolean>((resolve) =>
+            emit({
+                type: "offered",
+                files: tops,
+                accept: () => resolve(true),
+                reject: () => resolve(false),
+            }),
+        ),
+        peer.stopped,
     ]);
-
     if (!accepted) {
-      await control.send({ type: "RejectFiles" } as ReceiverToSender);
-      await control.flush();
-      throw new Error("Transfer rejected");
+        peer.send({ type: "reject" });
+        await peer.goodbye();
+        throw new TransferFailure("Transfer rejected");
     }
 
-    // Resume negotiation
-    const skipInfo: (FilesToSkip | null)[] =
-      resume && sink.canResume
-        ? await sink.existing(offered)
-        : offered.map(() => null);
-
-    await control.send({
-      type: "AcceptFilesSkip",
-      files: skipInfo,
-    } as ReceiverToSender);
-
-    const trees: FileSendRecvTree[] = [];
-    for (let i = 0; i < offered.length; i++) {
-      const tree = applySkip(offered[i], skipInfo[i]);
-      if (tree) trees.push(tree);
-    }
-
-    const flat = flattenTree(trees);
-    emit({
-      type: "transferring",
-      entries: trees.map((t) => ({
-        name: t.name,
-        sizeBytes: treeSizeBytes(t),
-        skipBytes: treeSkipBytes(t),
-        isDir: t.type === "Dir",
-      })),
-    });
-
-    if (flat.length === 0) {
-      await sink.finish(offered);
-      emit({ type: "complete" });
-      return;
-    }
-
-    // data
-    let fileIdx = 0;
-    let writtenBytes = flat[0].skipBytes;
-
-    // Buffer chunks from the very first one
-    const queue: Uint8Array[] = [];
-    dataChannel.onmessage = (ev) => {
-      if (!(ev.data instanceof ArrayBuffer) || ev.data.byteLength === 0) return;
-      queue.push(new Uint8Array(ev.data));
+    let { plan, files } = await planFor(peer, sink, entries, tops, policy);
+    const asking: Asking = {
+        start: () => emit({ type: "askingStorage" }),
+        skipped: skipAsking ?? new Promise(() => {}),
     };
-
-    await sink.open(flat[0].path, flat[0].skipBytes);
-
-    const received = new Promise<void>((resolve, reject) => {
-      let draining = false;
-
-      /// Close finished files and open the next, returns true if the transfer is complete.
-      const advance = async () => {
-        while (
-          fileIdx < flat.length &&
-          writtenBytes >= flat[fileIdx].sizeBytes
-        ) {
-          await sink.closeFile();
-          fileIdx++;
-          if (fileIdx < flat.length) {
-            writtenBytes = flat[fileIdx].skipBytes;
-            await sink.open(flat[fileIdx].path, flat[fileIdx].skipBytes);
-          }
-        }
-        if (fileIdx >= flat.length) {
-          resolve();
-          return true;
-        }
-        return false;
-      };
-
-      const drain = async () => {
-        if (draining) return;
-        draining = true;
-        try {
-          // File that is empty or has been fully skipped (done)
-          if (await advance()) return;
-
-          while (queue.length > 0) {
-            const chunk = queue.shift()!;
-            if (fileIdx >= flat.length) break;
-            await sink.write(chunk);
-            writtenBytes += chunk.length;
-            emit({ type: "progress", bytes: chunk.length });
-            if (await advance()) return;
-          }
-        } catch (err) {
-          reject(err);
-        } finally {
-          draining = false;
-        }
-      };
-
-      dataChannel.onmessage = (ev) => {
-        if (!(ev.data instanceof ArrayBuffer) || ev.data.byteLength === 0)
-          return;
-        queue.push(new Uint8Array(ev.data));
-        drain();
-      };
-
-      drain();
-    });
-
-    await Promise.race([received, disconnected]);
-    session.peer.stop();
-    session.pc.close();
-
-    await sink.finish(offered, (percent) => emit({ type: "packing", percent }));
-    emit({ type: "complete" });
-  } catch (err: any) {
-    await sink.abandon();
-    if (!abort.aborted) {
-      emit({ type: "error", message: err?.message ?? String(err) });
+    try {
+        const remaining = files.reduce(
+            (n, { id, offset }) => n + entrySize(entries[id]) - offset,
+            0,
+        );
+        await Promise.race([sink.reserve(remaining, asking), peer.stopped]);
+    } catch (err) {
+        if (!(err instanceof NotEnoughRoom) || !fallback) throw err;
+        sink = fallback();
+        use(sink);
+        emit({ type: "heldInMemory" });
+        ({ plan, files } = await planFor(peer, sink, entries, tops, policy));
     }
-  } finally {
-    await sink.closeFile().catch(() => {});
-    session?.close();
-  }
+    // Before accepting, as the sender then waits for acks only so long.
+    for (const { id, offset } of files) {
+        if (offset > 0) {
+            await Promise.race([sink.reopen(entries[id].path, offset), peer.stopped]);
+        }
+    }
+    peer.send({ type: "accept", files });
+    emit(transferring(tops, presentBytes(entries, files)));
+    if (plan.conflicts.length > 0) {
+        const replaced =
+            policy === "replace"
+                ? plan.conflicts.filter((conflict) => conflict.replaceable).length
+                : 0;
+        emit({
+            type: "conflicts",
+            replaced,
+            skipped: plan.conflicts.length - replaced,
+        });
+    }
+
+    for (const id of plan.dirs) await sink.createDir(entries[id].path);
+    const codec = files.some(({ id, offset }) => entrySize(entries[id]) > offset)
+        ? await createCodec()
+        : undefined;
+    try {
+        await receiveData(peer, sink, entries, files, topOf, codec, emit);
+    } finally {
+        codec?.close();
+    }
+
+    peer.send({ type: "done" });
+    await peer.goodbye();
+    return { entries, tops };
+}
+
+/** What to receive into `sink`, given what it already holds. */
+async function planFor(
+    peer: ReceiverPeer,
+    sink: TransferSink,
+    entries: Entry[],
+    tops: TopEntry[],
+    policy: ConflictPolicy,
+) {
+    await sink.prepare(tops);
+    const local: Local[] = [];
+    for (const entry of entries) local.push(await sink.probe(entry));
+    const checked = filesToCheck(entries, local);
+    const verified = checked.length === 0 ? [] : await verify(peer, sink, entries, checked);
+    const plan = planReceive(entries, local, verified);
+    return { plan, files: acceptPlan(plan, policy) };
+}
+
+/** Writes the accepted files from the data stream into `sink`, acking as it goes. */
+async function receiveData(
+    peer: ReceiverPeer,
+    sink: TransferSink,
+    entries: Entry[],
+    files: AcceptedFile[],
+    topOf: number[],
+    codec: BlockCodec | undefined,
+    emit: TransferListener,
+): Promise<void> {
+    let written = 0;
+    let acked = 0;
+    let ackedAt = performance.now();
+    // File bytes count as their blocks arrive, in proportion.
+    const progress = new Progress(entries, files, topOf);
+    let decoded = 0;
+    let arrived = 0;
+    const blocks: Bytes[] = [];
+    let empty = true;
+    const nextBlock = async () => {
+        while (blocks.length === 0) {
+            const first = await peer.receive(IDLE_TIMEOUT_MS, SENDER_IDLE);
+            // The sender says nothing while it sends.
+            if (!(first instanceof Uint8Array)) throw unexpected(first);
+            const chunks = [first];
+            for (let more = peer.pollData(); more; more = peer.pollData()) {
+                chunks.push(more);
+            }
+            let batch;
+            try {
+                batch = await codec!.decode(chunks);
+            } catch (err) {
+                throw protocolError(messageOf(err));
+            }
+            blocks.push(...batch.blocks);
+            empty = batch.empty;
+            decoded += batch.blocks.reduce((n, block) => n + block.length, 0);
+            const now = decoded + batch.partial;
+            if (now > arrived) {
+                for (const [entry, n] of progress.advance(now - arrived)) {
+                    emit({ type: "progress", entry, bytes: n });
+                }
+                arrived = now;
+            }
+        }
+        return blocks.shift()!;
+    };
+    const wrote = (n: number) => {
+        written += n;
+        if (written - acked >= ACK_STEP || performance.now() - ackedAt >= ACK_INTERVAL_MS) {
+            peer.send({ type: "ack", bytes: written });
+            acked = written;
+            ackedAt = performance.now();
+        }
+    };
+    // Whole files being written.
+    const writing: { bytes: number; done: Promise<void> }[] = [];
+    const settle = async () => {
+        const { bytes, done } = writing.shift()!;
+        await done;
+        wrote(bytes);
+    };
+    // The rest of a block that ends one file and starts the next.
+    let pending: Bytes | undefined;
+    for (const { id, offset } of files) {
+        const entry = entries[id];
+        const size = entrySize(entry);
+        const rest = size - offset;
+        if (rest > 0 && !pending) pending = await nextBlock();
+        // A file that has arrived in full
+        if (rest <= (pending?.length ?? 0)) {
+            const data = pending?.subarray(0, rest) ?? new Uint8Array(0);
+            if (pending) {
+                pending = rest < pending.length ? pending.subarray(rest) : undefined;
+            }
+            const done = sink.writeFile(entry.path, offset, data);
+            done.catch(() => {});
+            writing.push({ bytes: rest, done });
+            if (writing.length >= CONCURRENT_FILES) await settle();
+            continue;
+        }
+        // Written as it arrives, once the files before it are done.
+        while (writing.length > 0) await settle();
+        await sink.open(entry.path, offset);
+        for (let position = offset; position < size;) {
+            const block = pending ?? (await nextBlock());
+            const n = Math.min(block.length, size - position);
+            await sink.write(block.subarray(0, n));
+            pending = n < block.length ? block.subarray(n) : undefined;
+            position += n;
+            wrote(n);
+        }
+        await sink.closeFile();
+    }
+    while (writing.length > 0) await settle();
+    if (pending || blocks.length > 0 || !empty) {
+        throw protocolError("the sender sent more bytes than accepted");
+    }
+}
+
+/** Asks the sender for fingerprints of the `checked` files; returns the ids of those that match ours. */
+async function verify(
+    peer: ReceiverPeer,
+    sink: TransferSink,
+    entries: Entry[],
+    checked: CheckedFile[],
+): Promise<number[]> {
+    peer.send({ type: "check", files: checked });
+    const answer = await peer.next();
+    if (answer.type !== "hashes") throw unexpected(answer);
+    if (answer.hashes.length !== checked.length) {
+        throw protocolError("the hashes do not match the check");
+    }
+    const verified = [];
+    for (const [i, { id, len }] of checked.entries()) {
+        const ours = await fingerprintOf(await sink.read(entries[id].path), len);
+        if (ours === answer.hashes[i]) verified.push(id);
+    }
+    return verified;
 }

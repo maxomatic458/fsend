@@ -43,3 +43,6 @@ playwright.config.mjs
 
 # Build stamp (scripts/buildinfo.mjs)
 .buildinfo.json
+
+# fsend-proto-wasm bindings (scripts/build-wasm.mjs)
+src/lib/proto/pkg/

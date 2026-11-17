@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use clap::Parser;
@@ -11,11 +10,17 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use fsend_cli::cli::{Args, Mode};
+use fsend_cli::cli::{Args, Mode, OnConflict};
 use fsend_cli::iroh::IrohTransfer;
-use fsend_cli::relay::{ConnectionInfo, Protocol, RelayClient};
-use fsend_cli::transfer::{self, FilesAvailable, ReceiveArgs, SendArgs, TransferError, Transport};
+use fsend_cli::relay::{Relay, RelayError, pair_as_receiver, pair_as_sender};
+use fsend_cli::transfer::{self, ConnectionKind, Event, TransferError, build_offer};
 use fsend_cli::webrtc::WebRtcTransfer;
+use fsend_proto::code::Code;
+use fsend_proto::pairing::ConnectionInfo;
+use fsend_proto::peer::resume::{Conflict, ConflictPolicy};
+use fsend_proto::peer::{self, Entry, progress::TopEntry};
+use fsend_proto::relay::Transport;
+use url::Url;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -23,10 +28,15 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     };
 
-    match report
+    let user_error = report
         .downcast_ref::<TransferError>()
         .and_then(TransferError::user_error)
-    {
+        .or_else(|| {
+            report
+                .downcast_ref::<RelayError>()
+                .and_then(RelayError::user_error)
+        });
+    match user_error {
         Some(msg) => eprintln!("{msg}"),
         None => eprintln!("{report:?}"),
     }
@@ -43,21 +53,29 @@ async fn run() -> color_eyre::Result<()> {
         .init();
 
     match args.mode {
-        Mode::Send { files } => run_send(&args.relay_url, &args.download_url, files).await?,
+        Mode::Send {
+            files,
+            no_compression,
+        } => run_send(&args.relay_url, &args.download_url, files, !no_compression).await?,
         Mode::Receive {
-            overwrite,
+            on_conflict,
             output_dir,
             code,
             auto_accept,
-        } => run_receive(&args.relay_url, code, output_dir, !overwrite, auto_accept).await?,
+        } => {
+            let on_conflict = on_conflict.unwrap_or(match auto_accept {
+                true => OnConflict::Skip,
+                false => OnConflict::Ask,
+            });
+            run_receive(&args.relay_url, code, output_dir, on_conflict, auto_accept).await?
+        }
         Mode::Version => print_version(),
     }
 
     Ok(())
 }
 
-/// Only show errors for fsend and fsend_cli (webrtc throws some error logs that,
-/// are not actually errors) to avoid spam.
+/// At error level, libraries are silenced: webrtc logs errors that are not.
 fn log_filter(level: tracing::Level) -> Targets {
     let own = LevelFilter::from_level(level);
     let libraries = if level == tracing::Level::ERROR {
@@ -67,13 +85,13 @@ fn log_filter(level: tracing::Level) -> Targets {
     };
     Targets::new()
         .with_default(libraries)
-        .with_targets([("fsend", own), ("fsend_cli", own)])
+        .with_target("fsend", own)
 }
 
 fn print_version() {
     let rows = [
         ("fsend-cli", env!("CARGO_PKG_VERSION").to_owned()),
-        ("protocol", transfer::PROTO_VERSION.to_owned()),
+        ("protocol", peer::VERSION.to_string()),
     ];
 
     for (label, value) in rows {
@@ -81,48 +99,24 @@ fn print_version() {
     }
 }
 
-/// Accepts a bare code or a share link like `https://fsend.sh/receive/AB12CD34`.
-/// Codes are uppercase, so a hand-typed lowercase one is normalised too.
-fn parse_code(input: &str) -> String {
-    let cleaned = input.trim();
-    let cleaned = cleaned.split(['?', '#']).next().unwrap_or(cleaned);
-    let cleaned = cleaned.trim_end_matches('/');
-    cleaned.rsplit('/').next().unwrap_or(cleaned).to_uppercase()
-}
-
-/// The link a receiver can open in a browser, e.g.
-/// `https://fsend.sh` + `AB12CD34` -> `https://fsend.sh/receive/AB12CD34`.
-fn download_link(base: &str, code: &str) -> String {
-    format!("{}/receive/{}", base.trim_end_matches('/'), code)
-}
-
-async fn connect_as_sender(
-    protocol: Protocol,
-    relay: &mut RelayClient,
-) -> color_eyre::Result<Box<dyn Transport>> {
-    match protocol {
-        Protocol::Iroh => {
+async fn connect_as_sender(relay: &mut Relay) -> color_eyre::Result<Box<dyn transfer::Transport>> {
+    match relay.transport {
+        Transport::Iroh => {
             let endpoint = IrohTransfer::create_endpoint().await?;
             let my_info = IrohTransfer::local_connection_info(&endpoint).await;
 
-            relay.send_exchange(my_info).await?;
-            let _peer_info = relay.recv_exchange().await?;
+            relay.send_connection(my_info).await?;
+            let peer_info = relay.connection().await?;
 
-            Ok(Box::new(IrohTransfer::accept(endpoint).await?))
+            Ok(Box::new(IrohTransfer::accept(endpoint, &peer_info).await?))
         }
-        Protocol::WebRtc => {
+        Transport::Webrtc => {
             let (mut wrt, offer_sdp) = WebRtcTransfer::create_offerer().await?;
-            let my_info = ConnectionInfo::WebRtc {
-                sdp: offer_sdp,
-                ice_candidates: vec![],
-            };
+            let my_info = ConnectionInfo::WebRtc { sdp: offer_sdp };
 
-            relay.send_exchange(my_info).await?;
-            let peer_info = relay.recv_exchange().await?;
-
-            let answer_sdp = match &peer_info {
-                ConnectionInfo::WebRtc { sdp, .. } => sdp.clone(),
-                _ => return Err(TransferError::UnexpectedConnectionInfo.into()),
+            relay.send_connection(my_info).await?;
+            let ConnectionInfo::WebRtc { sdp: answer_sdp } = relay.connection().await? else {
+                return Err(TransferError::UnexpectedConnectionInfo.into());
             };
             wrt.set_answer(&answer_sdp).await?;
             wrt.wait_connected().await?;
@@ -132,32 +126,28 @@ async fn connect_as_sender(
 }
 
 async fn connect_as_receiver(
-    protocol: Protocol,
-    relay: &mut RelayClient,
-) -> color_eyre::Result<Box<dyn Transport>> {
-    match protocol {
-        Protocol::Iroh => {
+    relay: &mut Relay,
+) -> color_eyre::Result<Box<dyn transfer::Transport>> {
+    match relay.transport {
+        Transport::Iroh => {
             let endpoint = IrohTransfer::create_endpoint().await?;
-            let my_info = IrohTransfer::local_connection_info(&endpoint).await;
+            // Finding our own address can take a while; the sender's arrives meanwhile.
+            let (my_info, peer_info) = tokio::try_join!(
+                async { Ok(IrohTransfer::local_connection_info(&endpoint).await) },
+                relay.connection()
+            )?;
+            relay.send_connection(my_info).await?;
 
-            let peer_info = relay.recv_exchange().await?;
-            relay.send_exchange(my_info).await?;
-
-            Ok(Box::new(IrohTransfer::connect(endpoint, peer_info).await?))
+            Ok(Box::new(IrohTransfer::connect(endpoint, &peer_info).await?))
         }
-        Protocol::WebRtc => {
-            let peer_info = relay.recv_exchange().await?;
-            let offer_sdp = match &peer_info {
-                ConnectionInfo::WebRtc { sdp, .. } => sdp.clone(),
-                _ => return Err(TransferError::UnexpectedConnectionInfo.into()),
+        Transport::Webrtc => {
+            let ConnectionInfo::WebRtc { sdp: offer_sdp } = relay.connection().await? else {
+                return Err(TransferError::UnexpectedConnectionInfo.into());
             };
 
             let (mut wrt, answer_sdp) = WebRtcTransfer::create_answerer(&offer_sdp).await?;
-            let my_info = ConnectionInfo::WebRtc {
-                sdp: answer_sdp,
-                ice_candidates: vec![],
-            };
-            relay.send_exchange(my_info).await?;
+            let my_info = ConnectionInfo::WebRtc { sdp: answer_sdp };
+            relay.send_connection(my_info).await?;
 
             wrt.wait_connected().await?;
             Ok(Box::new(wrt))
@@ -166,42 +156,32 @@ async fn connect_as_receiver(
 }
 
 async fn run_send(
-    relay_url: &str,
-    download_url: &str,
+    relay_url: &Url,
+    download_url: &Url,
     files: Vec<PathBuf>,
+    compress: bool,
 ) -> color_eyre::Result<()> {
-    let missing: Vec<_> = files.iter().filter(|f| !f.exists()).cloned().collect();
+    let outgoing = build_offer(&files)?;
 
-    if !missing.is_empty() {
-        return Err(TransferError::PathsNotFound(missing).into());
-    }
+    let mut relay = pair_as_sender(relay_url, |code| {
+        let link = code.link(download_url.as_str());
+        let code = code.to_string();
+        println!("Code: {}\n", code.bright_white());
+        println!("On the other peer, run:\n");
+        println!("  {} {}\n", "fsend receive".yellow(), code.yellow());
+        println!("or open in a browser:\n");
+        println!("  {}\n", link.blue());
+    })
+    .await?;
 
-    let mut relay = RelayClient::connect(relay_url).await?;
-    let code = relay
-        .create_session(vec![Protocol::Iroh, Protocol::WebRtc])
-        .await?;
-
-    println!("Session code: {}\n", code.bright_white());
-    println!("On the other peer, run:\n");
-    println!("  {} {}\n", "fsend receive".yellow(), code.yellow());
-
-    println!("or open in a browser:\n");
-    println!("  {}\n", download_link(download_url, &code).blue());
-
-    let protocol = relay.wait_for_peer().await?;
-    tracing::info!("peer joined, negotiated protocol: {:?}", protocol);
-
-    let mut transport = connect_as_sender(protocol, &mut relay).await?;
+    let mut transport = connect_as_sender(&mut relay).await?;
+    drop(relay);
     announce_connection(transport.as_ref()).await;
 
-    let progress = Progress::default();
-    transfer::send_files(
-        transport.as_mut(),
-        SendArgs { files },
-        &mut |initial| progress.start(initial),
-        &mut || println!("Waiting for peer to accept files..."),
-        &mut |n| progress.update(n),
-    )
+    let mut progress = Progress::default();
+    transfer::send_files(transport.as_mut(), &outgoing, compress, &mut |event| {
+        progress.on_event(event)
+    })
     .await?;
 
     println!("\nTransfer complete.");
@@ -209,39 +189,32 @@ async fn run_send(
 }
 
 async fn run_receive(
-    relay_url: &str,
-    code: String,
+    relay_url: &Url,
+    code: Code,
     output_dir: PathBuf,
-    resume: bool,
+    on_conflict: OnConflict,
     auto_accept: bool,
 ) -> color_eyre::Result<()> {
-    let code = parse_code(&code);
-
-    let mut relay = RelayClient::connect(relay_url).await?;
-    let protocol = relay
-        .join_session(code, vec![Protocol::Iroh, Protocol::WebRtc])
-        .await?;
-    tracing::info!("joined session, negotiated protocol: {:?}", protocol);
-
-    let mut transport = connect_as_receiver(protocol, &mut relay).await?;
+    let mut relay = pair_as_receiver(relay_url, &code).await?;
+    let mut transport = connect_as_receiver(&mut relay).await?;
+    drop(relay);
     announce_connection(transport.as_ref()).await;
 
-    let progress = Progress::default();
+    let mut progress = Progress::default();
     transfer::receive_files(
         transport.as_mut(),
-        ReceiveArgs { resume },
-        &mut |initial| progress.start(initial),
-        &mut |files_offered| {
+        &mut |offered| {
             if auto_accept {
                 println!("Auto-accepting files.");
                 Some(output_dir.clone())
-            } else if accept_files(files_offered) {
+            } else if accept_files(offered) {
                 Some(output_dir.clone())
             } else {
                 None
             }
         },
-        &mut |n| progress.update(n),
+        &mut |entries, conflicts| resolve_conflicts(entries, conflicts, on_conflict),
+        &mut |event| progress.on_event(event),
     )
     .await?;
 
@@ -249,37 +222,64 @@ async fn run_receive(
     Ok(())
 }
 
-async fn announce_connection(transport: &dyn Transport) {
+async fn announce_connection(transport: &dyn transfer::Transport) {
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let conn_type = transport.connection_type_name();
-    println!("Connection type: {}", colorize_conn_type(&conn_type));
+    println!(
+        "Connection type: {}",
+        colorize_conn_type(transport.connection_kind())
+    );
 }
 
 #[derive(Default)]
-struct Progress(Mutex<Option<CliProgressBars>>);
+struct Progress(Option<CliProgressBars>);
 
 impl Progress {
-    fn start(&self, initial: &[(String, u64, u64)]) {
-        *self.0.lock().unwrap() = Some(CliProgressBars::new(initial));
-    }
-
-    fn update(&self, bytes: u64) {
-        if let Some(bars) = &mut *self.0.lock().unwrap() {
-            bars.update(bytes);
+    fn on_event(&mut self, event: Event) {
+        match event {
+            Event::Offered => println!("Waiting for peer to accept files..."),
+            Event::Started { entries, present } => {
+                let (here, total) = (
+                    present.iter().sum::<u64>(),
+                    entries.iter().map(|e| e.size).sum(),
+                );
+                if here > 0 {
+                    println!(
+                        "Already there: {} of {}",
+                        HumanBytes(here),
+                        HumanBytes(total)
+                    );
+                }
+                let initial: Vec<_> = entries
+                    .iter()
+                    .zip(present)
+                    .map(|(entry, present)| (entry.name.clone(), *present, entry.size))
+                    .collect();
+                self.0 = Some(CliProgressBars::new(&initial));
+            }
+            Event::Progress { entry, bytes } => {
+                if let Some(bars) = &mut self.0 {
+                    bars.update(entry, bytes);
+                }
+            }
         }
     }
 }
 
-fn accept_files(files: &[FilesAvailable]) -> bool {
+fn accept_files(files: &[TopEntry]) -> bool {
     println!("The following files will be received:\n");
 
-    let longest = files.iter().map(|f| f.name().len()).max().unwrap_or(0) + 1;
-    let total_size: u64 = files.iter().map(|f| f.size()).sum();
+    let longest = files
+        .iter()
+        .map(|f| f.name.chars().count())
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let total_size: u64 = files.iter().map(|f| f.size).sum();
 
     for file in files {
-        let size_str = HumanBytes(file.size()).to_string();
-        let name = file.name();
-        let display = if matches!(file, FilesAvailable::Dir { .. }) {
+        let size_str = HumanBytes(file.size).to_string();
+        let name = &file.name;
+        let display = if file.dir {
             format!("{}/", name).blue()
         } else {
             format!("{} ", name).blue()
@@ -301,6 +301,59 @@ fn accept_files(files: &[FilesAvailable]) -> bool {
         .with_prompt("Accept these files?")
         .interact()
         .unwrap_or(false)
+}
+
+/// Lists the conflicts and picks what to do with them.
+fn resolve_conflicts(
+    entries: &[Entry],
+    conflicts: &[Conflict],
+    on_conflict: OnConflict,
+) -> ConflictPolicy {
+    const SHOWN: usize = 10;
+    let list = |conflicts: &[&Conflict]| {
+        for conflict in conflicts.iter().take(SHOWN) {
+            println!(
+                " - {}",
+                entries[conflict.id as usize].path().join("/").blue()
+            );
+        }
+        if conflicts.len() > SHOWN {
+            println!(" ... and {} more", conflicts.len() - SHOWN);
+        }
+    };
+    let (replaceable, blocked): (Vec<_>, Vec<_>) = conflicts.iter().partition(|c| c.replaceable);
+    if !blocked.is_empty() {
+        println!("\nSkipping these, a file or folder of another kind is in the way:\n");
+        list(&blocked);
+    }
+    if replaceable.is_empty() {
+        return ConflictPolicy::Skip;
+    }
+    println!("\nThese files already exist and differ from the offered ones:\n");
+    list(&replaceable);
+    println!();
+    match on_conflict {
+        OnConflict::Skip => {
+            println!("Skipping them.");
+            ConflictPolicy::Skip
+        }
+        OnConflict::Replace => {
+            println!("Replacing them.");
+            ConflictPolicy::Replace
+        }
+        OnConflict::Ask => {
+            let choice = dialoguer::Select::with_theme(&ColorfulTheme::default())
+                .with_prompt("What should happen to them?")
+                .items(["Skip", "Replace"])
+                .default(0)
+                .interact()
+                .unwrap_or(0);
+            match choice {
+                1 => ConflictPolicy::Replace,
+                _ => ConflictPolicy::Skip,
+            }
+        }
+    }
 }
 
 struct CliProgressBars {
@@ -327,7 +380,7 @@ impl CliProgressBars {
         let (mut longest, total_progress, total_size) = data
             .iter()
             .fold((0usize, 0u64, 0u64), |(l, tp, ts), (name, prog, size)| {
-                (l.max(name.len()), tp + prog, ts + size)
+                (l.max(name.chars().count()), tp + prog, ts + size)
             });
         longest = longest.max("Total".len());
 
@@ -360,83 +413,31 @@ impl CliProgressBars {
         Self { bars, total }
     }
 
-    fn update(&mut self, mut progress: u64) {
+    fn update(&mut self, entry: usize, bytes: u64) {
         if let Some(pb) = &self.total {
-            pb.inc(progress);
+            pb.inc(bytes);
         }
-        for pb in &self.bars {
-            let remaining = pb.length().unwrap_or(0).saturating_sub(pb.position());
-            if remaining == 0 {
-                continue;
-            }
-            let inc = progress.min(remaining);
-            pb.inc(inc);
-            progress -= inc;
-            if progress == 0 {
-                break;
-            }
+        if let Some(pb) = self.bars.get(entry) {
+            pb.inc(bytes);
         }
     }
 }
 
-fn colorize_conn_type(conn_type: &str) -> String {
-    match conn_type {
-        "Direct" => conn_type.green().to_string(),
-        "Relay" => conn_type.yellow().to_string(),
-        "WebRTC" => conn_type.green().to_string(),
-        _ => conn_type.red().to_string(),
+fn colorize_conn_type(kind: ConnectionKind) -> String {
+    let name = kind.to_string();
+    match kind {
+        ConnectionKind::Direct | ConnectionKind::WebRtc => name.green().to_string(),
+        ConnectionKind::Relay => name.yellow().to_string(),
+        ConnectionKind::Unknown => name.red().to_string(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fsend_cli::cli::DEFAULT_DOWNLOAD_URL;
 
     #[test]
-    fn accepts_codes_and_share_links() {
-        assert_eq!(parse_code("AB12CD34"), "AB12CD34");
-        assert_eq!(parse_code("ab12cd34"), "AB12CD34");
-        assert_eq!(parse_code("  AB12CD34\n"), "AB12CD34");
-        assert_eq!(parse_code("https://fsend.sh/receive/AB12CD34"), "AB12CD34");
-        assert_eq!(
-            parse_code("http://localhost:3000/receive/YJ6HM1DC"),
-            "YJ6HM1DC"
-        );
-        // Trailing slash, query and fragment must not end up in the code.
-        assert_eq!(parse_code("https://fsend.sh/receive/AB12CD34/"), "AB12CD34");
-        assert_eq!(
-            parse_code("https://fsend.sh/receive/AB12CD34?ref=x"),
-            "AB12CD34"
-        );
-        assert_eq!(
-            parse_code("https://fsend.sh/receive/AB12CD34#top"),
-            "AB12CD34"
-        );
-    }
-
-    #[test]
-    fn builds_the_download_link() {
-        assert_eq!(
-            download_link("https://fsend.sh", "AB12CD34"),
-            "https://fsend.sh/receive/AB12CD34"
-        );
-        // A trailing slash must not double up.
-        assert_eq!(
-            download_link("http://localhost:3000/", "AB12CD34"),
-            "http://localhost:3000/receive/AB12CD34"
-        );
-    }
-
-    #[test]
-    fn a_printed_link_is_accepted_back_as_a_code() {
-        let code = "AB12CD34";
-        let link = download_link(DEFAULT_DOWNLOAD_URL, code);
-        assert_eq!(parse_code(&link), code);
-    }
-
-    #[test]
-    fn progress_bars_fill_files_in_order() {
+    fn progress_lands_on_its_entry() {
         let mut bars = CliProgressBars::new(&[
             ("a".into(), 0, 100),
             ("b".into(), 50, 100),
@@ -450,13 +451,11 @@ mod tests {
         assert_eq!(total.position(), 150);
         assert_eq!(total.length(), Some(300));
 
-        // Bytes land in the first file that still has room.
-        bars.update(30);
-        assert_eq!(positions(&bars), [30, 50, 100]);
-        // then they move to the next bar
-        bars.update(100);
+        bars.update(1, 30);
+        assert_eq!(positions(&bars), [0, 80, 100]);
+        bars.update(0, 100);
         assert_eq!(positions(&bars), [100, 80, 100]);
-        bars.update(20);
+        bars.update(1, 20);
         assert_eq!(positions(&bars), [100, 100, 100]);
         assert_eq!(bars.total.as_ref().unwrap().position(), 300);
     }
@@ -465,7 +464,7 @@ mod tests {
     fn a_single_file_has_no_total_bar() {
         let mut bars = CliProgressBars::new(&[("only".into(), 10, 40)]);
         assert!(bars.total.is_none());
-        bars.update(30);
+        bars.update(0, 30);
         assert_eq!(bars.bars[0].position(), 40);
     }
 
@@ -473,14 +472,19 @@ mod tests {
     fn progress_bars_survive_no_files() {
         let mut bars = CliProgressBars::new(&[]);
         assert!(bars.bars.is_empty() && bars.total.is_none());
-        bars.update(5);
+        bars.update(0, 5);
     }
 
     #[test]
     fn connection_types_keep_their_names() {
         colored::control::set_override(false);
-        for kind in ["Direct", "Relay", "WebRTC", "None", "Unknown"] {
-            assert_eq!(colorize_conn_type(kind), kind);
+        for (kind, name) in [
+            (ConnectionKind::Direct, "Direct"),
+            (ConnectionKind::Relay, "Relay"),
+            (ConnectionKind::WebRtc, "WebRTC"),
+            (ConnectionKind::Unknown, "Unknown"),
+        ] {
+            assert_eq!(colorize_conn_type(kind), name);
         }
     }
 }
