@@ -39,6 +39,12 @@ export function generateBuildInfo() {
     };
 }
 
+/** The CLI version in fsend-cli/Cargo.toml, which the download page names. */
+export function cliVersion() {
+    const manifest = readFileSync(new URL("../../fsend-cli/Cargo.toml", import.meta.url), "utf8");
+    return /^version = "(.+)"$/m.exec(manifest)[1];
+}
+
 export function loadBuildInfo() {
     try {
         return JSON.parse(readFileSync(FILE, "utf8"));

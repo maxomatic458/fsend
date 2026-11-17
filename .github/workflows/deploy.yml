@@ -3,11 +3,12 @@ name: Deploy site
 on:
   push:
     branches: [master]
-    # The site bundles the protocol crates as wasm.
+    # The site bundles the protocol crates as wasm and names the CLI version.
     paths:
       - "fsend-site/**"
       - "fsend-proto/**"
       - "fsend-proto-wasm/**"
+      - "fsend-cli/Cargo.toml"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/deploy.yml"

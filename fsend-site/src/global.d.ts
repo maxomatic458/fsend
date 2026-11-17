@@ -4,6 +4,7 @@ declare const __BUILD_COMMIT__: string | null;
 declare const __BUILD_COMMIT_FULL__: string | null;
 declare const __BUILD_TIME__: string;
 declare const __BUILD_TIMESTAMP__: number;
+declare const __CLI_VERSION__: string;
 
 interface Window {
     showOpenFilePicker(options?: {

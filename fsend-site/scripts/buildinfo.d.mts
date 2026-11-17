@@ -11,3 +11,4 @@ export interface BuildInfo {
 
 export function generateBuildInfo(): BuildInfo;
 export function loadBuildInfo(): BuildInfo;
+export function cliVersion(): string;

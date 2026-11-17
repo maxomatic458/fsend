@@ -96,6 +96,8 @@ jobs:
           locked: true
           ref: refs/tags/${{ env.TAG }}
           include: README.md,fsend-cli/LICENCE,fsend-cli/dist/completions,fsend-cli/dist/man
+          # Checked by the install scripts.
+          checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
 
   deb:

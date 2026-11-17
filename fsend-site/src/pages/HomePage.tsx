@@ -45,7 +45,7 @@ const FAQ_ITEMS = [
         a: () => (
             <>
                 No — files stream straight from one device to the other, so you're limited only by
-                your connection and the receiver's free disk space.
+                your connection and the receiver's free disk space or memory (depending on the browser).
             </>
         ),
     },
@@ -66,12 +66,8 @@ const FAQ_ITEMS = [
         q: "Which browsers work best?",
         a: () => (
             <>
-                Anything with WebRTC. Chrome, Edge and Opera also ship the{" "}
-                <Ext href={MDN_FS_API}>File System Access API</Ext>, so fsend writes straight to a
-                folder you pick. Firefox and Safari keep the transfer in the browser's own storage
-                and save it to Downloads at the end, zipped if there is more than one file. Both can
-                resume interrupted transfers. Where neither works, as in some private windows, the
-                transfer is held in memory, which caps it at your available RAM.
+                Any browser with <Ext href={MDN_WEBRTC}>WebRTC</Ext>. Chome, Edge and Opera can
+                directly save files to disk and seemlessly resume transfers. Firefox and Safari need to save them to browser storage first.
             </>
         ),
     },

@@ -2,7 +2,7 @@ import tailwindcss from "@tailwindcss/vite";
 import { defineConfig } from "vite";
 import solidPlugin from "vite-plugin-solid";
 import devtools from "solid-devtools/vite";
-import { loadBuildInfo } from "./scripts/buildinfo.mjs";
+import { cliVersion, loadBuildInfo } from "./scripts/buildinfo.mjs";
 
 const buildInfo = loadBuildInfo();
 
@@ -12,6 +12,7 @@ export default defineConfig(({ isSsrBuild }) => ({
         __BUILD_COMMIT_FULL__: JSON.stringify(buildInfo.commitFull),
         __BUILD_TIME__: JSON.stringify(buildInfo.builtAt),
         __BUILD_TIMESTAMP__: JSON.stringify(buildInfo.builtAtMs),
+        __CLI_VERSION__: JSON.stringify(cliVersion()),
     },
     // The SSR build is the prerender pass.
     plugins: [...(isSsrBuild ? [] : [devtools()]), solidPlugin({ ssr: isSsrBuild }), tailwindcss()],
