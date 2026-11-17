@@ -2,7 +2,7 @@ import { createEffect, on, Show } from "solid-js";
 import { isServer } from "solid-js/web";
 import { useLocation, useNavigate } from "@solidjs/router";
 import { Title, Meta, Link } from "@solidjs/meta";
-import { FiFolder } from "solid-icons/fi";
+import { FiArchive, FiFolder, FiHardDrive } from "solid-icons/fi";
 import { SITE_URL } from "../lib/links";
 import { createReceiveSession } from "../primitives/createReceiveSession";
 import { createWindowDropTarget } from "../primitives/createWindowDropTarget";
@@ -14,6 +14,7 @@ import { FileOffer } from "../components/FileOffer";
 import { TransferProgress } from "../components/TransferProgress";
 import { ErrorCard } from "../components/ErrorCard";
 import { Button } from "../components/Button";
+import { Choice } from "../components/Choice";
 import { Busy } from "../components/Busy";
 import { StorageUsage } from "../components/StorageUsage";
 import { formatBytes, plural } from "../lib/format";
@@ -100,28 +101,31 @@ export function ReceivePage() {
 
                         <div class="w-full flex flex-col gap-3">
                             <Show when={receive.kind()}>
-                                <div class="flex flex-wrap gap-x-5 gap-y-2 text-sm text-ink-dim">
-                                    <label class="flex items-center gap-2 cursor-pointer">
-                                        <input
-                                            type="radio"
-                                            name="storage"
-                                            checked={toFs()}
-                                            onChange={() => receive.setMode("fs")}
-                                        />
-                                        {receive.kind() === "picked"
-                                            ? "Save to Folder"
-                                            : "Save in Browser Storage"}
-                                    </label>
-                                    <label class="flex items-center gap-2 cursor-pointer">
-                                        <input
-                                            type="radio"
-                                            name="storage"
-                                            checked={!toFs()}
-                                            onChange={() => receive.setMode("zip")}
-                                        />
-                                        Download as Zip
-                                    </label>
-                                </div>
+                                {(kind) => (
+                                    <Choice
+                                        label="Save Files"
+                                        value={receive.mode()}
+                                        onChange={receive.setMode}
+                                        options={[
+                                            kind() === "picked"
+                                                ? {
+                                                      value: "fs",
+                                                      label: "Save to Folder",
+                                                      icon: FiFolder,
+                                                  }
+                                                : {
+                                                      value: "fs",
+                                                      label: "Save in Browser Storage",
+                                                      icon: FiHardDrive,
+                                                  },
+                                            {
+                                                value: "zip",
+                                                label: "Download as Zip",
+                                                icon: FiArchive,
+                                            },
+                                        ]}
+                                    />
+                                )}
                             </Show>
 
                             <Show when={toFs() && receive.kind() === "browser"}>

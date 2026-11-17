@@ -3,23 +3,20 @@
 #   irm https://fsend.sh/install.ps1 | iex
 #   iex "& {$(irm https://fsend.sh/install.ps1)} -Uninstall"
 param(
-    # Where fsend.exe goes; it is added to the user's PATH.
+    # Where fsend.exe will be installed to.
     [string]$Dir = "$env:LOCALAPPDATA\Programs\fsend",
     [switch]$Uninstall
 )
 
-# A script block, so the settings below don't leak into the caller's session.
 & {
     $ErrorActionPreference = 'Stop'
     $ProgressPreference = 'SilentlyContinue'
     Set-StrictMode -Version Latest
-    # Windows PowerShell 5.1 may still offer TLS 1.0, which GitHub refuses.
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
     $Releases = 'https://github.com/maxomatic458/fsend/releases/latest/download'
-    # Also runs on ARM64 Windows, through its x64 emulation.
     $Target = 'x86_64-pc-windows-msvc'
-    # Where earlier versions of this script installed to.
+    # Legacy version install path.
     $Legacy = "$env:LOCALAPPDATA\fsend"
 
     function Get-UserPath {
@@ -39,7 +36,7 @@ param(
         } finally {
             $key.Close()
         }
-        # Setting a variable through .NET tells running programs, like Explorer, that PATH changed.
+        # Setting a variable through .NET notifies programs of a a PATH change.
         [Environment]::SetEnvironmentVariable('FSEND_INSTALL', '1', 'User')
         [Environment]::SetEnvironmentVariable('FSEND_INSTALL', $null, 'User')
     }
@@ -69,8 +66,8 @@ param(
         try {
             Write-Host "fsend: downloading $archive"
             Invoke-WebRequest "$Releases/$archive" -OutFile "$tmp\$archive" -UseBasicParsing
-            Invoke-WebRequest "$Releases/$archive.sha256" -OutFile "$tmp\$archive.sha256" -UseBasicParsing
-            $expected = (Get-Content "$tmp\$archive.sha256" -Raw).Trim() -split '\s+' | Select-Object -First 1
+            Invoke-WebRequest "$Releases/fsend-$Target.sha256" -OutFile "$tmp\checksum" -UseBasicParsing
+            $expected = (Get-Content "$tmp\checksum" -Raw).Trim() -split '\s+' | Select-Object -First 1
             if ((Get-FileHash "$tmp\$archive" -Algorithm SHA256).Hash -ne $expected) {
                 throw "fsend: $archive does not match its checksum"
             }
@@ -96,13 +93,14 @@ param(
     function Uninstall-Fsend {
         if (Test-Path "$Dir\fsend.exe") {
             Remove-Item "$Dir\fsend.exe" -Force
-            # Only the folder this script made, never one the user chose that holds other files.
+            # Only the folder this script made.
             if (-not (Get-ChildItem $Dir -Force)) { Remove-Item $Dir -Force }
             Write-Host "fsend: removed $Dir\fsend.exe"
         } else {
             Write-Host "fsend: nothing to remove at $Dir\fsend.exe"
         }
-        Remove-FromPath @($Dir)
+        # A folder that still holds other files may still be needed on PATH.
+        if (-not (Test-Path $Dir)) { Remove-FromPath @($Dir) }
         Remove-Legacy
     }
 

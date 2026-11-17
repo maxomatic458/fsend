@@ -50,17 +50,6 @@ download() {
     fi
 }
 
-sha256() {
-    if has sha256sum; then
-        sha256sum "$1"
-    elif has shasum; then
-        shasum -a 256 "$1"
-    else
-        fail "sha256sum or shasum is needed"
-    fi | cut -d ' ' -f 1
-}
-
-# Runs a command in $dir, through sudo unless it, or the folder it goes in, is writable.
 in_dir() {
     existing=$dir
     while [ ! -d "$existing" ]; do existing=$(dirname "$existing"); done
@@ -69,11 +58,19 @@ in_dir() {
     elif has sudo; then
         sudo "$@"
     else
-        fail "no permission to write to $dir; run as root or pass --dir"
+        fail "no permission to write to $dir. Run as root or pass --dir"
     fi
 }
 
 install_fsend() {
+    if has sha256sum; then
+        sha256=sha256sum
+    elif has shasum; then
+        sha256="shasum -a 256"
+    else
+        fail "sha256sum or shasum is needed"
+    fi
+
     target=$(target)
     archive="fsend-$target.tar.gz"
     tmp=$(mktemp -d)
@@ -81,9 +78,11 @@ install_fsend() {
 
     say "downloading $archive"
     download "$RELEASES/$archive" "$tmp/$archive"
-    download "$RELEASES/$archive.sha256" "$tmp/$archive.sha256"
-    expected=$(cut -d ' ' -f 1 "$tmp/$archive.sha256")
-    [ "$(sha256 "$tmp/$archive")" = "$expected" ] || fail "$archive does not match its checksum"
+    # Named after the archive without extension.
+    download "$RELEASES/fsend-$target.sha256" "$tmp/checksum"
+    expected=$(cut -d ' ' -f 1 "$tmp/checksum")
+    actual=$($sha256 "$tmp/$archive" | cut -d ' ' -f 1)
+    [ "$actual" = "$expected" ] || fail "$archive does not match its checksum"
 
     tar -xzf "$tmp/$archive" -C "$tmp"
     in_dir mkdir -p "$dir"
@@ -129,5 +128,4 @@ main() {
     "$action"
 }
 
-# Called last, so a download cut short runs nothing.
 main "$@"

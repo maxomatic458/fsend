@@ -5,10 +5,10 @@ import { FiUpload, FiDownload } from "solid-icons/fi";
 import { handleDrop } from "../lib/files/source";
 import { setPendingDrop } from "../lib/pendingDrop";
 import { canStoreTransfers } from "../lib/files/storage";
-import { GITHUB_URL, MDN_FS_API, MDN_WEBRTC, SITE_URL } from "../lib/links";
+import { GITHUB_URL, MDN_WEBRTC, SITE_URL } from "../lib/links";
 import { createWindowDropTarget } from "../primitives/createWindowDropTarget";
 import { Logo } from "../components/Logo";
-import { Ext } from "../components/Ext";
+import { Ext, LINK_CLASS } from "../components/Ext";
 
 // Functions, so their JSX is built inside the component.
 const STEPS = [
@@ -45,7 +45,8 @@ const FAQ_ITEMS = [
         a: () => (
             <>
                 No — files stream straight from one device to the other, so you're limited only by
-                your connection and the receiver's free disk space or memory (depending on the browser).
+                your connection and the receiver's free disk space or memory (depending on the
+                browser).
             </>
         ),
     },
@@ -66,8 +67,9 @@ const FAQ_ITEMS = [
         q: "Which browsers work best?",
         a: () => (
             <>
-                Any browser with <Ext href={MDN_WEBRTC}>WebRTC</Ext>. Chome, Edge and Opera can
-                directly save files to disk and seemlessly resume transfers. Firefox and Safari need to save them to browser storage first.
+                Any browser with <Ext href={MDN_WEBRTC}>WebRTC</Ext>. Chrome, Edge and Opera can
+                directly save files to disk and seamlessly resume transfers. Firefox and Safari need
+                to save them to browser storage first.
             </>
         ),
     },
@@ -76,7 +78,11 @@ const FAQ_ITEMS = [
         a: () => (
             <>
                 Yes — fsend is available as a command-line tool. You can find the installation
-                instructions on <Ext href={GITHUB_URL}>GitHub</Ext>.
+                instructions on the{" "}
+                <A href="/download" class={LINK_CLASS}>
+                    download page
+                </A>
+                .
             </>
         ),
     },
