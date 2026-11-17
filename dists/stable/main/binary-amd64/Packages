@@ -1,0 +1,18 @@
+Package: fsend
+Version: 0.4.0
+Architecture: amd64
+Maintainer: Maxomatic458
+Installed-Size: 16601
+Filename: pool/main/f/fsend/fsend_0.4.0_amd64.deb
+Size: 5193532
+MD5sum: 50498b5f13ddc3fca4d9cd643ed623f9
+SHA1: 33cf576543d1a4975ac9b7f3dfb7fae044575167
+SHA256: 686fa12f8f71ec02614d97ca0458c9e8d56625cbc4c5108da1571fbdca243e26
+Section: utils
+Priority: optional
+Homepage: https://fsend.sh
+Description: A CLI for fsend, a peer-to-peer file sharing tool
+ fsend is a peer-to-peer file transfer tool. Send files and directories, no
+ relay server involved. Transfers can be resumed if interrupted. Compatible with
+ the fsend.sh web-app.
+
