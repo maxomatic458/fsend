@@ -49,10 +49,6 @@ function assertFiles(actual, expected) {
 }
 
 /**
- * Runs a sender and a native-FS receiver against each other.
- * Returns once both have settled.
- */
-/**
  * Starts a transfer of the entries `spec` describes; a test steps in before
  * awaiting `senderDone` and `receiverDone`.
  */
@@ -511,9 +507,13 @@ describe("interrupted transfers", () => {
     });
 
     test("cancelling while the peers connect ends the attempt at once", async () => {
+        let cancelledAt = 0;
         const { send, recv } = await attempt("stall", async (...aborts) => {
+            cancelledAt = Date.now();
             for (const abort of aborts) abort.abort();
         });
+        // Not after the connect timeout.
+        assert.ok(Date.now() - cancelledAt < 1000, "both sides end at once");
         assert.equal(recv.error, null, "a cancel is not an error");
         assert.equal(send.error, null, "a cancel is not an error");
     });

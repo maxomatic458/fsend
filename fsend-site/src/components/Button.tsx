@@ -23,7 +23,6 @@ interface ButtonProps {
     onClick?: () => void;
     disabled?: boolean;
     class?: string;
-    "aria-expanded"?: boolean;
     ref?: (el: HTMLButtonElement) => void;
     children: JSX.Element;
 }
@@ -34,7 +33,6 @@ export function Button(props: ButtonProps) {
             ref={(el) => props.ref?.(el)}
             onClick={props.onClick}
             disabled={props.disabled}
-            aria-expanded={props["aria-expanded"]}
             class={`rounded-lg border transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed ${
                 tones[props.tone ?? "neutral"]
             } ${sizes[props.size ?? "md"]} ${props.class ?? ""}`}

@@ -1,10 +1,9 @@
-/** Mirrors public/logo.svg. The viewBox starts at -16 * tan 20deg so the shear fits. */
 let uid = 0;
 
 const FLAME = "#e6570f";
 const AZURE = "#4d84ff";
 
-/** Flame over azure, or all flame. */
+/** Mirrors public/logo.svg: flame over azure, or all flame. The viewBox starts at -16 * tan 20deg so the shear fits. */
 export function Logo(props: { class?: string; tint?: "brand" | "flame" }) {
     const id = `fsend-mark-${uid++}`;
     const bottom = () => (props.tint === "flame" ? FLAME : AZURE);

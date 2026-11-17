@@ -22,7 +22,7 @@ export function hasFileSystemAccess(): boolean {
 }
 
 /** Whether OPFS can be written to from the page; it may still be refused, as in private windows. */
-export function hasBrowserStorage(): boolean {
+function hasBrowserStorage(): boolean {
     return (
         typeof navigator !== "undefined" &&
         typeof navigator.storage?.getDirectory === "function" &&

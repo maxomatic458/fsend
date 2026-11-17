@@ -56,8 +56,7 @@ export function ShareCode(props: ShareCodeProps) {
                 <Button tone="accent" onClick={() => copy(shareUrl())} class="whitespace-nowrap">
                     <span class="flex items-center gap-2">
                         {copied() ? <FiCheck class="w-4 h-4" /> : <FiCopy class="w-4 h-4" />}
-                        {/* Both labels share one grid cell, so the button stays as wide as
-                the longer of the two and does not resize when it flips. */}
+                        {/* Both labels share one grid cell, so the button keeps one width. */}
                         <span class="grid justify-items-center">
                             <span class={`col-start-1 row-start-1 ${copied() ? "invisible" : ""}`}>
                                 Copy Link

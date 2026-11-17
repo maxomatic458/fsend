@@ -6,8 +6,6 @@
     "target": "ESNext",
 
     // Modules
-    "allowSyntheticDefaultImports": true,
-    "esModuleInterop": true,
     "isolatedModules": true,
     "module": "ESNext",
     "moduleResolution": "bundler",

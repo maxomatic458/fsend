@@ -8,7 +8,7 @@ import App from "./App";
 
 const root = document.getElementById("root")!;
 
-// Solid appends rather than replaces, so the prerendered markup goes first.
+// Solid appends, so clear the prerendered markup.
 root.textContent = "";
 
 render(

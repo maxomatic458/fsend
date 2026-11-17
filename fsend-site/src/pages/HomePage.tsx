@@ -10,24 +10,27 @@ import { createWindowDropTarget } from "../primitives/createWindowDropTarget";
 import { Logo } from "../components/Logo";
 import { Ext } from "../components/Ext";
 
+// Functions, so their JSX is built inside the component.
 const STEPS = [
     {
         n: "01",
         accent: "text-flame",
         title: "Pick Your Files",
-        body: <>Select individual files and folders or drag and drop them anywhere on this page</>,
+        body: () => (
+            <>Select individual files and folders or drag and drop them anywhere on this page</>
+        ),
     },
     {
         n: "02",
         accent: "text-flame",
         title: "Share the Code",
-        body: <>Share the one-time code with the receiver</>,
+        body: () => <>Share the one-time code with the receiver</>,
     },
     {
         n: "03",
         accent: "text-azure",
         title: "Direct Transfer",
-        body: (
+        body: () => (
             <>
                 Both browsers connect over <Ext href={MDN_WEBRTC}>WebRTC</Ext> and the files stream
                 directly between them
@@ -39,29 +42,29 @@ const STEPS = [
 const FAQ_ITEMS = [
     {
         q: "Is there a file size limit?",
-        a: (
+        a: () => (
             <>
                 No — files stream straight from one device to the other, so you're limited only by
-                your connection and the receiver's free disk space
+                your connection and the receiver's free disk space.
             </>
         ),
     },
     {
         q: "Do both sides need to be online?",
-        a: <>Yes — both tabs have to stay open until the transfer finishes</>,
+        a: () => <>Yes — both tabs have to stay open until the transfer finishes.</>,
     },
     {
         q: "Can fsend see my files?",
-        a: (
+        a: () => (
             <>
-                No — fsend uses end to end encrypted <Ext href={MDN_WEBRTC}>WebRTC</Ext> data
-                channels. File data never touches our servers
+                No — fsend uses end-to-end encrypted <Ext href={MDN_WEBRTC}>WebRTC</Ext> data
+                channels. File data never touches our servers.
             </>
         ),
     },
     {
         q: "Which browsers work best?",
-        a: (
+        a: () => (
             <>
                 Anything with WebRTC. Chrome, Edge and Opera also ship the{" "}
                 <Ext href={MDN_FS_API}>File System Access API</Ext>, so fsend writes straight to a
@@ -74,7 +77,7 @@ const FAQ_ITEMS = [
     },
     {
         q: "Can I use it outside the browser?",
-        a: (
+        a: () => (
             <>
                 Yes — fsend is available as a command-line tool. You can find the installation
                 instructions on <Ext href={GITHUB_URL}>GitHub</Ext>.
@@ -83,7 +86,7 @@ const FAQ_ITEMS = [
     },
     {
         q: "Is it free?",
-        a: (
+        a: () => (
             <>
                 Yes — free and open source. The code is on <Ext href={GITHUB_URL}>GitHub</Ext>.
             </>
@@ -258,7 +261,7 @@ export function HomePage() {
                                 <div class={`font-mono text-[13px] ${step.accent}`}>{step.n}</div>
                                 <h3 class="font-bold text-lg">{step.title}</h3>
                                 <p class="text-ink-muted text-[15px] leading-relaxed">
-                                    {step.body}
+                                    {step.body()}
                                 </p>
                             </li>
                         )}
@@ -277,7 +280,7 @@ export function HomePage() {
                         {(item) => (
                             <div class="bg-surface border border-line rounded-xl p-6 flex flex-col gap-2">
                                 <h3 class="font-bold text-[17px]">{item.q}</h3>
-                                <p class="text-ink-muted text-[15px] leading-relaxed">{item.a}</p>
+                                <p class="text-ink-muted text-[15px] leading-relaxed">{item.a()}</p>
                             </div>
                         )}
                     </For>

@@ -104,6 +104,7 @@ export function createSendSession() {
                         setState("completed");
                         break;
                     case "error":
+                        run.tracker.cleanup();
                         run.setError(event.message);
                         setState("error");
                         break;

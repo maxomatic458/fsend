@@ -159,7 +159,6 @@ impl TransferError {
     }
 }
 
-/// The transports report a peer that is gone as `ConnectionAborted`, `ConnectionReset` or `NotConnected`.
 /// A QUIC connection that fails has lost the peer.
 impl From<iroh::endpoint::ConnectionError> for TransferError {
     fn from(e: iroh::endpoint::ConnectionError) -> Self {
@@ -167,6 +166,7 @@ impl From<iroh::endpoint::ConnectionError> for TransferError {
     }
 }
 
+/// The transports report a peer that is gone as `ConnectionAborted`, `ConnectionReset` or `NotConnected`.
 impl From<io::Error> for TransferError {
     fn from(e: io::Error) -> Self {
         use io::ErrorKind::*;

@@ -1,4 +1,3 @@
-// Pins the commit and build time in .buildinfo.json, so the client and SSR builds agree.
 import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -22,8 +21,7 @@ function commitSha() {
     }
 }
 
-// Baked as a preformatted string so the server and client render identical
-// text — no locale or timezone to disagree about at hydration time.
+// Preformatted, so it reads the same whatever the locale or timezone.
 function formatUtc(date) {
     return `${date.toISOString().slice(0, 16).replace("T", " ")} UTC`;
 }

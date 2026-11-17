@@ -132,11 +132,10 @@ async fn connect_as_receiver(
         Transport::Iroh => {
             let endpoint = IrohTransfer::create_endpoint().await?;
             // Finding our own address can take a while; the sender's arrives meanwhile.
-            let (my_info, peer_info) = tokio::join!(
-                IrohTransfer::local_connection_info(&endpoint),
+            let (my_info, peer_info) = tokio::try_join!(
+                async { Ok(IrohTransfer::local_connection_info(&endpoint).await) },
                 relay.connection()
-            );
-            let peer_info = peer_info?;
+            )?;
             relay.send_connection(my_info).await?;
 
             Ok(Box::new(IrohTransfer::connect(endpoint, &peer_info).await?))
@@ -298,13 +297,10 @@ fn accept_files(files: &[TopEntry]) -> bool {
         HumanBytes(total_size).to_string().red()
     );
 
-    // The prompt blocks, so the runtime moves other tasks off this thread meanwhile.
-    tokio::task::block_in_place(|| {
-        dialoguer::Confirm::with_theme(&ColorfulTheme::default())
-            .with_prompt("Accept these files?")
-            .interact()
-    })
-    .unwrap_or(false)
+    dialoguer::Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt("Accept these files?")
+        .interact()
+        .unwrap_or(false)
 }
 
 /// Lists the conflicts and picks what to do with them.
@@ -346,14 +342,12 @@ fn resolve_conflicts(
             ConflictPolicy::Replace
         }
         OnConflict::Ask => {
-            let choice = tokio::task::block_in_place(|| {
-                dialoguer::Select::with_theme(&ColorfulTheme::default())
-                    .with_prompt("What should happen to them?")
-                    .items(["Skip", "Replace"])
-                    .default(0)
-                    .interact()
-            })
-            .unwrap_or(0);
+            let choice = dialoguer::Select::with_theme(&ColorfulTheme::default())
+                .with_prompt("What should happen to them?")
+                .items(["Skip", "Replace"])
+                .default(0)
+                .interact()
+                .unwrap_or(0);
             match choice {
                 1 => ConflictPolicy::Replace,
                 _ => ConflictPolicy::Skip,

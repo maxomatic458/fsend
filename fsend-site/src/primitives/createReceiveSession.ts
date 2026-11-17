@@ -222,6 +222,7 @@ export function createReceiveSession() {
                 break;
             case "error":
                 setAskingStorage(false);
+                run.tracker.cleanup();
                 run.setError(event.message);
                 setState("error");
                 void refreshUsage();

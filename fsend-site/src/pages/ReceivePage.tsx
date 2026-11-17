@@ -1,4 +1,5 @@
 import { createEffect, on, Show } from "solid-js";
+import { isServer } from "solid-js/web";
 import { useLocation, useNavigate } from "@solidjs/router";
 import { Title, Meta, Link } from "@solidjs/meta";
 import { FiFolder } from "solid-icons/fi";
@@ -175,13 +176,16 @@ export function ReceivePage() {
                             Connect &amp; Receive
                         </Button>
 
-                        <p class="text-[13px] text-ink-faint text-center leading-relaxed max-w-[460px]">
-                            {toFolder()
-                                ? "Files are written straight to the folder you choose, so size is limited by disk space. An interrupted transfer resumes where it stopped; other files that already exist are skipped or replaced, as chosen above."
-                                : toFs()
-                                  ? "Files are kept in this browser's storage while they arrive, then saved to your Downloads folder, zipped if there is more than one. An interrupted transfer resumes where it stopped, as long as it stays in browser storage."
-                                  : "Files land in your Downloads folder, zipped if there is more than one. The transfer is held in memory until it finishes, so size is limited by RAM and it can't be resumed."}
-                        </p>
+                        {/* Depends on the browser, so the prerendered page leaves it out. */}
+                        <Show when={!isServer}>
+                            <p class="text-[13px] text-ink-faint text-center leading-relaxed max-w-[460px]">
+                                {toFolder()
+                                    ? "Files are written straight to the folder you choose, so size is limited by disk space. An interrupted transfer resumes where it stopped; other files that already exist are skipped or replaced, as chosen above."
+                                    : toFs()
+                                      ? "Files are kept in this browser's storage while they arrive, then saved to your Downloads folder, zipped if there is more than one. An interrupted transfer resumes where it stopped, as long as it stays in browser storage."
+                                      : "Files land in your Downloads folder, zipped if there is more than one. The transfer is held in memory until it finishes, so size is limited by RAM and it can't be resumed."}
+                            </p>
+                        </Show>
                     </div>
                 </Show>
 

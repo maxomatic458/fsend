@@ -57,9 +57,9 @@ pub fn encode(message: &impl Serialize) -> Result<Vec<u8>, FrameError> {
 
 /// The frame of `head` and the compressed `payload` if it is smaller than the raw frame of `payload`, else that one.
 pub(super) fn compact(head: &[u8], payload: &[u8]) -> Vec<u8> {
-    // Room for the raw frame, which the compressed one must beat.
+    // The compressed frame must beat the raw one; zstd needs a few bytes more room than it writes.
     let raw_len = HEADER_BYTES + 1 + payload.len();
-    let mut frame = Vec::with_capacity(raw_len);
+    let mut frame = Vec::with_capacity(raw_len + 16);
     frame.extend_from_slice(&[0; HEADER_BYTES]);
     frame.push(ZSTD);
     frame.extend_from_slice(head);

@@ -16,7 +16,11 @@ export function ThemeToggle() {
         document
             .querySelector('meta[name="theme-color"]')
             ?.setAttribute("content", next ? "#151515" : "#f7f5f2");
-        localStorage.setItem("theme", next ? "dark" : "light");
+        try {
+            localStorage.setItem("theme", next ? "dark" : "light");
+        } catch {
+            // Site data is blocked; the choice lasts until the page is left.
+        }
     };
 
     return (

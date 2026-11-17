@@ -139,6 +139,20 @@ mod tests {
     }
 
     #[test]
+    fn a_block_that_compresses_a_little_is_still_compressed() {
+        // Noise after a run of zeros, so compression saves anything from nothing to a few bytes.
+        for zeros in 0..64 {
+            let mut data = vec![0; zeros];
+            data.extend(noise(1000));
+            let compressed = zstd::bulk::compress(&data, 1).unwrap();
+            let helps = RAW_LEN_BYTES + compressed.len() < data.len();
+            let block = encode(&data, true);
+            assert_eq!(block[4] == ZSTD, helps, "{zeros} zeros");
+            assert_eq!(decode_all(&block).unwrap(), [data]);
+        }
+    }
+
+    #[test]
     fn compressible_blocks_shrink_and_noise_goes_raw() {
         let text = b"fsend ".repeat(MAX_BLOCK_BYTES / 6);
         let packed = encode(&text, true);

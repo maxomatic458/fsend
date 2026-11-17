@@ -29,7 +29,7 @@ const share = (template, fields) =>
                 ? out
                 : out.replace(
                       new RegExp(`(<meta[^>]*="${key}"[^>]*content=")[^"]*"`),
-                      `$1${value}"`,
+                      (_, start) => `${start}${value}"`,
                   ),
         template,
     );
@@ -47,8 +47,9 @@ for (const url of ROUTES) {
         "twitter:description": description,
         "og:url": canonical,
     })
-        .replace("</head>", `  ${head}\n  </head>`)
-        .replace('<div id="root"></div>', `<div id="root">${html}</div>`);
+        // Replacer functions, so a `$&` in the content is not a pattern.
+        .replace("</head>", () => `  ${head}\n  </head>`)
+        .replace('<div id="root"></div>', () => `<div id="root">${html}</div>`);
 
     // Flat files, not <route>/index.html: Pages serves `foo.html` at `/foo` but
     // 308s `/foo` to `/foo/` when the file is a directory index, which would

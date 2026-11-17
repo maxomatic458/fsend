@@ -18,7 +18,3 @@ interface Window {
 interface DataTransferItem {
     getAsFileSystemHandle?(): Promise<FileSystemFileHandle | FileSystemDirectoryHandle | null>;
 }
-
-interface HTMLInputElement {
-    webkitdirectory: boolean;
-}

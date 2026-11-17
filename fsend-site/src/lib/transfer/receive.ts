@@ -81,7 +81,6 @@ export async function runReceive(
         await current.abandon();
         if (!abort.aborted) emit({ type: "error", message: messageOf(err) });
     } finally {
-        await current.closeFile().catch(() => {});
         link?.close();
     }
 }

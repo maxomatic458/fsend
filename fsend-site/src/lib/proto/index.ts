@@ -52,18 +52,13 @@ const PAIRING_ERRORS: Record<PairingError, string> = {
     unexpected_signal: "Pairing failed: unexpected message from the other side.",
 };
 
-export class PairingFailure extends Error {
-    constructor(readonly error: PairingError) {
-        super(PAIRING_ERRORS[error]);
-    }
-}
-
-/** Rethrows the wasm's JSON `PairingError` as a {@link PairingFailure}. */
+/** Rethrows the wasm's JSON `PairingError` with a message for the user. */
 function pairing<T>(call: () => T): T {
     try {
         return call();
     } catch (error) {
-        throw new PairingFailure(JSON.parse((error as Error).message));
+        const code: PairingError = JSON.parse((error as Error).message);
+        throw new Error(PAIRING_ERRORS[code]);
     }
 }
 
