@@ -1,4 +1,8 @@
-# fsend
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="fsend-site/public/brand/wordmark-dark.png">
+  <img src="fsend-site/public/brand/wordmark-light.png" alt="fsend" width="250">
+</picture>
+
 fsend is a peer-to-peer file transfer webapp and CLI tool.
 
 > [!NOTE]
@@ -87,4 +91,5 @@ $ fsend receive K7Q29XMV4P
 ## Licenses
 * fsend-relay and fsend-cli are licensed under MIT. See [LICENCE](fsend-relay/LICENCE) and [LICENCE](fsend-cli/LICENCE).
 * fsend-site is licensed under [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/legalcode). See [LICENCE](fsend-site/LICENCE).
+* The fsend logo and the images made from it, everything in [`fsend-site/public/brand`](fsend-site/public/brand), are not covered by these licenses. All rights reserved. See [LICENCE](fsend-site/public/brand/LICENCE).
 
