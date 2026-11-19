@@ -214,46 +214,71 @@ fn errors_tell_the_peer_what_it_needs_to_know() {
     );
 }
 
+/// A GUI runs each transfer on a task of its own.
+#[test]
+fn transfers_can_be_spawned() {
+    fn spawnable<A, B, F: Future + Send + 'static>(_: fn(A, B) -> F) {}
+    async fn send(mut transport: Box<dyn Transport>, outgoing: Outgoing) {
+        let _ = send_files(
+            transport.as_mut(),
+            &outgoing,
+            true,
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await;
+    }
+    async fn receive(mut transport: Box<dyn Transport>, mut decide: Box<dyn Decide>) {
+        let _ = receive_files(
+            transport.as_mut(),
+            decide.as_mut(),
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await;
+    }
+    spawnable(send);
+    spawnable(receive);
+}
+
 #[test]
 fn user_errors_are_worded_for_humans() {
-    colored::control::set_override(false);
-
     assert_eq!(
-        TransferError::Declined.user_error().as_deref(),
-        Some("Transfer declined.")
+        TransferError::Declined.user_message().as_deref(),
+        Some("transfer declined")
     );
     assert_eq!(
-        TransferError::PeerDeclined(None).user_error().as_deref(),
-        Some("error: the peer declined the files")
+        TransferError::PeerDeclined(None).user_message().as_deref(),
+        Some("the peer declined the files")
     );
     assert_eq!(
         TransferError::PathsNotFound(vec!["a".into()])
-            .user_error()
+            .user_message()
             .as_deref(),
-        Some("error: 1 path does not exist:\n - a")
+        Some("1 path does not exist:\n - a")
     );
     assert_eq!(
         TransferError::PathsNotFound(vec!["a".into(), "b/c".into()])
-            .user_error()
+            .user_message()
             .as_deref(),
-        Some("error: 2 paths do not exist:\n - a\n - b/c")
+        Some("2 paths do not exist:\n - a\n - b/c")
     );
     let lost = TransferError::Disconnected("timed out".into())
-        .user_error()
+        .user_message()
         .unwrap();
     assert!(lost.contains("timed out") && lost.contains("resume"));
     let version = TransferError::Version {
         version: 9,
         min_version: 7,
     }
-    .user_error()
+    .user_message()
     .unwrap();
     assert!(version.contains("7 to 9") && version.contains("Update"));
     let peer_version = TransferError::Peer {
         code: ErrorCode::Version,
         message: "versions 5 to 6 are supported".into(),
     }
-    .user_error()
+    .user_message()
     .unwrap();
     assert!(peer_version.contains("5 to 6") && peer_version.contains("Update"));
 
@@ -263,7 +288,7 @@ fn user_errors_are_worded_for_humans() {
         TransferError::PeerTimeout,
         TransferError::Unsendable(OfferError::Empty),
     ] {
-        assert!(error.user_error().is_some(), "{error:?}");
+        assert!(error.user_message().is_some(), "{error:?}");
     }
     for error in [
         TransferError::Protocol("x".into()),
@@ -272,6 +297,6 @@ fn user_errors_are_worded_for_humans() {
         TransferError::UnexpectedConnectionInfo,
         TransferError::Io(io::Error::other("x")),
     ] {
-        assert!(error.user_error().is_none(), "{error:?}");
+        assert!(error.user_message().is_none(), "{error:?}");
     }
 }

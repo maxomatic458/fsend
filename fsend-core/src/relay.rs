@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use colored::Colorize;
 use fsend_proto::{
     code::Code,
     pairing::{Channel, ConnectionInfo, PairingError, Pake, Role, Sealed, Signal},
@@ -18,7 +17,6 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const PEER_TIMEOUT: Duration = Duration::from_secs(60);
 /// In order of preference.
 pub(crate) const TRANSPORTS: [Transport; 2] = [Transport::Iroh, Transport::Webrtc];
-pub(crate) const APP: &str = concat!("fsend-cli ", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Error)]
 pub enum RelayError {
@@ -42,7 +40,7 @@ pub enum RelayError {
 
 impl RelayError {
     /// A message for the errors a user can act on.
-    pub fn user_error(&self) -> Option<String> {
+    pub fn user_message(&self) -> Option<String> {
         let message = match self {
             Self::Connect(_) | Self::ConnectTimeout | Self::Timeout => self.to_string(),
             Self::Pairing(PairingError::WrongCode) => {
@@ -67,7 +65,7 @@ impl RelayError {
                 return None;
             }
         };
-        Some(format!("{} {message}", "error:".red()))
+        Some(message)
     }
 }
 
@@ -81,9 +79,10 @@ pub struct Relay {
 }
 
 /// Creates a session at the relay at `base_url` and pairs with whoever joins
-/// it; `show_code` gets the code for the receiver.
+/// it; `show_code` gets the code for the receiver. `app` names this client to the peer.
 pub async fn pair_as_sender(
     base_url: &Url,
+    app: &str,
     show_code: impl FnOnce(&Code),
 ) -> Result<Relay, RelayError> {
     let mut ws = connect(base_url).await?;
@@ -107,11 +106,11 @@ pub async fn pair_as_sender(
 
     let wait = Duration::from_secs(expires_in.into()) + CONNECT_TIMEOUT;
     let transport = recv_paired(&mut ws, wait).await?;
-    handshake(ws, &code, Role::Sender, transport).await
+    handshake(ws, &code, Role::Sender, transport, app).await
 }
 
 /// Joins the session of `code` at the relay at `base_url`.
-pub async fn pair_as_receiver(base_url: &Url, code: &Code) -> Result<Relay, RelayError> {
+pub async fn pair_as_receiver(base_url: &Url, app: &str, code: &Code) -> Result<Relay, RelayError> {
     let mut ws = connect(base_url).await?;
     send(
         &mut ws,
@@ -123,7 +122,7 @@ pub async fn pair_as_receiver(base_url: &Url, code: &Code) -> Result<Relay, Rela
     )
     .await?;
     let transport = recv_paired(&mut ws, CONNECT_TIMEOUT).await?;
-    handshake(ws, code, Role::Receiver, transport).await
+    handshake(ws, code, Role::Receiver, transport, app).await
 }
 
 /// SPAKE2, then each side's sealed confirm proves both used the same code.
@@ -132,6 +131,7 @@ async fn handshake(
     code: &Code,
     role: Role,
     transport: Transport,
+    app: &str,
 ) -> Result<Relay, RelayError> {
     let (pake, message) = Pake::start(code);
     send_signal(&mut ws, Signal::Pake(message)).await?;
@@ -140,7 +140,7 @@ async fn handshake(
     };
     let mut channel = pake.finish(&peer_message, role)?;
 
-    let confirm = Sealed::Confirm { app: APP.into() };
+    let confirm = Sealed::Confirm { app: app.into() };
     send_signal(&mut ws, Signal::Sealed(channel.seal(&confirm))).await?;
     let Signal::Sealed(peer_confirm) = recv_signal(&mut ws).await? else {
         return Err(PairingError::UnexpectedSignal.into());
@@ -250,6 +250,8 @@ mod tests {
     use fsend_relay::Config;
     use tokio::{net::TcpListener, sync::oneshot};
 
+    const APP: &str = "fsend-core tests";
+
     fn ws(listener: &TcpListener) -> Url {
         Url::parse(&format!("ws://{}", listener.local_addr().unwrap())).unwrap()
     }
@@ -276,10 +278,10 @@ mod tests {
     ) -> (Result<Relay, RelayError>, Result<Relay, RelayError>) {
         let (code_tx, code_rx) = oneshot::channel();
         tokio::join!(
-            pair_as_sender(url, |code| code_tx.send(code.clone()).unwrap()),
+            pair_as_sender(url, APP, |code| code_tx.send(code.clone()).unwrap()),
             async {
                 let code = receiver_code(code_rx.await.unwrap());
-                pair_as_receiver(url, &code).await
+                pair_as_receiver(url, APP, &code).await
             }
         )
     }
@@ -321,7 +323,7 @@ mod tests {
                 matches!(err, RelayError::Pairing(PairingError::WrongCode)),
                 "{err}"
             );
-            assert!(err.user_error().unwrap().contains("did not match"));
+            assert!(err.user_message().unwrap().contains("did not match"));
         }
     }
 
@@ -329,9 +331,9 @@ mod tests {
     async fn an_unknown_code_is_reported() {
         let url = start_relay().await;
         let code = "ZZZZ000000".parse().unwrap();
-        let err = pair_as_receiver(&url, &code).await.err().unwrap();
+        let err = pair_as_receiver(&url, APP, &code).await.err().unwrap();
         assert!(
-            err.user_error()
+            err.user_message()
                 .unwrap()
                 .contains("no session with this code"),
             "{err}"
@@ -352,7 +354,7 @@ mod tests {
             let _ = ws.next().await;
         });
 
-        let err = pair_as_sender(&url, |_| {}).await.err().unwrap();
+        let err = pair_as_sender(&url, APP, |_| {}).await.err().unwrap();
         assert!(matches!(err, RelayError::Protocol(_)), "{err}");
     }
 
@@ -366,7 +368,7 @@ mod tests {
             let _ = ws.close(None).await;
         });
 
-        let err = pair_as_sender(&url, |_| {}).await.err().unwrap();
+        let err = pair_as_sender(&url, APP, |_| {}).await.err().unwrap();
         assert!(matches!(err, RelayError::Closed), "{err}");
     }
 
@@ -375,7 +377,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = ws(&listener);
         drop(listener);
-        let result = pair_as_sender(&url, |_| {}).await;
+        let result = pair_as_sender(&url, APP, |_| {}).await;
         assert!(matches!(result, Err(RelayError::Connect(_))));
     }
 }

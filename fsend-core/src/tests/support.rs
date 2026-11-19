@@ -129,6 +129,10 @@ pub struct RunOptions {
     pub abort_sender_after: Option<u64>,
     /// Abort the receiver once it has written this many bytes.
     pub abort_receiver_after: Option<u64>,
+    /// Cancel the sender once it has handed this many bytes to the transport.
+    pub cancel_sender_after: Option<u64>,
+    /// Cancel the receiver once it has written this many bytes.
+    pub cancel_receiver_after: Option<u64>,
 }
 
 /// What one side reported through its events.
@@ -211,19 +215,24 @@ pub async fn run_offer(peers: Peers, outgoing: &Outgoing, out: &Path, opts: RunO
     let out_dir = out.to_path_buf();
 
     let (mut sender_aborted, mut receiver_aborted) = (false, false);
+    let (sender_cancel, receiver_cancel) = (CancellationToken::new(), CancellationToken::new());
+    let reached = |limit: Option<u64>, moved: u64| limit.is_some_and(|n| moved >= n);
 
     let mut on_send = |event: Event| {
         sending.record(event);
-        if !sender_aborted && opts.abort_sender_after.is_some_and(|n| sending.moved >= n) {
+        if !sender_aborted && reached(opts.abort_sender_after, sending.moved) {
             sender_aborted = true;
             abort_sender();
         }
+        if reached(opts.cancel_sender_after, sending.moved) {
+            sender_cancel.cancel();
+        }
     };
-    let mut on_offer = |entries: &[TopEntry]| {
+    let on_offer = |entries: &[TopEntry]| {
         offered = Some(entries.to_vec());
         (!opts.decline).then(|| out_dir.clone())
     };
-    let mut on_conflict = |_: &[Entry], found: &[Conflict]| {
+    let on_conflict = |_: &[Entry], found: &[Conflict]| {
         conflicts = Some(found.to_vec());
         match opts.replace {
             true => ConflictPolicy::Replace,
@@ -240,19 +249,27 @@ pub async fn run_offer(peers: Peers, outgoing: &Outgoing, out: &Path, opts: RunO
             receiver_aborted = true;
             abort_receiver();
         }
+        if reached(opts.cancel_receiver_after, receiving.moved) {
+            receiver_cancel.cancel();
+        }
     };
 
+    let mut decide = Answer {
+        accept: on_offer,
+        resolve: on_conflict,
+    };
     let send = send_files(
         sender.as_mut(),
         outgoing,
         !opts.no_compression,
         &mut on_send,
+        sender_cancel.clone(),
     );
     let recv = receive_files(
         receiver.as_mut(),
-        &mut on_offer,
-        &mut on_conflict,
+        &mut decide,
         &mut on_receive,
+        receiver_cancel.clone(),
     );
     let (send, recv) =
         tokio::time::timeout(Duration::from_secs(120), async { tokio::join!(send, recv) })
@@ -336,6 +353,9 @@ macro_rules! transport_suite {
             entries_of_another_kind_are_skipped,
             interrupted_by_the_receiver_then_resumed,
             interrupted_by_the_sender_then_resumed,
+            cancelled_by_the_receiver_then_resumed,
+            cancelled_by_the_sender_then_resumed,
+            cancelled_while_deciding,
             a_file_that_vanishes_fails_both_sides,
             receiver_rejects_another_protocol_version,
             sender_stops_when_the_receiver_wants_another_version,
@@ -913,6 +933,126 @@ pub mod suite {
         assert_eq!(std::fs::read(f.out.join("movie.bin")).unwrap(), data);
     }
 
+    /// Stops a transfer of a large file with `opts`, checks what is left is a
+    /// prefix and that a fresh session finishes it; returns the stopped run.
+    async fn stopped_then_resumed(pair: PairFn, opts: RunOptions) -> Outcome {
+        let f = fixture();
+        let data = bytes(INTERRUPT_SIZE, 6);
+        write(&f.src.join("movie.bin"), &data);
+
+        let stopped = run(pair().await, vec![f.src.join("movie.bin")], &f.out, opts).await;
+
+        let partial = std::fs::metadata(f.out.join("movie.bin"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert!(
+            partial < data.len() as u64,
+            "partial file of {partial} bytes"
+        );
+        assert_eq!(
+            std::fs::read(f.out.join("movie.bin")).unwrap_or_default(),
+            &data[..partial as usize]
+        );
+
+        let o = run(
+            pair().await,
+            vec![f.src.join("movie.bin")],
+            &f.out,
+            RunOptions::default(),
+        )
+        .await;
+
+        o.unwrap();
+        assert_eq!(o.sender.moved, data.len() as u64 - partial);
+        assert_eq!(std::fs::read(f.out.join("movie.bin")).unwrap(), data);
+        stopped
+    }
+
+    pub async fn cancelled_by_the_receiver_then_resumed(pair: PairFn) {
+        let opts = RunOptions {
+            cancel_receiver_after: Some(INTERRUPT_AFTER),
+            ..Default::default()
+        };
+        let o = stopped_then_resumed(pair, opts).await;
+        assert!(
+            matches!(o.recv, Err(TransferError::Cancelled)),
+            "{:?}",
+            o.recv
+        );
+        assert!(
+            matches!(o.send, Err(TransferError::PeerCancelled(None))),
+            "{:?}",
+            o.send
+        );
+    }
+
+    pub async fn cancelled_by_the_sender_then_resumed(pair: PairFn) {
+        let opts = RunOptions {
+            cancel_sender_after: Some(INTERRUPT_AFTER),
+            ..Default::default()
+        };
+        let o = stopped_then_resumed(pair, opts).await;
+        assert!(
+            matches!(o.send, Err(TransferError::Cancelled)),
+            "{:?}",
+            o.send
+        );
+        assert!(
+            matches!(o.recv, Err(TransferError::PeerCancelled(None))),
+            "{:?}",
+            o.recv
+        );
+    }
+
+    /// A receiver that cancels while its user is still looking at the offer.
+    struct CancelWhileDeciding(CancellationToken);
+
+    #[async_trait]
+    impl Decide for CancelWhileDeciding {
+        async fn accept(&mut self, _: &[TopEntry]) -> Option<PathBuf> {
+            self.0.cancel();
+            std::future::pending().await
+        }
+
+        async fn resolve(&mut self, _: &[Entry], _: &[Conflict]) -> ConflictPolicy {
+            unreachable!("the offer is never accepted")
+        }
+    }
+
+    pub async fn cancelled_while_deciding(pair: PairFn) {
+        let f = fixture();
+        write(&f.src.join("a.txt"), b"hello");
+        let Peers {
+            mut sender,
+            mut receiver,
+            ..
+        } = pair().await;
+        let outgoing = build_offer(&[f.src.join("a.txt")]).unwrap();
+        let cancel = CancellationToken::new();
+        let mut decide = CancelWhileDeciding(cancel.clone());
+        let (mut on_send, mut on_receive) = (no_event, no_event);
+
+        let send = send_files(
+            sender.as_mut(),
+            &outgoing,
+            true,
+            &mut on_send,
+            CancellationToken::new(),
+        );
+        let recv = receive_files(receiver.as_mut(), &mut decide, &mut on_receive, cancel);
+        let (send, recv) =
+            tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(send, recv) })
+                .await
+                .expect("the transfer hung");
+
+        assert!(matches!(recv, Err(TransferError::Cancelled)), "{recv:?}");
+        assert!(
+            matches!(send, Err(TransferError::PeerCancelled(None))),
+            "{send:?}"
+        );
+        assert!(!f.out.join("a.txt").exists());
+    }
+
     pub async fn a_file_that_vanishes_fails_both_sides(pair: PairFn) {
         let f = fixture();
         write(&f.src.join("gone.txt"), &bytes(100, 1));
@@ -944,8 +1084,17 @@ pub mod suite {
 
         let raw = frames(&[SenderMessage::Hello(hello_for(9, None))]);
         let peer = fake_sender(&mut sender, &raw);
-        let (mut offer, mut conflict, mut event) = (no_offer, no_conflict, no_event);
-        let receive = receive_files(receiver.as_mut(), &mut offer, &mut conflict, &mut event);
+        let mut decide = Answer {
+            accept: no_offer,
+            resolve: no_conflict,
+        };
+        let mut event = no_event;
+        let receive = receive_files(
+            receiver.as_mut(),
+            &mut decide,
+            &mut event,
+            CancellationToken::new(),
+        );
 
         let (got, result) = tokio::join!(peer, receive);
         assert_eq!(got[0], ReceiverMessage::Hello(hello(Some(RECV_WINDOW))));
@@ -976,7 +1125,13 @@ pub mod suite {
         } = pair().await;
         let outgoing = build_offer(&[f.src.join("a.txt")]).unwrap();
         let mut event = no_event;
-        let send = send_files(sender.as_mut(), &outgoing, true, &mut event);
+        let send = send_files(
+            sender.as_mut(),
+            &outgoing,
+            true,
+            &mut event,
+            CancellationToken::new(),
+        );
         tokio::join!(fake_receiver(&mut receiver, raw), send)
     }
 
@@ -985,21 +1140,30 @@ pub mod suite {
         pair: PairFn,
         raw: &[u8],
     ) -> (Vec<ReceiverMessage>, Result<(), TransferError>) {
-        hostile_sender_into(pair, raw, &mut no_offer).await
+        hostile_sender_into(pair, raw, no_offer).await
     }
 
     async fn hostile_sender_into(
         pair: PairFn,
         raw: &[u8],
-        accept: AcceptCb<'_>,
+        accept: impl FnMut(&[TopEntry]) -> Option<PathBuf> + Send,
     ) -> (Vec<ReceiverMessage>, Result<(), TransferError>) {
         let Peers {
             mut sender,
             mut receiver,
             ..
         } = pair().await;
-        let (mut conflict, mut event) = (no_conflict, no_event);
-        let receive = receive_files(receiver.as_mut(), accept, &mut conflict, &mut event);
+        let mut decide = Answer {
+            accept,
+            resolve: no_conflict,
+        };
+        let mut event = no_event;
+        let receive = receive_files(
+            receiver.as_mut(),
+            &mut decide,
+            &mut event,
+            CancellationToken::new(),
+        );
         tokio::join!(fake_sender(&mut sender, raw), receive)
     }
 
@@ -1199,8 +1363,8 @@ pub mod suite {
         };
         let hashes = SenderMessage::Hashes { hashes: vec![] };
         let raw = frames(&[SenderMessage::Hello(ok_hello()), offer, hashes]);
-        let mut accept = |_: &[TopEntry]| Some(f.out.clone());
-        let (got, result) = hostile_sender_into(pair, &raw, &mut accept).await;
+        let accept = |_: &[TopEntry]| Some(f.out.clone());
+        let (got, result) = hostile_sender_into(pair, &raw, accept).await;
         assert_eq!(
             got[1],
             ReceiverMessage::Check {
