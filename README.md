@@ -89,7 +89,7 @@ $ fsend receive K7Q29XMV4P
 ```
 
 ## Licenses
-* fsend-relay and fsend-cli are licensed under MIT. See [LICENCE](fsend-relay/LICENCE) and [LICENCE](fsend-cli/LICENCE).
+* fsend-relay, fsend-core and fsend-cli are licensed under MIT. See [LICENCE](fsend-relay/LICENCE), [LICENCE](fsend-core/LICENCE) and [LICENCE](fsend-cli/LICENCE).
 * fsend-site is licensed under [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/legalcode). See [LICENCE](fsend-site/LICENCE).
 * The fsend logo and the images made from it, everything in [`fsend-site/public/brand`](fsend-site/public/brand), are not covered by these licenses. All rights reserved. See [LICENCE](fsend-site/public/brand/LICENCE).
 

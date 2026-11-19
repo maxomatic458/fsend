@@ -1276,18 +1276,30 @@ dependencies = [
 name = "fsend-cli"
 version = "0.4.0"
 dependencies = [
- "async-trait",
- "bytes",
  "clap",
  "clap_complete",
  "clap_mangen",
  "color-eyre",
  "colored",
  "dialoguer",
+ "fsend-core",
+ "fsend-proto",
+ "indicatif",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
+name = "fsend-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
  "fsend-proto",
  "fsend-relay",
  "futures-util",
- "indicatif",
  "iroh",
  "rtc",
  "serde_json",
@@ -1298,7 +1310,6 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tokio-util",
  "tracing",
- "tracing-subscriber",
  "url",
  "webrtc",
 ]

@@ -5,7 +5,6 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use colored::Colorize;
 use fsend_proto::peer::block::{self, BlockDecoder};
 use fsend_proto::peer::frame::{self, FrameDecoder};
 use fsend_proto::peer::limits::{
@@ -25,6 +24,7 @@ use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 /// Chunk size for stream reads and writes.
 pub(crate) const BUF_SIZE: usize = 64 * 1024;
@@ -55,6 +55,9 @@ pub enum TransferError {
     /// We declined the offer.
     #[error("transfer declined")]
     Declined,
+    /// We cancelled the transfer.
+    #[error("transfer cancelled")]
+    Cancelled,
     #[error("the peer declined the files")]
     PeerDeclined(Option<String>),
     #[error("the peer cancelled the transfer")]
@@ -88,42 +91,36 @@ pub enum TransferError {
 
 impl TransferError {
     /// A message for the errors a user can act on.
-    pub fn user_error(&self) -> Option<String> {
-        let error = "error:".red();
+    pub fn user_message(&self) -> Option<String> {
         let update = "Update fsend on both sides.";
         Some(match self {
-            Self::Declined => "Transfer declined.".to_owned(),
-            Self::PeerDeclined(_)
+            Self::Declined
+            | Self::Cancelled
+            | Self::PeerDeclined(_)
             | Self::PeerCancelled(_)
             | Self::Unsendable(_)
-            | Self::Timeout(_) => {
-                format!("{error} {self}")
-            }
+            | Self::Timeout(_) => self.to_string(),
             Self::Disconnected(reason) => format!(
-                "{error} the connection to the peer was lost ({reason}).\n\
+                "the connection to the peer was lost ({reason}).\n\
                  Start a new session to resume the transfer where it stopped."
             ),
-            Self::Version { .. } => format!("{error} {self}.\n{update}"),
+            Self::Version { .. } => format!("{self}.\n{update}"),
             Self::Peer {
                 code: ErrorCode::Version,
                 message,
-            } => format!("{error} the peer speaks another protocol version ({message}).\n{update}"),
-            Self::Peer { message, .. } => format!("{error} the peer failed: {message}"),
+            } => format!("the peer speaks another protocol version ({message}).\n{update}"),
+            Self::Peer { message, .. } => format!("the peer failed: {message}"),
             Self::PathsNotFound(paths) => {
-                let noun = if paths.len() == 1 {
-                    "path does"
-                } else {
-                    "paths do"
-                };
                 let list: String = paths
                     .iter()
-                    .map(|p| format!("\n - {}", p.display().to_string().blue()))
+                    .map(|p| format!("\n - {}", p.display()))
                     .collect();
-                format!("{error} {} {noun} not exist:{list}", paths.len())
+                format!("{}:{list}", missing_paths(paths.len()))
             }
-            Self::PeerTimeout => format!(
-                "{error} the peer did not connect in time. Check that both sides are online and try again."
-            ),
+            Self::PeerTimeout => {
+                "the peer did not connect in time. Check that both sides are online and try again."
+                    .to_owned()
+            }
             Self::Io(_)
             | Self::InvalidOffer(_)
             | Self::Protocol(_)
@@ -159,6 +156,12 @@ impl TransferError {
     }
 }
 
+/// "`n` paths do not exist", for a list of the paths to follow.
+pub fn missing_paths(n: usize) -> String {
+    let noun = if n == 1 { "path does" } else { "paths do" };
+    format!("{n} {noun} not exist")
+}
+
 /// A QUIC connection that fails has lost the peer.
 impl From<iroh::endpoint::ConnectionError> for TransferError {
     fn from(e: iroh::endpoint::ConnectionError) -> Self {
@@ -191,10 +194,36 @@ pub enum Event<'a> {
 }
 
 pub type EventCb<'a> = &'a mut (dyn FnMut(Event<'_>) + Send);
-/// The directory to receive into, or `None` to decline.
-pub type AcceptCb<'a> = &'a mut (dyn FnMut(&[TopEntry]) -> Option<PathBuf> + Send);
-/// What to do with the entries of the offer that conflict with local ones.
-pub type ConflictCb<'a> = &'a mut (dyn FnMut(&[Entry], &[Conflict]) -> ConflictPolicy + Send);
+
+/// The receiver's answers about an offer, which may take as long as a user does.
+#[async_trait]
+pub trait Decide: Send {
+    /// The directory to receive into, or `None` to decline.
+    async fn accept(&mut self, offer: &[TopEntry]) -> Option<PathBuf>;
+    /// What to do with the entries of the offer that conflict with local ones.
+    async fn resolve(&mut self, entries: &[Entry], conflicts: &[Conflict]) -> ConflictPolicy;
+}
+
+/// Answers right away with the `accept` and `resolve` closures.
+pub struct Answer<A, R> {
+    pub accept: A,
+    pub resolve: R,
+}
+
+#[async_trait]
+impl<A, R> Decide for Answer<A, R>
+where
+    A: FnMut(&[TopEntry]) -> Option<PathBuf> + Send,
+    R: FnMut(&[Entry], &[Conflict]) -> ConflictPolicy + Send,
+{
+    async fn accept(&mut self, offer: &[TopEntry]) -> Option<PathBuf> {
+        (self.accept)(offer)
+    }
+
+    async fn resolve(&mut self, entries: &[Entry], conflicts: &[Conflict]) -> ConflictPolicy {
+        (self.resolve)(entries, conflicts)
+    }
+}
 
 /// How the peers are connected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -517,20 +546,37 @@ async fn goodbye<Out: Message + Debug, In: PeerMessage>(
     .await;
 }
 
-/// Tells the peer why `result` failed, if it should know, as `error(report)`.
+/// Tells the peer why `result` failed, if it should know, as `error(report)`
+/// or as `cancel`.
 async fn explain<Out: Message + Debug, In: PeerMessage>(
     transport: &mut dyn Transport,
     control: &mut Control<Out, In>,
     result: Result<(), TransferError>,
     error: fn(ErrorReport) -> Out,
+    cancel: Out,
 ) -> Result<(), TransferError> {
-    if let Err(failure) = &result
-        && let Some(report) = failure.report()
-        && control.send(&error(report)).await.is_ok()
+    let last_word = match &result {
+        Ok(()) => None,
+        Err(TransferError::Cancelled) => Some(cancel),
+        Err(failure) => failure.report().map(error),
+    };
+    if let Some(message) = last_word
+        && control.send(&message).await.is_ok()
     {
         goodbye(transport, control).await;
     }
     result
+}
+
+/// `work`, unless `cancel` fires first.
+async fn cancellable<T>(
+    cancel: &CancellationToken,
+    work: impl Future<Output = Result<T, TransferError>>,
+) -> Result<T, TransferError> {
+    cancel
+        .run_until_cancelled(work)
+        .await
+        .unwrap_or(Err(TransferError::Cancelled))
 }
 
 /// Bytes of the accepted files still to move.
@@ -542,17 +588,31 @@ fn remaining(entries: &[Entry], files: &[AcceptedFile]) -> u64 {
 }
 
 /// Sends `outgoing`, zstd-compressing the data where that helps if `compress`.
+/// Once `cancel` fires, the receiver is told and the transfer ends.
 pub async fn send_files(
     transport: &mut dyn Transport,
     outgoing: &Outgoing,
     compress: bool,
     on_event: EventCb<'_>,
+    cancel: CancellationToken,
 ) -> Result<(), TransferError> {
-    let result = match transport.control().await {
+    let result = match cancellable(&cancel, transport.control()).await {
         Ok(stream) => {
             let mut control = Control::new(stream);
-            let result = send(transport, &mut control, outgoing, compress, on_event).await;
-            explain(transport, &mut control, result, SenderMessage::Error).await
+            let result = cancellable(
+                &cancel,
+                send(transport, &mut control, outgoing, compress, on_event),
+            )
+            .await;
+            let cancel = SenderMessage::Cancel(Cancel { reason: None });
+            explain(
+                transport,
+                &mut control,
+                result,
+                SenderMessage::Error,
+                cancel,
+            )
+            .await
         }
         Err(e) => Err(e),
     };
@@ -645,9 +705,15 @@ async fn send(
                 counted = now;
             };
             let write = window.write(data.as_mut(), &frame, control, &mut on_written);
-            timeout(IDLE_TIMEOUT, write)
-                .await
-                .map_err(|_| TransferError::Timeout(RECEIVER_IDLE))??;
+            match timeout(IDLE_TIMEOUT, write).await {
+                Ok(Ok(())) => {}
+                // The receiver may say why it stopped the data stream.
+                Ok(Err(lost @ TransferError::Disconnected(_))) => {
+                    return Err(window.last_word(control, lost).await);
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err(TransferError::Timeout(RECEIVER_IDLE)),
+            }
         }
         timeout(IDLE_TIMEOUT, data.shutdown())
             .await
@@ -754,6 +820,31 @@ impl Window {
         Ok(())
     }
 
+    /// What the receiver says past its acks, or `lost` if it says nothing in time.
+    async fn last_word(
+        &mut self,
+        control: &mut SenderControl,
+        lost: TransferError,
+    ) -> TransferError {
+        let said = async {
+            loop {
+                match control.recv().await {
+                    Ok(message) => {
+                        if let Err(e) = self.ack(message) {
+                            return Some(e);
+                        }
+                    }
+                    Err(_) => return None,
+                }
+            }
+        };
+        timeout(GOODBYE_TIMEOUT, said)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(lost)
+    }
+
     fn ack(&mut self, message: ReceiverMessage) -> Result<(), TransferError> {
         match message {
             ReceiverMessage::Ack { bytes } if (self.acked..=self.sent).contains(&bytes) => {
@@ -768,21 +859,36 @@ impl Window {
     }
 }
 
+/// Receives what the sender offers, as `decide` answers. Once `cancel` fires,
+/// the sender is told and the transfer ends.
 pub async fn receive_files(
     transport: &mut dyn Transport,
-    accept: AcceptCb<'_>,
-    on_conflict: ConflictCb<'_>,
+    decide: &mut dyn Decide,
     on_event: EventCb<'_>,
+    cancel: CancellationToken,
 ) -> Result<(), TransferError> {
     // Over iroh the stream only shows up once the sender has written to it.
-    let result = match timeout(HELLO_TIMEOUT, transport.control()).await {
-        Ok(Ok(stream)) => {
+    let control = async {
+        timeout(HELLO_TIMEOUT, transport.control())
+            .await
+            .map_err(|_| TransferError::Timeout(SENDER_HELLO))?
+    };
+    let result = match cancellable(&cancel, control).await {
+        Ok(stream) => {
             let mut control = Control::new(stream);
-            let result = receive(transport, &mut control, accept, on_conflict, on_event).await;
-            explain(transport, &mut control, result, ReceiverMessage::Error).await
+            let result =
+                cancellable(&cancel, receive(transport, &mut control, decide, on_event)).await;
+            let cancel = ReceiverMessage::Cancel(Cancel { reason: None });
+            explain(
+                transport,
+                &mut control,
+                result,
+                ReceiverMessage::Error,
+                cancel,
+            )
+            .await
         }
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(TransferError::Timeout(SENDER_HELLO)),
+        Err(e) => Err(e),
     };
     transport.close(result.is_ok()).await;
     result
@@ -791,8 +897,7 @@ pub async fn receive_files(
 async fn receive(
     transport: &mut dyn Transport,
     control: &mut ReceiverControl,
-    accept: AcceptCb<'_>,
-    on_conflict: ConflictCb<'_>,
+    decide: &mut dyn Decide,
     on_event: EventCb<'_>,
 ) -> Result<(), TransferError> {
     control
@@ -812,7 +917,7 @@ async fn receive(
     offer::validate(&entries).map_err(TransferError::InvalidOffer)?;
     let (tops, top_of) = progress::top_entries(&entries);
 
-    let Some(out) = accept(&tops) else {
+    let Some(out) = decide.accept(&tops).await else {
         control
             .send(&ReceiverMessage::Reject { reason: None })
             .await?;
@@ -834,7 +939,7 @@ async fn receive(
     let plan = resume::plan(&entries, &local, &verified);
     let policy = match plan.conflicts.is_empty() {
         true => ConflictPolicy::Skip,
-        false => on_conflict(&entries, &plan.conflicts),
+        false => decide.resolve(&entries, &plan.conflicts).await,
     };
     let files = plan.accept(policy);
     control

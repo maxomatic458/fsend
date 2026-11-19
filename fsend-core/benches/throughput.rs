@@ -1,4 +1,4 @@
-// Throughput of a CLI transfer over iroh and WebRTC:
+// Throughput of a transfer over iroh and WebRTC:
 //
 //     cargo bench
 //     FSEND_BENCH_MIB=1024 FSEND_BENCH_RUNS=5 cargo bench
@@ -13,13 +13,16 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
 
-use fsend_cli::iroh::IrohTransfer;
-use fsend_cli::transfer::{Event, Transport, build_offer, receive_files, send_files};
-use fsend_cli::webrtc::{WebRtcConfig, WebRtcTransfer};
+use fsend_core::iroh::IrohTransfer;
+use fsend_core::transfer::{Answer, Event, Transport, build_offer, receive_files, send_files};
+use fsend_core::webrtc::{WebRtcConfig, WebRtcTransfer};
 use fsend_proto::pairing::ConnectionInfo;
-use fsend_proto::peer::resume::ConflictPolicy;
+use fsend_proto::peer::Entry;
+use fsend_proto::peer::progress::TopEntry;
+use fsend_proto::peer::resume::{Conflict, ConflictPolicy};
 use iroh::Endpoint;
 use iroh::endpoint::presets;
+use tokio_util::sync::CancellationToken;
 
 fn env_or(name: &str, default: u64) -> u64 {
     std::env::var(name)
@@ -63,9 +66,15 @@ fn send_harness(payload: PathBuf, transfer: impl Future<Output = Box<dyn Transpo
     runtime().block_on(async {
         let outgoing = build_offer(&[payload]).expect("offer");
         let mut transfer = transfer.await;
-        send_files(transfer.as_mut(), &outgoing, compress(), &mut |_| {})
-            .await
-            .expect("send");
+        send_files(
+            transfer.as_mut(),
+            &outgoing,
+            compress(),
+            &mut |_| {},
+            CancellationToken::new(),
+        )
+        .await
+        .expect("send");
     });
 }
 
@@ -80,13 +89,16 @@ fn receive_harness(
         let out_dir = out.clone();
         receive_files(
             transfer.as_mut(),
-            &mut |_| Some(out_dir.clone()),
-            &mut |_, _| ConflictPolicy::Replace,
+            &mut Answer {
+                accept: |_: &[TopEntry]| Some(out_dir.clone()),
+                resolve: |_: &[Entry], _: &[Conflict]| ConflictPolicy::Replace,
+            },
             &mut |event| {
                 if matches!(event, Event::Started { .. }) {
                     started = Some(Instant::now());
                 }
             },
+            CancellationToken::new(),
         )
         .await
         .expect("receive");

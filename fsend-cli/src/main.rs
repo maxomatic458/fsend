@@ -10,17 +10,22 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use fsend_cli::cli::{Args, Mode, OnConflict};
-use fsend_cli::iroh::IrohTransfer;
-use fsend_cli::relay::{Relay, RelayError, pair_as_receiver, pair_as_sender};
-use fsend_cli::transfer::{self, ConnectionKind, Event, TransferError, build_offer};
-use fsend_cli::webrtc::WebRtcTransfer;
+use cli::{Args, Mode, OnConflict};
+use fsend_core::connect::{connect_as_receiver, connect_as_sender};
+use fsend_core::relay::{pair_as_receiver, pair_as_sender};
+use fsend_core::transfer::{
+    self, Answer, ConnectionKind, Event, TransferError, build_offer, missing_paths,
+};
+use fsend_core::{CancellationToken, Error};
 use fsend_proto::code::Code;
-use fsend_proto::pairing::ConnectionInfo;
 use fsend_proto::peer::resume::{Conflict, ConflictPolicy};
 use fsend_proto::peer::{self, Entry, progress::TopEntry};
-use fsend_proto::relay::Transport;
 use url::Url;
+
+mod cli;
+
+/// How this client introduces itself to the peer.
+const APP: &str = concat!("fsend-cli ", env!("CARGO_PKG_VERSION"));
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -28,15 +33,7 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     };
 
-    let user_error = report
-        .downcast_ref::<TransferError>()
-        .and_then(TransferError::user_error)
-        .or_else(|| {
-            report
-                .downcast_ref::<RelayError>()
-                .and_then(RelayError::user_error)
-        });
-    match user_error {
+    match report.downcast_ref::<Error>().and_then(user_error) {
         Some(msg) => eprintln!("{msg}"),
         None => eprintln!("{report:?}"),
     }
@@ -75,6 +72,22 @@ async fn run() -> color_eyre::Result<()> {
     Ok(())
 }
 
+/// What to tell the user about `error`, if they can act on it.
+fn user_error(error: &Error) -> Option<String> {
+    let message = match error {
+        Error::Transfer(TransferError::Declined) => return Some("Transfer declined.".into()),
+        Error::Transfer(TransferError::PathsNotFound(paths)) => {
+            let list: String = paths
+                .iter()
+                .map(|p| format!("\n - {}", p.display().to_string().blue()))
+                .collect();
+            format!("{}:{list}", missing_paths(paths.len()))
+        }
+        error => error.user_message()?,
+    };
+    Some(format!("{} {message}", "error:".red()))
+}
+
 /// At error level, libraries are silenced: webrtc logs errors that are not.
 fn log_filter(level: tracing::Level) -> Targets {
     let own = LevelFilter::from_level(level);
@@ -99,71 +112,15 @@ fn print_version() {
     }
 }
 
-async fn connect_as_sender(relay: &mut Relay) -> color_eyre::Result<Box<dyn transfer::Transport>> {
-    match relay.transport {
-        Transport::Iroh => {
-            let endpoint = IrohTransfer::create_endpoint().await?;
-            let my_info = IrohTransfer::local_connection_info(&endpoint).await;
-
-            relay.send_connection(my_info).await?;
-            let peer_info = relay.connection().await?;
-
-            Ok(Box::new(IrohTransfer::accept(endpoint, &peer_info).await?))
-        }
-        Transport::Webrtc => {
-            let (mut wrt, offer_sdp) = WebRtcTransfer::create_offerer().await?;
-            let my_info = ConnectionInfo::WebRtc { sdp: offer_sdp };
-
-            relay.send_connection(my_info).await?;
-            let ConnectionInfo::WebRtc { sdp: answer_sdp } = relay.connection().await? else {
-                return Err(TransferError::UnexpectedConnectionInfo.into());
-            };
-            wrt.set_answer(&answer_sdp).await?;
-            wrt.wait_connected().await?;
-            Ok(Box::new(wrt))
-        }
-    }
-}
-
-async fn connect_as_receiver(
-    relay: &mut Relay,
-) -> color_eyre::Result<Box<dyn transfer::Transport>> {
-    match relay.transport {
-        Transport::Iroh => {
-            let endpoint = IrohTransfer::create_endpoint().await?;
-            // Finding our own address can take a while; the sender's arrives meanwhile.
-            let (my_info, peer_info) = tokio::try_join!(
-                async { Ok(IrohTransfer::local_connection_info(&endpoint).await) },
-                relay.connection()
-            )?;
-            relay.send_connection(my_info).await?;
-
-            Ok(Box::new(IrohTransfer::connect(endpoint, &peer_info).await?))
-        }
-        Transport::Webrtc => {
-            let ConnectionInfo::WebRtc { sdp: offer_sdp } = relay.connection().await? else {
-                return Err(TransferError::UnexpectedConnectionInfo.into());
-            };
-
-            let (mut wrt, answer_sdp) = WebRtcTransfer::create_answerer(&offer_sdp).await?;
-            let my_info = ConnectionInfo::WebRtc { sdp: answer_sdp };
-            relay.send_connection(my_info).await?;
-
-            wrt.wait_connected().await?;
-            Ok(Box::new(wrt))
-        }
-    }
-}
-
 async fn run_send(
     relay_url: &Url,
     download_url: &Url,
     files: Vec<PathBuf>,
     compress: bool,
-) -> color_eyre::Result<()> {
+) -> Result<(), Error> {
     let outgoing = build_offer(&files)?;
 
-    let mut relay = pair_as_sender(relay_url, |code| {
+    let mut relay = pair_as_sender(relay_url, APP, |code| {
         let link = code.link(download_url.as_str());
         let code = code.to_string();
         println!("Code: {}\n", code.bright_white());
@@ -179,9 +136,13 @@ async fn run_send(
     announce_connection(transport.as_ref()).await;
 
     let mut progress = Progress::default();
-    transfer::send_files(transport.as_mut(), &outgoing, compress, &mut |event| {
-        progress.on_event(event)
-    })
+    transfer::send_files(
+        transport.as_mut(),
+        &outgoing,
+        compress,
+        &mut |event| progress.on_event(event),
+        CancellationToken::new(),
+    )
     .await?;
 
     println!("\nTransfer complete.");
@@ -194,27 +155,34 @@ async fn run_receive(
     output_dir: PathBuf,
     on_conflict: OnConflict,
     auto_accept: bool,
-) -> color_eyre::Result<()> {
-    let mut relay = pair_as_receiver(relay_url, &code).await?;
+) -> Result<(), Error> {
+    let mut relay = pair_as_receiver(relay_url, APP, &code).await?;
     let mut transport = connect_as_receiver(&mut relay).await?;
     drop(relay);
     announce_connection(transport.as_ref()).await;
 
     let mut progress = Progress::default();
-    transfer::receive_files(
-        transport.as_mut(),
-        &mut |offered| {
+    // The prompts block, so they leave the async workers to the transfer.
+    let mut decide = Answer {
+        accept: |offered: &[TopEntry]| {
             if auto_accept {
                 println!("Auto-accepting files.");
                 Some(output_dir.clone())
-            } else if accept_files(offered) {
+            } else if tokio::task::block_in_place(|| accept_files(offered)) {
                 Some(output_dir.clone())
             } else {
                 None
             }
         },
-        &mut |entries, conflicts| resolve_conflicts(entries, conflicts, on_conflict),
+        resolve: |entries: &[Entry], conflicts: &[Conflict]| {
+            tokio::task::block_in_place(|| resolve_conflicts(entries, conflicts, on_conflict))
+        },
+    };
+    transfer::receive_files(
+        transport.as_mut(),
+        &mut decide,
         &mut |event| progress.on_event(event),
+        CancellationToken::new(),
     )
     .await?;
 
