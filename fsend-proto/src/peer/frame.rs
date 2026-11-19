@@ -7,7 +7,7 @@ use std::{
 use thiserror::Error;
 use zstd::bulk::Compressor;
 
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 
 use super::{
     Message,
@@ -53,6 +53,19 @@ pub fn encode(message: &impl Serialize) -> Result<Vec<u8>, FrameError> {
         return Err(FrameError::TooLarge(frame.len() - HEADER_BYTES));
     }
     Ok(frame)
+}
+
+/// `u8 flags | payload` of a frame of `message`, without the length: how sealed pairing messages carry theirs.
+pub fn encode_body(message: &impl Serialize) -> Result<Vec<u8>, FrameError> {
+    let mut frame = encode(message)?;
+    frame.drain(..HEADER_BYTES);
+    Ok(frame)
+}
+
+/// The message in a body from [`encode_body`].
+pub fn decode_body<M: DeserializeOwned>(body: &[u8]) -> Result<M, FrameError> {
+    let (&flags, payload) = body.split_first().ok_or(FrameError::Empty)?;
+    decode(flags, payload)
 }
 
 /// The frame of `head` and the compressed `payload` if it is smaller than the raw frame of `payload`, else that one.
@@ -187,7 +200,7 @@ impl FrameDecoder {
     }
 }
 
-fn decode<M: Message>(flags: u8, payload: &[u8]) -> Result<M, FrameError> {
+fn decode<M: DeserializeOwned>(flags: u8, payload: &[u8]) -> Result<M, FrameError> {
     let json = match flags {
         0 => Cow::Borrowed(payload),
         ZSTD => Cow::Owned(decompress(payload)?),
@@ -214,9 +227,7 @@ fn decompress(payload: &[u8]) -> Result<Vec<u8>, FrameError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::peer::{
-        AcceptedFile, Entry, ErrorCode, ErrorReport, ReceiverMessage, SenderMessage,
-    };
+    use crate::peer::{AcceptedFile, ErrorCode, ErrorReport, ReceiverMessage, SenderMessage};
 
     fn decode_all<M: Message>(bytes: &[u8]) -> Result<Vec<M>, FrameError> {
         let mut decoder = FrameDecoder::default();
@@ -233,12 +244,12 @@ mod tests {
         decode_all(bytes)
     }
 
-    fn big_offer(files: usize) -> SenderMessage {
-        SenderMessage::Offer {
-            entries: (0..files)
-                .map(|i| Entry::File {
-                    path: vec![format!("file-{i}.bin")],
-                    size: i as u64,
+    fn big_accept(files: u32) -> ReceiverMessage {
+        ReceiverMessage::Accept {
+            files: (0..files)
+                .map(|id| AcceptedFile {
+                    id,
+                    offset: id as u64 * 7,
                 })
                 .collect(),
         }
@@ -259,11 +270,26 @@ mod tests {
 
     #[test]
     fn large_messages_are_compressed_and_round_trip() {
-        let offer = big_offer(5000);
-        let frame = encode(&offer).unwrap();
+        let accept = big_accept(5000);
+        let frame = encode(&accept).unwrap();
         assert_eq!(frame[4], ZSTD);
-        assert!(frame.len() < serde_json::to_vec(&offer).unwrap().len() / 2);
-        assert_eq!(decode_all(&frame), Ok(vec![offer]));
+        assert!(frame.len() < serde_json::to_vec(&accept).unwrap().len() / 2);
+        assert_eq!(decode_all(&frame), Ok(vec![accept]));
+    }
+
+    #[test]
+    fn bodies_are_frames_without_the_length() {
+        for message in [ReceiverMessage::Done, big_accept(5000)] {
+            let frame = encode(&message).unwrap();
+            let body = encode_body(&message).unwrap();
+            assert_eq!(body, frame[HEADER_BYTES..]);
+            assert_eq!(decode_body(&body), Ok(message));
+        }
+        assert_eq!(decode_body::<ReceiverMessage>(&[]), Err(FrameError::Empty));
+        assert_eq!(
+            decode_body::<ReceiverMessage>(&[2, b'{', b'}']),
+            Err(FrameError::Flags(2))
+        );
     }
 
     #[test]
@@ -309,7 +335,7 @@ mod tests {
             br#"{"type":"ack"}"#,
             // An unknown type, and one only the sender sends.
             br#"{"type":"later","x":[1]}"#,
-            br#"{"type":"offer","entries":[]}"#,
+            br#"{"type":"hashes","hashes":[]}"#,
             // Flags without a payload.
             b"",
         ] {

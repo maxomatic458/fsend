@@ -1,16 +1,18 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+use checksum::{Algorithm, Digest};
 use resume::Fingerprint;
 
 pub mod block;
+pub mod checksum;
 pub mod frame;
 pub mod limits;
 pub mod offer;
 pub mod progress;
 pub mod resume;
 
-pub const VERSION: u32 = 4;
-pub const MIN_VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
+pub const MIN_VERSION: u32 = 5;
 pub const FSEND_ALPN: &[u8] = b"fsend";
 
 /// What the sender sends. Any other `type` or an unknown value fails to parse; unknown fields are ignored.
@@ -20,10 +22,6 @@ pub const FSEND_ALPN: &[u8] = b"fsend";
 pub enum SenderMessage {
     /// Sent first.
     Hello(Hello),
-    /// The entries on offer; an entry's id is its index.
-    Offer {
-        entries: Vec<Entry>,
-    },
     /// The fingerprint of each file in the receiver's `check`, in its order.
     Hashes {
         hashes: Vec<Fingerprint>,
@@ -47,11 +45,6 @@ pub enum ReceiverMessage {
     Accept {
         files: Vec<AcceptedFile>,
     },
-    Reject {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "ts", ts(optional))]
-        reason: Option<String>,
-    },
     /// Bytes written so far, cumulative.
     Ack {
         bytes: u64,
@@ -72,7 +65,6 @@ impl Message for SenderMessage {
     fn kind(&self) -> &'static str {
         match self {
             Self::Hello(_) => "hello",
-            Self::Offer { .. } => "offer",
             Self::Hashes { .. } => "hashes",
             Self::Cancel(_) => "cancel",
             Self::Error(_) => "error",
@@ -86,7 +78,6 @@ impl Message for ReceiverMessage {
             Self::Hello(_) => "hello",
             Self::Check { .. } => "check",
             Self::Accept { .. } => "accept",
-            Self::Reject { .. } => "reject",
             Self::Ack { .. } => "ack",
             Self::Done => "done",
             Self::Cancel(_) => "cancel",
@@ -124,12 +115,82 @@ pub struct ErrorReport {
     pub message: String,
 }
 
+/// What the sender offers: a tree of files and directories. An entry's id is
+/// its index in [`Offer::flatten`], each directory before what it holds.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct Offer {
+    /// How the files are checksummed, if they are.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub checksums: Option<Algorithm>,
+    /// The top-level entries.
+    pub entries: Vec<Node>,
+}
+
+/// An entry of an [`Offer`] as it goes on the wire, a directory with what it holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum Node {
+    File {
+        name: String,
+        size: u64,
+        /// Under the offer's algorithm; on every file if it has one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        checksum: Option<Digest>,
+    },
+    Dir {
+        name: String,
+        entries: Vec<Node>,
+    },
+}
+
+impl Node {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::File { name, .. } | Self::Dir { name, .. } => name,
+        }
+    }
+
+    /// For a directory, the bytes of every file below it.
+    pub fn size(&self) -> u64 {
+        match self {
+            Self::File { size, .. } => *size,
+            Self::Dir { entries, .. } => entries.iter().map(Self::size).sum(),
+        }
+    }
+
+    /// The files it is, or holds.
+    pub fn files(&self) -> u64 {
+        match self {
+            Self::File { .. } => 1,
+            Self::Dir { entries, .. } => entries.iter().map(Self::files).sum(),
+        }
+    }
+
+    pub fn is_dir(&self) -> bool {
+        matches!(self, Self::Dir { .. })
+    }
+}
+
+/// An entry of an [`Offer`] by its full path, as [`Offer::flatten`] lists them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum Entry {
-    File { path: Vec<String>, size: u64 },
-    Dir { path: Vec<String> },
+    File {
+        path: Vec<String>,
+        size: u64,
+        /// Under the offer's algorithm; on every file if it has one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        checksum: Option<Digest>,
+    },
+    Dir {
+        path: Vec<String>,
+    },
 }
 
 impl Entry {
@@ -149,6 +210,13 @@ impl Entry {
 
     pub fn is_dir(&self) -> bool {
         matches!(self, Self::Dir { .. })
+    }
+
+    pub fn checksum(&self) -> Option<&Digest> {
+        match self {
+            Self::File { checksum, .. } => checksum.as_ref(),
+            Self::Dir { .. } => None,
+        }
     }
 }
 
@@ -173,7 +241,6 @@ pub struct CheckedFile {
 pub enum ErrorCode {
     Version,
     Protocol,
-    InvalidOffer,
     Io,
     Timeout,
     Internal,
@@ -208,7 +275,7 @@ mod tests {
 
     fn report() -> ErrorReport {
         ErrorReport {
-            code: ErrorCode::InvalidOffer,
+            code: ErrorCode::Protocol,
             message: "m".into(),
         }
     }
@@ -217,21 +284,7 @@ mod tests {
     fn sender_messages_keep_their_wire_format() {
         pinned(
             SenderMessage::Hello(hello(None)),
-            r#"{"type":"hello","version":4,"min_version":4,"features":[]}"#,
-        );
-        pinned(
-            SenderMessage::Offer {
-                entries: vec![
-                    Entry::Dir {
-                        path: vec!["d".into()],
-                    },
-                    Entry::File {
-                        path: vec!["d".into(), "a.txt".into()],
-                        size: 3,
-                    },
-                ],
-            },
-            r#"{"type":"offer","entries":[{"kind":"dir","path":["d"]},{"kind":"file","path":["d","a.txt"],"size":3}]}"#,
+            r#"{"type":"hello","version":5,"min_version":5,"features":[]}"#,
         );
         pinned(
             SenderMessage::Hashes {
@@ -246,7 +299,7 @@ mod tests {
         );
         pinned(
             SenderMessage::Error(report()),
-            r#"{"type":"error","code":"invalid_offer","message":"m"}"#,
+            r#"{"type":"error","code":"protocol","message":"m"}"#,
         );
     }
 
@@ -254,7 +307,7 @@ mod tests {
     fn receiver_messages_keep_their_wire_format() {
         pinned(
             ReceiverMessage::Hello(hello(Some(1024))),
-            r#"{"type":"hello","version":4,"min_version":4,"features":[],"recv_window":1024}"#,
+            r#"{"type":"hello","version":5,"min_version":5,"features":[],"recv_window":1024}"#,
         );
         pinned(
             ReceiverMessage::Check {
@@ -267,16 +320,6 @@ mod tests {
                 files: vec![AcceptedFile { id: 1, offset: 2 }],
             },
             r#"{"type":"accept","files":[{"id":1,"offset":2}]}"#,
-        );
-        pinned(
-            ReceiverMessage::Reject { reason: None },
-            r#"{"type":"reject"}"#,
-        );
-        pinned(
-            ReceiverMessage::Reject {
-                reason: Some("no".into()),
-            },
-            r#"{"type":"reject","reason":"no"}"#,
         );
         pinned(
             ReceiverMessage::Ack { bytes: 9 },
@@ -293,7 +336,7 @@ mod tests {
         );
         pinned(
             ReceiverMessage::Error(report()),
-            r#"{"type":"error","code":"invalid_offer","message":"m"}"#,
+            r#"{"type":"error","code":"protocol","message":"m"}"#,
         );
     }
 
@@ -308,19 +351,16 @@ mod tests {
         ] {
             assert!(from_sender(json).is_err(), "{json}");
         }
-        for json in [
-            r#"{"type":"offer","entries":[]}"#,
-            r#"{"type":"hashes","hashes":[]}"#,
-        ] {
-            assert!(from_receiver(json).is_err(), "{json}");
-        }
+        assert!(from_receiver(r#"{"type":"hashes","hashes":[]}"#).is_err());
         for json in [
             r#"{"type":"resume","x":1}"#,
             r#"{"x":1}"#,
             r#"{"type":"ack"}"#,
             // Unknown values inside a message, too.
             r#"{"type":"error","code":"disk_on_fire","message":"m"}"#,
-            r#"{"type":"offer","entries":[{"kind":"link","path":["a"]}]}"#,
+            // The offer and its answer travel in pairing now.
+            r#"{"type":"offer","entries":[]}"#,
+            r#"{"type":"reject"}"#,
             r#"{"type":"hashes","hashes":["0123"]}"#,
             r#"{"type":"hashes","hashes":["0123456789ABCDEF0011223344556677"]}"#,
         ] {
@@ -333,12 +373,12 @@ mod tests {
     fn unknown_fields_are_ignored() {
         assert_eq!(
             serde_json::from_str::<SenderMessage>(
-                r#"{"type":"hello","version":5,"min_version":4,"extra":true}"#
+                r#"{"type":"hello","version":6,"min_version":5,"extra":true}"#
             )
             .unwrap(),
             SenderMessage::Hello(Hello {
-                version: 5,
-                min_version: 4,
+                version: 6,
+                min_version: 5,
                 features: vec![],
                 recv_window: None,
             })
@@ -350,14 +390,69 @@ mod tests {
     }
 
     #[test]
+    fn nodes_keep_their_wire_format() {
+        let checksum = Digest::from(&[0xab; 32][..]);
+        let hex = "ab".repeat(32);
+        pinned(
+            Node::Dir {
+                name: "d".into(),
+                entries: vec![
+                    Node::File {
+                        name: "a.txt".into(),
+                        size: 3,
+                        checksum: None,
+                    },
+                    Node::Dir {
+                        name: "e".into(),
+                        entries: vec![],
+                    },
+                ],
+            },
+            r#"{"kind":"dir","name":"d","entries":[{"kind":"file","name":"a.txt","size":3},{"kind":"dir","name":"e","entries":[]}]}"#,
+        );
+        pinned(
+            Node::File {
+                name: "a".into(),
+                size: 3,
+                checksum: Some(checksum),
+            },
+            &format!(r#"{{"kind":"file","name":"a","size":3,"checksum":"{hex}"}}"#),
+        );
+        assert!(serde_json::from_str::<Node>(r#"{"kind":"link","name":"a"}"#).is_err());
+        // A directory lists what it holds, if only nothing.
+        assert!(serde_json::from_str::<Node>(r#"{"kind":"dir","name":"d"}"#).is_err());
+    }
+
+    #[test]
+    fn nodes_sum_up_what_they_hold() {
+        let file = |name: &str, size| Node::File {
+            name: name.into(),
+            size,
+            checksum: None,
+        };
+        let dir = Node::Dir {
+            name: "d".into(),
+            entries: vec![
+                file("a", 3),
+                Node::Dir {
+                    name: "e".into(),
+                    entries: vec![file("b", 4), file("c", 0)],
+                },
+            ],
+        };
+        assert_eq!((dir.size(), dir.files()), (7, 3));
+        assert_eq!((file("a", 3).size(), file("a", 3).files()), (3, 1));
+    }
+
+    #[test]
     fn negotiation_picks_the_highest_common_version() {
-        assert_eq!(negotiate(4, 4), Some(4));
-        // A newer peer that still speaks 4.
-        assert_eq!(negotiate(7, 3), Some(4));
+        assert_eq!(negotiate(5, 5), Some(5));
+        // A newer peer that still speaks 5.
+        assert_eq!(negotiate(7, 3), Some(5));
         // Too old, or only newer versions.
-        assert_eq!(negotiate(3, 1), None);
-        assert_eq!(negotiate(9, 5), None);
+        assert_eq!(negotiate(4, 1), None);
+        assert_eq!(negotiate(9, 6), None);
         // A nonsensical range.
-        assert_eq!(negotiate(4, 5), None);
+        assert_eq!(negotiate(5, 6), None);
     }
 }

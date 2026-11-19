@@ -5,6 +5,7 @@ fn file(path: &[&str], size: u64) -> Entry {
     Entry::File {
         path: path.iter().map(|s| s.to_string()).collect(),
         size,
+        checksum: None,
     }
 }
 
@@ -21,7 +22,7 @@ fn offers_a_tree_parents_first() {
 
     let outgoing = build_offer(std::slice::from_ref(&root)).unwrap();
     assert_eq!(
-        outgoing.entries,
+        outgoing.offer.flatten(),
         [
             dir(&["album"]),
             file(&["album", "a.txt"], 10_000),
@@ -36,14 +37,18 @@ fn offers_a_tree_parents_first() {
     assert_eq!(outgoing.sources[4], root.join("nested/b.txt"));
 
     let single = build_offer(&[root.join("a.txt")]).unwrap();
-    assert_eq!(single.entries, [file(&["a.txt"], 10_000)]);
+    assert_eq!(single.offer.flatten(), [file(&["a.txt"], 10_000)]);
 }
 
 #[test]
 fn dot_is_announced_under_its_real_name() {
     let tmp = tempfile::tempdir().unwrap();
     let root = sample_tree(tmp.path());
-    let name = |path: PathBuf| build_offer(&[path]).unwrap().entries[0].path()[0].clone();
+    let name = |path: PathBuf| {
+        build_offer(&[path]).unwrap().offer.entries[0]
+            .name()
+            .to_owned()
+    };
 
     assert_eq!(name(root.join(".")), "album");
     assert_eq!(name(root.join("nested/..")), "album");
@@ -131,10 +136,8 @@ async fn control_messages_round_trip_over_a_byte_stream() {
     let messages = [
         SenderMessage::Hello(peer::hello(None)),
         // Compressed, and bigger than any single WebRTC message.
-        SenderMessage::Offer {
-            entries: (0..3000)
-                .map(|i| file(&[&format!("file-{i}.bin")], i))
-                .collect(),
+        SenderMessage::Hashes {
+            hashes: (0..3000).map(|i| Fingerprint(i * 31)).collect(),
         },
     ];
     let send = async {
@@ -156,7 +159,7 @@ async fn control_messages_round_trip_over_a_byte_stream() {
     for frame in [
         receivers,
         json_frame(r#"{"type":"resume"}"#),
-        json_frame(r#"{"type":"offer"}"#),
+        json_frame(r#"{"type":"hashes"}"#),
         vec![0, 0, 0, 1, 7],
     ] {
         a.send_frame(&frame).await.unwrap();
@@ -188,10 +191,6 @@ fn errors_tell_the_peer_what_it_needs_to_know() {
         Some(ErrorCode::Version)
     );
     assert_eq!(
-        code(TransferError::InvalidOffer(OfferError::Empty)),
-        Some(ErrorCode::InvalidOffer)
-    );
-    assert_eq!(
         code(TransferError::Protocol("x".into())),
         Some(ErrorCode::Protocol)
     );
@@ -200,7 +199,8 @@ fn errors_tell_the_peer_what_it_needs_to_know() {
         code(TransferError::Internal("x")),
         Some(ErrorCode::Internal)
     );
-    // The peer already knows, or cannot be told.
+    // The peer already knows, cannot be told, or is better not told.
+    assert_eq!(code(TransferError::ChecksumMismatch("a".into())), None);
     assert_eq!(code(TransferError::Declined), None);
     assert_eq!(code(TransferError::PeerDeclined(None)), None);
     assert_eq!(code(TransferError::PeerCancelled(None)), None);
@@ -228,10 +228,12 @@ fn transfers_can_be_spawned() {
         )
         .await;
     }
-    async fn receive(mut transport: Box<dyn Transport>, mut decide: Box<dyn Decide>) {
+    async fn receive(mut transport: Box<dyn Transport>, mut resolve: Box<dyn Resolve>) {
         let _ = receive_files(
             transport.as_mut(),
-            decide.as_mut(),
+            &Offer::default(),
+            Path::new("out"),
+            resolve.as_mut(),
             &mut |_| {},
             CancellationToken::new(),
         )
@@ -287,12 +289,12 @@ fn user_errors_are_worded_for_humans() {
         TransferError::Timeout("x"),
         TransferError::PeerTimeout,
         TransferError::Unsendable(OfferError::Empty),
+        TransferError::ChecksumMismatch("a".into()),
     ] {
         assert!(error.user_message().is_some(), "{error:?}");
     }
     for error in [
         TransferError::Protocol("x".into()),
-        TransferError::InvalidOffer(OfferError::Empty),
         TransferError::Internal("x"),
         TransferError::UnexpectedConnectionInfo,
         TransferError::Io(io::Error::other("x")),

@@ -82,9 +82,6 @@ pub fn snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
 }
 
 pub fn no_event(_: Event) {}
-pub fn no_offer(_: &[TopEntry]) -> Option<PathBuf> {
-    panic!("must not get as far as the offer")
-}
 pub fn no_conflict(_: &[Entry], _: &[Conflict]) -> ConflictPolicy {
     panic!("must not get as far as conflicts")
 }
@@ -124,7 +121,8 @@ pub struct RunOptions {
     /// Replace conflicting files instead of skipping them.
     pub replace: bool,
     pub no_compression: bool,
-    pub decline: bool,
+    /// Offer checksums under this algorithm with the files.
+    pub checksums: Option<Algorithm>,
     /// Abort the sender once it has handed this many bytes to the transport.
     pub abort_sender_after: Option<u64>,
     /// Abort the receiver once it has written this many bytes.
@@ -146,13 +144,14 @@ pub struct Tally {
     pub moved: u64,
     /// The largest progress step.
     pub largest_step: u64,
-    pub offered: bool,
+    /// Receiver: the last `(done, total)` of checking the bytes already here.
+    pub verifying: Option<(u64, u64)>,
 }
 
 impl Tally {
     fn record(&mut self, event: Event) {
         match event {
-            Event::Offered => self.offered = true,
+            Event::Verifying { done, total } => self.verifying = Some((done, total)),
             Event::Started { entries, present } => {
                 self.initial = Some(
                     entries
@@ -178,7 +177,6 @@ pub struct Outcome {
     pub recv: Result<(), TransferError>,
     pub sender: Tally,
     pub receiver: Tally,
-    pub offered: Option<Vec<TopEntry>>,
     /// What the receiver was asked about, if anything.
     pub conflicts: Option<Vec<Conflict>>,
 }
@@ -196,7 +194,13 @@ impl Outcome {
 
 /// Runs one transfer of `files` into `out` between the two peers.
 pub async fn run(peers: Peers, files: Vec<PathBuf>, out: &Path, opts: RunOptions) -> Outcome {
-    let outgoing = build_offer(&files).unwrap();
+    let mut outgoing = build_offer(&files).unwrap();
+    if let Some(algorithm) = opts.checksums {
+        outgoing
+            .add_checksums(algorithm, &mut |_| {})
+            .await
+            .unwrap();
+    }
     run_offer(peers, &outgoing, out, opts).await
 }
 
@@ -210,9 +214,7 @@ pub async fn run_offer(peers: Peers, outgoing: &Outgoing, out: &Path, opts: RunO
 
     let mut sending = Tally::default();
     let mut receiving = Tally::default();
-    let mut offered = None;
     let mut conflicts = None;
-    let out_dir = out.to_path_buf();
 
     let (mut sender_aborted, mut receiver_aborted) = (false, false);
     let (sender_cancel, receiver_cancel) = (CancellationToken::new(), CancellationToken::new());
@@ -228,11 +230,7 @@ pub async fn run_offer(peers: Peers, outgoing: &Outgoing, out: &Path, opts: RunO
             sender_cancel.cancel();
         }
     };
-    let on_offer = |entries: &[TopEntry]| {
-        offered = Some(entries.to_vec());
-        (!opts.decline).then(|| out_dir.clone())
-    };
-    let on_conflict = |_: &[Entry], found: &[Conflict]| {
+    let mut on_conflict = |_: &[Entry], found: &[Conflict]| {
         conflicts = Some(found.to_vec());
         match opts.replace {
             true => ConflictPolicy::Replace,
@@ -254,10 +252,6 @@ pub async fn run_offer(peers: Peers, outgoing: &Outgoing, out: &Path, opts: RunO
         }
     };
 
-    let mut decide = Answer {
-        accept: on_offer,
-        resolve: on_conflict,
-    };
     let send = send_files(
         sender.as_mut(),
         outgoing,
@@ -267,7 +261,9 @@ pub async fn run_offer(peers: Peers, outgoing: &Outgoing, out: &Path, opts: RunO
     );
     let recv = receive_files(
         receiver.as_mut(),
-        &mut decide,
+        &outgoing.offer,
+        out,
+        &mut on_conflict,
         &mut on_receive,
         receiver_cancel.clone(),
     );
@@ -281,7 +277,6 @@ pub async fn run_offer(peers: Peers, outgoing: &Outgoing, out: &Path, opts: RunO
         recv,
         sender: sending,
         receiver: receiving,
-        offered,
         conflicts,
     }
 }
@@ -343,7 +338,6 @@ macro_rules! transport_suite {
             sends_compressible_data_either_way,
             progress_moves_in_small_steps,
             sends_the_current_directory,
-            receiver_can_decline,
             resumes_a_partial_file,
             resumes_a_partial_directory,
             resume_skips_complete_files,
@@ -355,7 +349,12 @@ macro_rules! transport_suite {
             interrupted_by_the_sender_then_resumed,
             cancelled_by_the_receiver_then_resumed,
             cancelled_by_the_sender_then_resumed,
-            cancelled_while_deciding,
+            cancelled_while_resolving_conflicts,
+            sends_with_checksums,
+            resumes_with_checksums,
+            a_file_changed_after_hashing_fails_verification,
+            a_stale_part_fails_verification,
+            a_complete_file_that_differs_fails_verification,
             a_file_that_vanishes_fails_both_sides,
             receiver_rejects_another_protocol_version,
             sender_stops_when_the_receiver_wants_another_version,
@@ -363,7 +362,6 @@ macro_rules! transport_suite {
             unexpected_messages_are_errors,
             unknown_and_wrong_direction_messages_are_errors,
             malformed_frames_are_errors,
-            an_invalid_offer_is_rejected,
             an_invalid_accept_is_rejected,
             an_invalid_check_is_rejected,
             a_second_check_is_rejected,
@@ -430,20 +428,8 @@ pub mod suite {
             o.receiver.initial.unwrap(),
             progress("photo.jpg", 0, 100_000)
         );
-        assert_eq!(
-            o.offered.unwrap(),
-            vec![TopEntry {
-                name: "photo.jpg".into(),
-                dir: false,
-                size: 100_000
-            }]
-        );
         assert_eq!(o.sender.moved, 100_000);
         assert_eq!(o.receiver.moved, 100_000);
-        assert!(
-            o.sender.offered,
-            "the sender must report waiting for the accept"
-        );
     }
 
     pub async fn sends_an_empty_file(pair: PairFn) {
@@ -543,37 +529,6 @@ pub mod suite {
         o.unwrap();
         assert_eq!(snapshot(&f.out), snapshot(&f.src));
         assert_eq!(o.sender.initial.unwrap(), progress("album", 0, 80_003));
-    }
-
-    pub async fn receiver_can_decline(pair: PairFn) {
-        let f = fixture();
-        write(&f.src.join("secret.txt"), &bytes(100, 1));
-
-        let o = run(
-            pair().await,
-            vec![f.src.join("secret.txt")],
-            &f.out,
-            RunOptions {
-                decline: true,
-                ..Default::default()
-            },
-        )
-        .await;
-
-        assert!(
-            matches!(o.recv, Err(TransferError::Declined)),
-            "{:?}",
-            o.recv
-        );
-        assert!(
-            matches!(o.send, Err(TransferError::PeerDeclined(None))),
-            "{:?}",
-            o.send
-        );
-        assert!(o.offered.is_some(), "the receiver saw the offer");
-        assert!(o.sender.initial.is_none() && o.receiver.initial.is_none());
-        assert_eq!(o.sender.moved, 0);
-        assert!(!f.out.join("secret.txt").exists());
     }
 
     pub async fn sends_compressible_data_either_way(pair: PairFn) {
@@ -1004,24 +959,21 @@ pub mod suite {
         );
     }
 
-    /// A receiver that cancels while its user is still looking at the offer.
-    struct CancelWhileDeciding(CancellationToken);
+    /// A receiver that cancels while its user is still looking at the conflicts.
+    struct CancelWhileResolving(CancellationToken);
 
     #[async_trait]
-    impl Decide for CancelWhileDeciding {
-        async fn accept(&mut self, _: &[TopEntry]) -> Option<PathBuf> {
+    impl Resolve for CancelWhileResolving {
+        async fn resolve(&mut self, _: &[Entry], _: &[Conflict]) -> ConflictPolicy {
             self.0.cancel();
             std::future::pending().await
         }
-
-        async fn resolve(&mut self, _: &[Entry], _: &[Conflict]) -> ConflictPolicy {
-            unreachable!("the offer is never accepted")
-        }
     }
 
-    pub async fn cancelled_while_deciding(pair: PairFn) {
+    pub async fn cancelled_while_resolving_conflicts(pair: PairFn) {
         let f = fixture();
         write(&f.src.join("a.txt"), b"hello");
+        write(&f.out.join("a.txt"), b"other");
         let Peers {
             mut sender,
             mut receiver,
@@ -1029,7 +981,7 @@ pub mod suite {
         } = pair().await;
         let outgoing = build_offer(&[f.src.join("a.txt")]).unwrap();
         let cancel = CancellationToken::new();
-        let mut decide = CancelWhileDeciding(cancel.clone());
+        let mut resolve = CancelWhileResolving(cancel.clone());
         let (mut on_send, mut on_receive) = (no_event, no_event);
 
         let send = send_files(
@@ -1039,7 +991,14 @@ pub mod suite {
             &mut on_send,
             CancellationToken::new(),
         );
-        let recv = receive_files(receiver.as_mut(), &mut decide, &mut on_receive, cancel);
+        let recv = receive_files(
+            receiver.as_mut(),
+            &outgoing.offer,
+            &f.out,
+            &mut resolve,
+            &mut on_receive,
+            cancel,
+        );
         let (send, recv) =
             tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(send, recv) })
                 .await
@@ -1050,7 +1009,118 @@ pub mod suite {
             matches!(send, Err(TransferError::PeerCancelled(None))),
             "{send:?}"
         );
-        assert!(!f.out.join("a.txt").exists());
+        assert_eq!(std::fs::read(f.out.join("a.txt")).unwrap(), b"other");
+    }
+
+    fn checksums() -> RunOptions {
+        RunOptions {
+            checksums: Some(Algorithm::Sha256),
+            ..Default::default()
+        }
+    }
+
+    /// Fails as a checksum mismatch at `path`, which the sender only sees as
+    /// the receiver hanging up.
+    fn mismatch_at(o: &Outcome, path: &Path) {
+        assert!(
+            matches!(&o.recv, Err(TransferError::ChecksumMismatch(at)) if at == path),
+            "{:?}",
+            o.recv
+        );
+        assert!(
+            matches!(o.send, Err(TransferError::Disconnected(_))),
+            "the sender is not told why: {:?}",
+            o.send
+        );
+    }
+
+    pub async fn sends_with_checksums(pair: PairFn) {
+        let f = fixture();
+        let album = sample_tree(&f.src);
+
+        let o = run(pair().await, vec![album], &f.out, checksums()).await;
+
+        o.unwrap();
+        assert_eq!(snapshot(&f.out), snapshot(&f.src));
+        assert_eq!(
+            o.receiver.verifying, None,
+            "nothing was here to check first"
+        );
+    }
+
+    pub async fn resumes_with_checksums(pair: PairFn) {
+        let f = fixture();
+        let (data, done) = (bytes(200_000, 3), bytes(50_000, 4));
+        write(&f.src.join("big.bin"), &data);
+        write(&f.out.join("big.bin"), &data[..80_000]);
+        write(&f.src.join("done.bin"), &done);
+        write(&f.out.join("done.bin"), &done);
+
+        let files = vec![f.src.join("big.bin"), f.src.join("done.bin")];
+        let o = run(pair().await, files, &f.out, checksums()).await;
+
+        o.unwrap();
+        assert_eq!(snapshot(&f.out), snapshot(&f.src));
+        // The part of big.bin and all of done.bin are read before anything arrives.
+        assert_eq!(o.receiver.verifying, Some((130_000, 130_000)));
+        assert_eq!(o.sender.moved, 120_000);
+    }
+
+    pub async fn a_file_changed_after_hashing_fails_verification(pair: PairFn) {
+        let f = fixture();
+        write(&f.src.join("a.bin"), &bytes(100_000, 1));
+        let mut outgoing = build_offer(&[f.src.join("a.bin")]).unwrap();
+        outgoing
+            .add_checksums(Algorithm::Sha256, &mut |_| {})
+            .await
+            .unwrap();
+        let changed = bytes(100_000, 2);
+        write(&f.src.join("a.bin"), &changed);
+
+        let o = run_offer(pair().await, &outgoing, &f.out, RunOptions::default()).await;
+
+        mismatch_at(&o, &f.out.join("a.bin"));
+        // Kept for the user to look at.
+        assert_eq!(std::fs::read(f.out.join("a.bin")).unwrap(), changed);
+    }
+
+    /// A local file that differs from the offered one where the fingerprint
+    /// does not look: past the first 2 MiB, it samples only the ends.
+    fn differing_in_the_middle(data: &[u8], len: usize) -> Vec<u8> {
+        let mut local = data[..len].to_vec();
+        local[len / 2] ^= 1;
+        local
+    }
+
+    pub async fn a_stale_part_fails_verification(pair: PairFn) {
+        let f = fixture();
+        let data = bytes(INTERRUPT_SIZE, 5);
+        write(&f.src.join("f.bin"), &data);
+        let local = differing_in_the_middle(&data, INTERRUPT_SIZE - 100_000);
+        write(&f.out.join("f.bin"), &local);
+
+        let o = run(pair().await, vec![f.src.join("f.bin")], &f.out, checksums()).await;
+
+        mismatch_at(&o, &f.out.join("f.bin"));
+        assert_eq!(o.sender.moved, 100_000, "the part resumed as usual");
+        assert_eq!(
+            std::fs::metadata(f.out.join("f.bin")).unwrap().len(),
+            data.len() as u64
+        );
+    }
+
+    pub async fn a_complete_file_that_differs_fails_verification(pair: PairFn) {
+        let f = fixture();
+        let data = bytes(INTERRUPT_SIZE, 5);
+        write(&f.src.join("f.bin"), &data);
+        let local = differing_in_the_middle(&data, INTERRUPT_SIZE);
+        write(&f.out.join("f.bin"), &local);
+
+        let o = run(pair().await, vec![f.src.join("f.bin")], &f.out, checksums()).await;
+
+        mismatch_at(&o, &f.out.join("f.bin"));
+        assert!(o.sender.initial.is_none(), "it fails before the accept");
+        assert_eq!(std::fs::read(f.out.join("f.bin")).unwrap(), local);
     }
 
     pub async fn a_file_that_vanishes_fails_both_sides(pair: PairFn) {
@@ -1082,16 +1152,15 @@ pub mod suite {
             ..
         } = pair().await;
 
+        let f = fixture();
         let raw = frames(&[SenderMessage::Hello(hello_for(9, None))]);
         let peer = fake_sender(&mut sender, &raw);
-        let mut decide = Answer {
-            accept: no_offer,
-            resolve: no_conflict,
-        };
-        let mut event = no_event;
+        let (offer, mut resolve, mut event) = (an_offer(), no_conflict, no_event);
         let receive = receive_files(
             receiver.as_mut(),
-            &mut decide,
+            &offer,
+            &f.out,
+            &mut resolve,
             &mut event,
             CancellationToken::new(),
         );
@@ -1135,32 +1204,32 @@ pub mod suite {
         tokio::join!(fake_receiver(&mut receiver, raw), send)
     }
 
-    /// A receiver against a sender that opens with `raw` on the control stream.
+    /// A receiver of [`an_offer`] against a sender that opens with `raw` on the control stream.
     async fn hostile_sender(
         pair: PairFn,
         raw: &[u8],
     ) -> (Vec<ReceiverMessage>, Result<(), TransferError>) {
-        hostile_sender_into(pair, raw, no_offer).await
+        let f = fixture();
+        hostile_sender_into(pair, raw, &an_offer(), &f.out).await
     }
 
     async fn hostile_sender_into(
         pair: PairFn,
         raw: &[u8],
-        accept: impl FnMut(&[TopEntry]) -> Option<PathBuf> + Send,
+        offer: &Offer,
+        out: &Path,
     ) -> (Vec<ReceiverMessage>, Result<(), TransferError>) {
         let Peers {
             mut sender,
             mut receiver,
             ..
         } = pair().await;
-        let mut decide = Answer {
-            accept,
-            resolve: no_conflict,
-        };
-        let mut event = no_event;
+        let (mut resolve, mut event) = (no_conflict, no_event);
         let receive = receive_files(
             receiver.as_mut(),
-            &mut decide,
+            offer,
+            out,
+            &mut resolve,
             &mut event,
             CancellationToken::new(),
         );
@@ -1208,7 +1277,8 @@ pub mod suite {
 
     pub async fn unexpected_messages_are_errors(pair: PairFn) {
         // A sender that skips hello.
-        let (got, result) = hostile_sender(pair, &frames(&[an_offer()])).await;
+        let hashes = SenderMessage::Hashes { hashes: vec![] };
+        let (got, result) = hostile_sender(pair, &frames(&[hashes])).await;
         assert!(is_error(&got[1], ErrorCode::Protocol), "{got:?}");
         assert!(
             matches!(result, Err(TransferError::Protocol(_))),
@@ -1224,11 +1294,18 @@ pub mod suite {
         );
     }
 
-    fn an_offer() -> SenderMessage {
-        SenderMessage::Offer {
-            entries: vec![Entry::File {
-                path: vec!["a".into()],
-                size: 1,
+    fn an_offer() -> Offer {
+        offer_of(1)
+    }
+
+    /// An offer of one file of `size` bytes, named `a`.
+    fn offer_of(size: u64) -> Offer {
+        Offer {
+            checksums: None,
+            entries: vec![Node::File {
+                name: "a".into(),
+                size,
+                checksum: None,
             }],
         }
     }
@@ -1242,8 +1319,8 @@ pub mod suite {
     ) {
         let raw = [receiver_frames(&[]), from_receiver.to_vec()].concat();
         let (got, result) = hostile_receiver(pair, &raw).await;
-        // After its hello and offer.
-        assert!(is_error(&got[2], ErrorCode::Protocol), "{got:?}");
+        // After its hello.
+        assert!(is_error(&got[1], ErrorCode::Protocol), "{got:?}");
         assert!(
             matches!(result, Err(TransferError::Protocol(_))),
             "{result:?}"
@@ -1255,7 +1332,9 @@ pub mod suite {
         ]
         .concat();
         let (got, result) = hostile_sender(pair, &raw).await;
-        assert!(is_error(&got[1], ErrorCode::Protocol), "{got:?}");
+        // After its hello and its accept, which need nothing from the sender.
+        assert!(matches!(got[1], ReceiverMessage::Accept { .. }), "{got:?}");
+        assert!(is_error(&got[2], ErrorCode::Protocol), "{got:?}");
         assert!(
             matches!(result, Err(TransferError::Protocol(_))),
             "{result:?}"
@@ -1264,8 +1343,10 @@ pub mod suite {
 
     pub async fn unknown_and_wrong_direction_messages_are_errors(pair: PairFn) {
         // Each side sends the other's message.
+        // The offer travels in pairing, so neither side may send it.
+        let offer = json_frame(r#"{"type":"offer","entries":[]}"#);
         let accept = ReceiverMessage::Accept { files: vec![] };
-        both_fail_with_a_protocol_error(pair, &frames(&[an_offer()]), &frames(&[accept])).await;
+        both_fail_with_a_protocol_error(pair, &offer, &frames(&[accept])).await;
         both_fail_with_a_protocol_error(
             pair,
             &frames(&[SenderMessage::Hashes { hashes: vec![] }]),
@@ -1288,25 +1369,9 @@ pub mod suite {
         both_fail_with_a_protocol_error(
             pair,
             &json_frame(r#"{"type":"accept"}"#),
-            &json_frame(r#"{"type":"offer"}"#),
+            &json_frame(r#"{"type":"hashes"}"#),
         )
         .await;
-    }
-
-    pub async fn an_invalid_offer_is_rejected(pair: PairFn) {
-        let offer = SenderMessage::Offer {
-            entries: vec![Entry::File {
-                path: vec!["..".into()],
-                size: 1,
-            }],
-        };
-        let raw = frames(&[SenderMessage::Hello(ok_hello()), offer]);
-        let (got, result) = hostile_sender(pair, &raw).await;
-        assert!(is_error(&got[1], ErrorCode::InvalidOffer), "{got:?}");
-        assert!(
-            matches!(result, Err(TransferError::InvalidOffer(_))),
-            "{result:?}"
-        );
     }
 
     pub async fn an_invalid_accept_is_rejected(pair: PairFn) {
@@ -1314,8 +1379,7 @@ pub mod suite {
             files: vec![AcceptedFile { id: 7, offset: 0 }],
         };
         let (got, result) = hostile_receiver(pair, &receiver_frames(&[accept])).await;
-        assert!(matches!(&got[1], SenderMessage::Offer { .. }), "{got:?}");
-        assert!(is_error(&got[2], ErrorCode::Protocol), "{got:?}");
+        assert!(is_error(&got[1], ErrorCode::Protocol), "{got:?}");
         assert!(
             matches!(result, Err(TransferError::Protocol(_))),
             "{result:?}"
@@ -1327,7 +1391,7 @@ pub mod suite {
             files: vec![CheckedFile { id: 0, len: 6 }],
         };
         let (got, result) = hostile_receiver(pair, &receiver_frames(&[check])).await;
-        assert!(is_error(&got[2], ErrorCode::Protocol), "{got:?}");
+        assert!(is_error(&got[1], ErrorCode::Protocol), "{got:?}");
         assert!(
             matches!(result, Err(TransferError::Protocol(_))),
             "{result:?}"
@@ -1340,12 +1404,12 @@ pub mod suite {
         };
         let (got, result) = hostile_receiver(pair, &receiver_frames(&[check.clone(), check])).await;
         assert_eq!(
-            got[2],
+            got[1],
             SenderMessage::Hashes {
                 hashes: vec![Fingerprint::of(b"hello")]
             }
         );
-        assert!(is_error(&got[3], ErrorCode::Protocol), "{got:?}");
+        assert!(is_error(&got[2], ErrorCode::Protocol), "{got:?}");
         assert!(
             matches!(result, Err(TransferError::Protocol(_))),
             "{result:?}"
@@ -1355,16 +1419,9 @@ pub mod suite {
     pub async fn hashes_must_match_the_check(pair: PairFn) {
         let f = fixture();
         write(&f.out.join("a"), b"x");
-        let offer = SenderMessage::Offer {
-            entries: vec![Entry::File {
-                path: vec!["a".into()],
-                size: 5,
-            }],
-        };
         let hashes = SenderMessage::Hashes { hashes: vec![] };
-        let raw = frames(&[SenderMessage::Hello(ok_hello()), offer, hashes]);
-        let accept = |_: &[TopEntry]| Some(f.out.clone());
-        let (got, result) = hostile_sender_into(pair, &raw, accept).await;
+        let raw = frames(&[SenderMessage::Hello(ok_hello()), hashes]);
+        let (got, result) = hostile_sender_into(pair, &raw, &offer_of(5), &f.out).await;
         assert_eq!(
             got[1],
             ReceiverMessage::Check {
@@ -1385,7 +1442,7 @@ pub mod suite {
         };
         let ack = ReceiverMessage::Ack { bytes: 1000 };
         let (got, result) = hostile_receiver(pair, &receiver_frames(&[accept, ack])).await;
-        assert!(is_error(&got[2], ErrorCode::Protocol), "{got:?}");
+        assert!(is_error(&got[1], ErrorCode::Protocol), "{got:?}");
         assert!(
             matches!(result, Err(TransferError::Protocol(_))),
             "{result:?}"
@@ -1397,8 +1454,8 @@ pub mod suite {
             reason: Some("changed my mind".into()),
         });
         let (got, result) = hostile_receiver(pair, &receiver_frames(&[cancel])).await;
-        // Closing may cut off the offer; nothing else follows a cancel.
-        assert!(got.len() <= 2, "{got:?}");
+        // Nothing follows a cancel but the hello sent before it.
+        assert!(got.len() <= 1, "{got:?}");
         assert!(
             matches!(&result, Err(TransferError::PeerCancelled(Some(r))) if r == "changed my mind"),
             "{result:?}"
@@ -1411,13 +1468,8 @@ pub mod suite {
             mut receiver,
             ..
         } = pair().await;
-        let big = SenderMessage::Offer {
-            entries: (0..5000)
-                .map(|i| Entry::File {
-                    path: vec![format!("file-{i}.bin")],
-                    size: i,
-                })
-                .collect(),
+        let big = SenderMessage::Hashes {
+            hashes: (0..50_000).map(Fingerprint).collect(),
         };
 
         // The receiver's stream only exists once the sender has written.

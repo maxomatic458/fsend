@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use fsend_proto::peer::block::{self, BlockDecoder};
+use fsend_proto::peer::checksum::{Algorithm, Hasher};
 use fsend_proto::peer::frame::{self, FrameDecoder};
 use fsend_proto::peer::limits::{
     ACK_INTERVAL, ACK_STEP, GOODBYE_TIMEOUT, HELLO_TIMEOUT, IDLE_TIMEOUT, MAX_BLOCK_BYTES,
@@ -15,8 +16,8 @@ use fsend_proto::peer::offer::{self, EntryError, OfferError};
 use fsend_proto::peer::progress::{self, Progress, TopEntry};
 use fsend_proto::peer::resume::{self, Conflict, ConflictPolicy, Fingerprint, Local};
 use fsend_proto::peer::{
-    self, AcceptedFile, Cancel, CheckedFile, Entry, ErrorCode, ErrorReport, Hello, Message,
-    ReceiverMessage, SenderMessage,
+    self, AcceptedFile, Cancel, CheckedFile, Entry, ErrorCode, ErrorReport, Hello, Message, Node,
+    Offer, ReceiverMessage, SenderMessage,
 };
 use futures_util::StreamExt;
 use futures_util::stream::FuturesOrdered;
@@ -25,6 +26,8 @@ use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
+
+use crate::checksum;
 
 /// Chunk size for stream reads and writes.
 pub(crate) const BUF_SIZE: usize = 64 * 1024;
@@ -64,8 +67,9 @@ pub enum TransferError {
     PeerCancelled(Option<String>),
     #[error("the peer failed ({code:?}): {message}")]
     Peer { code: ErrorCode, message: String },
-    #[error("the peer sent an invalid offer: {0}")]
-    InvalidOffer(OfferError),
+    /// A received file is not what its checksum says; the peer is not told.
+    #[error("{} does not match its checksum", .0.display())]
+    ChecksumMismatch(PathBuf),
     /// Traffic from the peer that the protocol does not allow.
     #[error("protocol: {0}")]
     Protocol(String),
@@ -121,8 +125,11 @@ impl TransferError {
                 "the peer did not connect in time. Check that both sides are online and try again."
                     .to_owned()
             }
+            Self::ChecksumMismatch(path) => format!(
+                "{} does not match its checksum. Delete it to receive it again.",
+                path.display()
+            ),
             Self::Io(_)
-            | Self::InvalidOffer(_)
             | Self::Protocol(_)
             | Self::Bind(_)
             | Self::Connect(_)
@@ -146,7 +153,6 @@ impl TransferError {
                     peer::VERSION
                 ),
             ),
-            Self::InvalidOffer(e) => (ErrorCode::InvalidOffer, e.to_string()),
             Self::Protocol(message) => (ErrorCode::Protocol, message.clone()),
             Self::Timeout(what) => (ErrorCode::Timeout, what.to_string()),
             Self::Internal(what) => (ErrorCode::Internal, what.to_string()),
@@ -182,8 +188,9 @@ impl From<io::Error> for TransferError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event<'a> {
-    /// Sender: the offer is out, the receiver is deciding.
-    Offered,
+    /// Receiver: `done` of the `total` bytes already here are checked against
+    /// the offer's checksums, before the transfer starts.
+    Verifying { done: u64, total: u64 },
     /// The offer was accepted; `present` counts the bytes of each entry already there.
     Started {
         entries: &'a [TopEntry],
@@ -195,33 +202,21 @@ pub enum Event<'a> {
 
 pub type EventCb<'a> = &'a mut (dyn FnMut(Event<'_>) + Send);
 
-/// The receiver's answers about an offer, which may take as long as a user does.
+/// What to do with the entries of the offer that conflict with local ones,
+/// which may take as long as a user does.
 #[async_trait]
-pub trait Decide: Send {
-    /// The directory to receive into, or `None` to decline.
-    async fn accept(&mut self, offer: &[TopEntry]) -> Option<PathBuf>;
-    /// What to do with the entries of the offer that conflict with local ones.
+pub trait Resolve: Send {
     async fn resolve(&mut self, entries: &[Entry], conflicts: &[Conflict]) -> ConflictPolicy;
 }
 
-/// Answers right away with the `accept` and `resolve` closures.
-pub struct Answer<A, R> {
-    pub accept: A,
-    pub resolve: R,
-}
-
+/// Answers right away.
 #[async_trait]
-impl<A, R> Decide for Answer<A, R>
+impl<F> Resolve for F
 where
-    A: FnMut(&[TopEntry]) -> Option<PathBuf> + Send,
-    R: FnMut(&[Entry], &[Conflict]) -> ConflictPolicy + Send,
+    F: FnMut(&[Entry], &[Conflict]) -> ConflictPolicy + Send,
 {
-    async fn accept(&mut self, offer: &[TopEntry]) -> Option<PathBuf> {
-        (self.accept)(offer)
-    }
-
     async fn resolve(&mut self, entries: &[Entry], conflicts: &[Conflict]) -> ConflictPolicy {
-        (self.resolve)(entries, conflicts)
+        self(entries, conflicts)
     }
 }
 
@@ -264,9 +259,11 @@ pub trait Transport: Send {
 /// The offer for the paths to send, and where each entry comes from.
 #[derive(Debug, Default)]
 pub struct Outgoing {
-    pub entries: Vec<Entry>,
-    sources: Vec<PathBuf>,
-    frame: Vec<u8>,
+    pub offer: Offer,
+    /// By entry id.
+    pub(crate) sources: Vec<PathBuf>,
+    /// The plaintext of the sealed offer.
+    pub(crate) encoded: Vec<u8>,
 }
 
 /// Walks `paths` into a valid offer.
@@ -277,40 +274,54 @@ pub fn build_offer(paths: &[PathBuf]) -> Result<Outgoing, TransferError> {
     }
     let mut outgoing = Outgoing::default();
     for path in paths {
-        outgoing.add(path, vec![entry_name(path)?])?;
+        let node = outgoing.add(path, entry_name(path)?, 1)?;
+        outgoing.offer.entries.push(node);
     }
-    outgoing.frame = offer::encode(&outgoing.entries).map_err(TransferError::Unsendable)?;
+    outgoing.encode()?;
     Ok(outgoing)
 }
 
 impl Outgoing {
-    /// Adds `source` under `path`, parents before children.
-    fn add(&mut self, source: &Path, path: Vec<String>) -> Result<(), TransferError> {
+    /// Encodes the offer, once it is valid.
+    pub(crate) fn encode(&mut self) -> Result<(), TransferError> {
+        self.encoded = offer::encode(&self.offer).map_err(TransferError::Unsendable)?;
+        Ok(())
+    }
+
+    /// Bytes of all its files.
+    pub fn size(&self) -> u64 {
+        self.offer.entries.iter().map(Node::size).sum()
+    }
+
+    /// The node of `source`, named `name` at `depth` components, with all
+    /// below it; their sources follow in offer order.
+    fn add(&mut self, source: &Path, name: String, depth: usize) -> Result<Node, TransferError> {
         // Symlinked directories can loop.
-        if path.len() > MAX_DEPTH {
+        if depth > MAX_DEPTH {
             return Err(TransferError::Unsendable(OfferError::Entry {
-                id: self.entries.len(),
+                id: self.sources.len(),
                 reason: EntryError::TooDeep,
             }));
         }
         let metadata = std::fs::metadata(source)?;
         self.sources.push(source.to_path_buf());
         if metadata.is_file() {
-            self.entries.push(Entry::File {
-                path,
+            return Ok(Node::File {
+                name,
                 size: metadata.len(),
+                checksum: None,
             });
-            return Ok(());
         }
-        self.entries.push(Entry::Dir { path: path.clone() });
         let mut children = std::fs::read_dir(source)?.collect::<io::Result<Vec<_>>>()?;
         children.sort_by_key(|child| child.file_name());
-        for child in children {
-            let mut child_path = path.clone();
-            child_path.push(child.file_name().to_string_lossy().into_owned());
-            self.add(&child.path(), child_path)?;
-        }
-        Ok(())
+        let entries = children
+            .iter()
+            .map(|child| {
+                let name = child.file_name().to_string_lossy().into_owned();
+                self.add(&child.path(), name, depth + 1)
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Node::Dir { name, entries })
     }
 }
 
@@ -430,10 +441,7 @@ impl PeerMessage for ReceiverMessage {
     }
 
     fn is_final(&self) -> bool {
-        matches!(
-            self,
-            Self::Done | Self::Reject { .. } | Self::Cancel(_) | Self::Error(_)
-        )
+        matches!(self, Self::Done | Self::Cancel(_) | Self::Error(_))
     }
 }
 
@@ -601,7 +609,14 @@ pub async fn send_files(
             let mut control = Control::new(stream);
             let result = cancellable(
                 &cancel,
-                send(transport, &mut control, outgoing, compress, on_event),
+                send(
+                    transport,
+                    &mut control,
+                    &outgoing.offer.flatten(),
+                    &outgoing.sources,
+                    compress,
+                    on_event,
+                ),
             )
             .await;
             let cancel = SenderMessage::Cancel(Cancel { reason: None });
@@ -623,7 +638,8 @@ pub async fn send_files(
 async fn send(
     transport: &mut dyn Transport,
     control: &mut SenderControl,
-    outgoing: &Outgoing,
+    entries: &[Entry],
+    sources: &[PathBuf],
     compress: bool,
     on_event: EventCb<'_>,
 ) -> Result<(), TransferError> {
@@ -645,16 +661,13 @@ async fn send(
         acked: 0,
     };
 
-    control.send_frame(&outgoing.frame).await?;
-    on_event(Event::Offered);
-    let entries = &outgoing.entries;
     let mut answer = control.recv().await?;
     if let ReceiverMessage::Check { files } = answer {
         offer::check_lengths(entries, &files)
             .map_err(|e| TransferError::Protocol(e.to_string()))?;
         let sources = files
             .iter()
-            .map(|file| (outgoing.sources[file.id as usize].clone(), file.len))
+            .map(|file| (sources[file.id as usize].clone(), file.len))
             .collect();
         let hashes = fingerprints(sources).await?;
         control.send(&SenderMessage::Hashes { hashes }).await?;
@@ -662,7 +675,6 @@ async fn send(
     }
     let files = match answer {
         ReceiverMessage::Accept { files } => files,
-        ReceiverMessage::Reject { reason } => return Err(TransferError::PeerDeclined(reason)),
         other => return Err(other.unexpected()),
     };
     offer::check_accept(entries, &files).map_err(|e| TransferError::Protocol(e.to_string()))?;
@@ -672,7 +684,7 @@ async fn send(
         present: &progress::present(entries, &files),
     });
 
-    let mut reader = BlockReader::new(outgoing, &files);
+    let mut reader = BlockReader::new(entries, sources, &files);
     let mut progress = Progress::new(entries, &files, &top_of);
     if !reader.is_done() {
         let mut data = transport.data().await?;
@@ -730,7 +742,8 @@ async fn send(
 
 /// Reads the accepted bytes of the offered files in order, a block at a time.
 struct BlockReader<'a> {
-    outgoing: &'a Outgoing,
+    entries: &'a [Entry],
+    sources: &'a [PathBuf],
     files: std::slice::Iter<'a, AcceptedFile>,
     /// The file being read and the bytes left in it.
     current: Option<(File, u64)>,
@@ -738,12 +751,13 @@ struct BlockReader<'a> {
 }
 
 impl<'a> BlockReader<'a> {
-    fn new(outgoing: &'a Outgoing, files: &'a [AcceptedFile]) -> Self {
+    fn new(entries: &'a [Entry], sources: &'a [PathBuf], files: &'a [AcceptedFile]) -> Self {
         Self {
-            outgoing,
+            entries,
+            sources,
             files: files.iter(),
             current: None,
-            left: remaining(&outgoing.entries, files),
+            left: remaining(entries, files),
         }
     }
 
@@ -762,11 +776,11 @@ impl<'a> BlockReader<'a> {
                 _ => {
                     let next = self.files.next().expect("bytes are left");
                     let id = next.id as usize;
-                    let mut file = File::open(&self.outgoing.sources[id]).await?;
+                    let mut file = File::open(&self.sources[id]).await?;
                     if next.offset > 0 {
                         file.seek(io::SeekFrom::Start(next.offset)).await?;
                     }
-                    let left = self.outgoing.entries[id].size() - next.offset;
+                    let left = self.entries[id].size() - next.offset;
                     self.current = Some((file, left));
                     continue;
                 }
@@ -859,11 +873,14 @@ impl Window {
     }
 }
 
-/// Receives what the sender offers, as `decide` answers. Once `cancel` fires,
-/// the sender is told and the transfer ends.
+/// Receives the `offer`, which pairing brought, into `out`; `resolve` picks
+/// what happens to local entries in the way. Once `cancel` fires, the sender
+/// is told and the transfer ends.
 pub async fn receive_files(
     transport: &mut dyn Transport,
-    decide: &mut dyn Decide,
+    offer: &Offer,
+    out: &Path,
+    resolve: &mut dyn Resolve,
     on_event: EventCb<'_>,
     cancel: CancellationToken,
 ) -> Result<(), TransferError> {
@@ -876,8 +893,8 @@ pub async fn receive_files(
     let result = match cancellable(&cancel, control).await {
         Ok(stream) => {
             let mut control = Control::new(stream);
-            let result =
-                cancellable(&cancel, receive(transport, &mut control, decide, on_event)).await;
+            let receive = receive(transport, &mut control, offer, out, resolve, on_event);
+            let result = cancellable(&cancel, receive).await;
             let cancel = ReceiverMessage::Cancel(Cancel { reason: None });
             explain(
                 transport,
@@ -897,9 +914,12 @@ pub async fn receive_files(
 async fn receive(
     transport: &mut dyn Transport,
     control: &mut ReceiverControl,
-    decide: &mut dyn Decide,
+    offer: &Offer,
+    out: &Path,
+    resolve: &mut dyn Resolve,
     on_event: EventCb<'_>,
 ) -> Result<(), TransferError> {
+    let entries = &offer.flatten();
     control
         .send(&ReceiverMessage::Hello(peer::hello(Some(RECV_WINDOW))))
         .await?;
@@ -907,41 +927,38 @@ async fn receive(
         SenderMessage::Hello(hello) => check_version(&hello)?,
         other => return Err(other.unexpected()),
     }
-    let entries = match control
-        .recv_within(HELLO_TIMEOUT, "the sender did not make an offer in time")
-        .await?
-    {
-        SenderMessage::Offer { entries } => entries,
-        other => return Err(other.unexpected()),
-    };
-    offer::validate(&entries).map_err(TransferError::InvalidOffer)?;
-    let (tops, top_of) = progress::top_entries(&entries);
+    let (tops, top_of) = progress::top_entries(entries);
 
-    let Some(out) = decide.accept(&tops).await else {
-        control
-            .send(&ReceiverMessage::Reject { reason: None })
-            .await?;
-        goodbye(transport, control).await;
-        return Err(TransferError::Declined);
-    };
-    tokio::fs::create_dir_all(&out).await?;
+    tokio::fs::create_dir_all(out).await?;
     let paths = entries
         .iter()
-        .map(|entry| local_path(&out, entry.path()))
+        .map(|entry| local_path(out, entry.path()))
         .collect::<io::Result<Vec<_>>>()?;
     let local = local_entries(&paths).await?;
-    let checked = resume::to_check(&entries, &local);
+    let checked = resume::to_check(entries, &local);
     let verified = if checked.is_empty() {
         Vec::new()
     } else {
         verify(control, &paths, checked).await?
     };
-    let plan = resume::plan(&entries, &local, &verified);
+    let plan = resume::plan(entries, &local, &verified);
     let policy = match plan.conflicts.is_empty() {
         true => ConflictPolicy::Skip,
-        false => decide.resolve(&entries, &plan.conflicts).await,
+        false => resolve.resolve(entries, &plan.conflicts).await,
     };
     let files = plan.accept(policy);
+    let mut hashers = match offer.checksums {
+        Some(algorithm) => {
+            let present = Present {
+                entries,
+                paths: &paths,
+                complete: &plan.complete,
+                files: &files,
+            };
+            Some(present.check(algorithm, on_event).await?.into_iter())
+        }
+        None => None,
+    };
     control
         .send(&ReceiverMessage::Accept {
             files: files.clone(),
@@ -949,13 +966,13 @@ async fn receive(
         .await?;
     on_event(Event::Started {
         entries: &tops,
-        present: &progress::present(&entries, &files),
+        present: &progress::present(entries, &files),
     });
 
     for &id in &plan.dirs {
         tokio::fs::create_dir_all(&paths[id as usize]).await?;
     }
-    let mut incoming = if remaining(&entries, &files) > 0 {
+    let mut incoming = if remaining(entries, &files) > 0 {
         let stream = tokio::select! {
             stream = timeout(IDLE_TIMEOUT, transport.data()) => {
                 stream.map_err(|_| TransferError::Timeout(SENDER_IDLE))??
@@ -966,11 +983,12 @@ async fn receive(
     } else {
         None
     };
-    let mut progress = Progress::new(&entries, &files, &top_of);
+    let mut progress = Progress::new(entries, &files, &top_of);
     for &AcceptedFile { id, offset } in &files {
         let id = id as usize;
         let size = entries[id].size();
         let mut file = open_for_receive(&paths[id], offset).await?;
+        let mut hasher = hashers.as_mut().and_then(Iterator::next);
         let received = match &mut incoming {
             Some(incoming) => {
                 let mut on_arrived = |bytes| {
@@ -978,8 +996,9 @@ async fn receive(
                         on_event(Event::Progress { entry, bytes });
                     }
                 };
+                let len = size - offset;
                 incoming
-                    .write_to(&mut file, size - offset, control, &mut on_arrived)
+                    .write_to(&mut file, len, control, &mut on_arrived, hasher.as_mut())
                     .await
             }
             None => Ok(()),
@@ -989,6 +1008,11 @@ async fn receive(
         received?;
         flushed?;
         finish_received_file(&mut file, size).await?;
+        if let Some(hasher) = hasher
+            && Some(&hasher.finish()) != entries[id].checksum()
+        {
+            return Err(TransferError::ChecksumMismatch(paths[id].clone()));
+        }
     }
     if incoming.is_some_and(|incoming| !incoming.is_empty()) {
         return Err(TransferError::Protocol(
@@ -999,6 +1023,46 @@ async fn receive(
     control.send(&ReceiverMessage::Done).await?;
     goodbye(transport, control).await;
     Ok(())
+}
+
+/// What the receiver already has of an offer, by the plan for it.
+struct Present<'a> {
+    entries: &'a [Entry],
+    paths: &'a [PathBuf],
+    /// Files already complete.
+    complete: &'a [u32],
+    /// The accepted files, each from its offset.
+    files: &'a [AcceptedFile],
+}
+
+impl Present<'_> {
+    /// Checks the complete files against their checksums, and hashes what is
+    /// here of each accepted file; returns a hasher per accepted file to go on with.
+    async fn check(
+        &self,
+        algorithm: Algorithm,
+        on_event: EventCb<'_>,
+    ) -> Result<Vec<Hasher>, TransferError> {
+        let path = |id: u32| self.paths[id as usize].clone();
+        let jobs: Vec<_> = (self.complete.iter())
+            .map(|&id| (path(id), self.entries[id as usize].size()))
+            .chain(self.files.iter().map(|file| (path(file.id), file.offset)))
+            .collect();
+        let total = jobs.iter().map(|(_, len)| len).sum();
+        let mut on_progress = |done| {
+            if total > 0 {
+                on_event(Event::Verifying { done, total });
+            }
+        };
+        let mut hashers = checksum::hash_files(algorithm, jobs, &mut on_progress).await?;
+        let resumed = hashers.split_off(self.complete.len());
+        for (&id, hasher) in self.complete.iter().zip(hashers) {
+            if Some(&hasher.finish()) != self.entries[id as usize].checksum() {
+                return Err(TransferError::ChecksumMismatch(path(id)));
+            }
+        }
+        Ok(resumed)
+    }
 }
 
 /// What is already at each path, looked up in one blocking task.
@@ -1138,19 +1202,23 @@ impl Incoming {
         }
     }
 
-    /// Writes the next `len` bytes of the stream to `file`.
+    /// Writes the next `len` bytes of the stream to `file`, and to `hasher`.
     async fn write_to(
         &mut self,
         file: &mut File,
         mut len: u64,
         control: &mut ReceiverControl,
         on_arrived: &mut (dyn FnMut(u64) + Send),
+        mut hasher: Option<&mut Hasher>,
     ) -> Result<(), TransferError> {
         while len > 0 {
             self.fill(control, on_arrived).await?;
             let n = len.min((self.block.len() - self.taken) as u64) as usize;
-            file.write_all(&self.block[self.taken..self.taken + n])
-                .await?;
+            let bytes = &self.block[self.taken..self.taken + n];
+            file.write_all(bytes).await?;
+            if let Some(hasher) = hasher.as_deref_mut() {
+                hasher.update(bytes);
+            }
             self.taken += n;
             len -= n as u64;
             self.written += n as u64;

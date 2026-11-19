@@ -3,6 +3,10 @@ use std::time::Duration;
 use fsend_proto::{
     code::Code,
     pairing::{Channel, ConnectionInfo, PairingError, Pake, Role, Sealed, Signal},
+    peer::{
+        Offer,
+        offer::{self, OfferError},
+    },
     relay::{ClientMessage, ErrorCode, PATH, ServerMessage, Transport, VERSION},
 };
 use futures_util::{SinkExt, StreamExt};
@@ -11,10 +15,15 @@ use tokio::{net::TcpStream, time::timeout};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 use url::Url;
 
+use crate::transfer::Outgoing;
+
 /// For connecting and for each reply of the relay.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// For each signal from the peer; the relay gives the two sides a minute.
+/// For each signal from the peer.
 pub(crate) const PEER_TIMEOUT: Duration = Duration::from_secs(60);
+/// For the receiver's answer to the offer, which its user takes; the relay's
+/// deadline for pairing comes first.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// In order of preference.
 pub(crate) const TRANSPORTS: [Transport; 2] = [Transport::Iroh, Transport::Webrtc];
 
@@ -34,6 +43,8 @@ pub enum RelayError {
     Relay { code: ErrorCode, message: String },
     #[error("pairing failed: {0}")]
     Pairing(#[from] PairingError),
+    #[error("the sender offered invalid files: {0}")]
+    InvalidOffer(OfferError),
     #[error("protocol error: {0}")]
     Protocol(&'static str),
 }
@@ -61,7 +72,11 @@ impl RelayError {
                 }
                 ErrorCode::Protocol => return None,
             },
-            Self::WebSocket(_) | Self::Closed | Self::Pairing(_) | Self::Protocol(_) => {
+            Self::WebSocket(_)
+            | Self::Closed
+            | Self::Pairing(_)
+            | Self::InvalidOffer(_)
+            | Self::Protocol(_) => {
                 return None;
             }
         };
@@ -78,11 +93,20 @@ pub struct Relay {
     pub transport: Transport,
 }
 
-/// Creates a session at the relay at `base_url` and pairs with whoever joins
-/// it; `show_code` gets the code for the receiver. `app` names this client to the peer.
+/// The receiver's answer to the offer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    Accepted,
+    Rejected(Option<String>),
+}
+
+/// Creates a session at the relay at `base_url`, pairs with whoever joins it
+/// and offers them `outgoing`; `show_code` gets the code for the receiver.
+/// `app` names this client to the peer.
 pub async fn pair_as_sender(
     base_url: &Url,
     app: &str,
+    outgoing: &Outgoing,
     show_code: impl FnOnce(&Code),
 ) -> Result<Relay, RelayError> {
     let mut ws = connect(base_url).await?;
@@ -106,11 +130,19 @@ pub async fn pair_as_sender(
 
     let wait = Duration::from_secs(expires_in.into()) + CONNECT_TIMEOUT;
     let transport = recv_paired(&mut ws, wait).await?;
-    handshake(ws, &code, Role::Sender, transport, app).await
+    let mut relay = handshake(ws, &code, Role::Sender, transport, app).await?;
+    let frames = relay.channel.seal_plaintext(&outgoing.encoded);
+    relay.send_frames(frames).await?;
+    Ok(relay)
 }
 
-/// Joins the session of `code` at the relay at `base_url`.
-pub async fn pair_as_receiver(base_url: &Url, app: &str, code: &Code) -> Result<Relay, RelayError> {
+/// Joins the session of `code` at the relay at `base_url`; returns the
+/// sender's offer, checked.
+pub async fn pair_as_receiver(
+    base_url: &Url,
+    app: &str,
+    code: &Code,
+) -> Result<(Relay, Offer), RelayError> {
     let mut ws = connect(base_url).await?;
     send(
         &mut ws,
@@ -122,7 +154,12 @@ pub async fn pair_as_receiver(base_url: &Url, app: &str, code: &Code) -> Result<
     )
     .await?;
     let transport = recv_paired(&mut ws, CONNECT_TIMEOUT).await?;
-    handshake(ws, code, Role::Receiver, transport, app).await
+    let mut relay = handshake(ws, code, Role::Receiver, transport, app).await?;
+    let Sealed::Offer(offer) = relay.recv_sealed(PEER_TIMEOUT).await? else {
+        return Err(RelayError::Protocol("expected an offer"));
+    };
+    offer::validate(&offer).map_err(RelayError::InvalidOffer)?;
+    Ok((relay, offer))
 }
 
 /// SPAKE2, then each side's sealed confirm proves both used the same code.
@@ -134,41 +171,79 @@ async fn handshake(
     app: &str,
 ) -> Result<Relay, RelayError> {
     let (pake, message) = Pake::start(code);
-    send_signal(&mut ws, Signal::Pake(message)).await?;
-    let Signal::Pake(peer_message) = recv_signal(&mut ws).await? else {
+    send_frame(&mut ws, Signal::Pake(message).encode()).await?;
+    let peer_message = recv_signal(&mut ws, PEER_TIMEOUT).await?;
+    let Some(Signal::Pake(peer_message)) = Signal::decode(&peer_message) else {
         return Err(PairingError::UnexpectedSignal.into());
     };
-    let mut channel = pake.finish(&peer_message, role)?;
-
-    let confirm = Sealed::Confirm { app: app.into() };
-    send_signal(&mut ws, Signal::Sealed(channel.seal(&confirm))).await?;
-    let Signal::Sealed(peer_confirm) = recv_signal(&mut ws).await? else {
-        return Err(PairingError::UnexpectedSignal.into());
-    };
-    let Sealed::Confirm { app } = channel.open(&peer_confirm)? else {
-        return Err(RelayError::Protocol("expected a confirm message"));
-    };
-    tracing::info!("paired with {app} via {transport:?}");
-    Ok(Relay {
+    let channel = pake.finish(&peer_message, role)?;
+    let mut relay = Relay {
         ws,
         channel,
         transport,
-    })
+    };
+
+    relay
+        .send_sealed(&Sealed::Confirm { app: app.into() })
+        .await?;
+    let Sealed::Confirm { app } = relay.recv_sealed(PEER_TIMEOUT).await? else {
+        return Err(RelayError::Protocol("expected a confirm message"));
+    };
+    tracing::info!("paired with {app} via {transport:?}");
+    Ok(relay)
 }
 
 impl Relay {
+    /// Sender: waits for the receiver's user to answer the offer.
+    pub async fn answer(&mut self) -> Result<Answer, RelayError> {
+        match self.recv_sealed(ANSWER_TIMEOUT).await? {
+            Sealed::Accept => Ok(Answer::Accepted),
+            Sealed::Reject { reason } => Ok(Answer::Rejected(reason)),
+            _ => Err(RelayError::Protocol("expected an answer to the offer")),
+        }
+    }
+
+    /// Receiver: takes the offer; the two sides connect next.
+    pub async fn accept(&mut self) -> Result<(), RelayError> {
+        self.send_sealed(&Sealed::Accept).await
+    }
+
+    /// Receiver: turns the offer down, which ends the session.
+    pub async fn reject(mut self, reason: Option<String>) -> Result<(), RelayError> {
+        self.send_sealed(&Sealed::Reject { reason }).await?;
+        Ok(self.ws.close(None).await?)
+    }
+
     pub async fn send_connection(&mut self, info: ConnectionInfo) -> Result<(), RelayError> {
-        let sealed = self.channel.seal(&Sealed::Connection { info });
-        send_signal(&mut self.ws, Signal::Sealed(sealed)).await
+        self.send_sealed(&Sealed::Connection { info }).await
     }
 
     pub async fn connection(&mut self) -> Result<ConnectionInfo, RelayError> {
-        let Signal::Sealed(sealed) = recv_signal(&mut self.ws).await? else {
-            return Err(PairingError::UnexpectedSignal.into());
-        };
-        match self.channel.open(&sealed)? {
+        match self.recv_sealed(PEER_TIMEOUT).await? {
             Sealed::Connection { info } => Ok(info),
-            Sealed::Confirm { .. } => Err(RelayError::Protocol("repeated confirm message")),
+            _ => Err(RelayError::Protocol("expected connection info")),
+        }
+    }
+
+    async fn send_sealed(&mut self, message: &Sealed) -> Result<(), RelayError> {
+        let frames = self.channel.seal(message)?;
+        self.send_frames(frames).await
+    }
+
+    async fn send_frames(&mut self, frames: Vec<Vec<u8>>) -> Result<(), RelayError> {
+        for frame in frames {
+            send_frame(&mut self.ws, frame).await?;
+        }
+        Ok(())
+    }
+
+    /// The peer's next sealed message, each of its frames within `wait`.
+    async fn recv_sealed(&mut self, wait: Duration) -> Result<Sealed, RelayError> {
+        loop {
+            let frame = recv_signal(&mut self.ws, wait).await?;
+            if let Some(message) = self.channel.open(&frame)? {
+                return Ok(message);
+            }
         }
     }
 }
@@ -189,13 +264,14 @@ async fn send(ws: &mut WsStream, message: &ClientMessage) -> Result<(), RelayErr
     Ok(ws.send(Message::text(text)).await?)
 }
 
-async fn send_signal(ws: &mut WsStream, signal: Signal) -> Result<(), RelayError> {
-    Ok(ws.send(Message::binary(signal.encode())).await?)
+async fn send_frame(ws: &mut WsStream, frame: Vec<u8>) -> Result<(), RelayError> {
+    Ok(ws.send(Message::binary(frame)).await?)
 }
 
 enum Frame {
     Message(ServerMessage),
-    Signal(Signal),
+    /// A binary frame from the peer.
+    Signal(Vec<u8>),
 }
 
 /// The next relay message or peer signal within `wait`; a relay error fails.
@@ -210,10 +286,7 @@ async fn recv(ws: &mut WsStream, wait: Duration) -> Result<Frame, RelayError> {
                     Ok(message) => return Ok(Frame::Message(message)),
                     Err(_) => return Err(RelayError::Protocol("invalid relay message")),
                 },
-                Some(Ok(Message::Binary(data))) => {
-                    let signal = Signal::decode(&data).ok_or(PairingError::UnexpectedSignal)?;
-                    return Ok(Frame::Signal(signal));
-                }
+                Some(Ok(Message::Binary(data))) => return Ok(Frame::Signal(data.to_vec())),
                 Some(Ok(Message::Close(_))) | None => return Err(RelayError::Closed),
                 Some(Ok(_)) => {}
                 Some(Err(error)) => return Err(error.into()),
@@ -237,9 +310,9 @@ async fn recv_paired(ws: &mut WsStream, wait: Duration) -> Result<Transport, Rel
     }
 }
 
-async fn recv_signal(ws: &mut WsStream) -> Result<Signal, RelayError> {
-    match recv(ws, PEER_TIMEOUT).await? {
-        Frame::Signal(signal) => Ok(signal),
+async fn recv_signal(ws: &mut WsStream, wait: Duration) -> Result<Vec<u8>, RelayError> {
+    match recv(ws, wait).await? {
+        Frame::Signal(frame) => Ok(frame),
         Frame::Message(_) => Err(RelayError::Protocol("unexpected relay message")),
     }
 }
@@ -247,10 +320,31 @@ async fn recv_signal(ws: &mut WsStream) -> Result<Signal, RelayError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fsend_proto::pairing::Sealed;
+    use fsend_proto::peer::checksum::{Algorithm, Digest};
+    use fsend_proto::peer::{Node, frame};
     use fsend_relay::Config;
     use tokio::{net::TcpListener, sync::oneshot};
 
     const APP: &str = "fsend-core tests";
+
+    fn file(name: &str, checksum: Option<&[u8]>) -> Node {
+        Node::File {
+            name: name.into(),
+            size: 3,
+            checksum: checksum.map(Digest::from),
+        }
+    }
+
+    /// An offer of `entries`, with checksums under `checksums`; it need not be valid.
+    fn offer_of(checksums: Option<Algorithm>, entries: Vec<Node>) -> Outgoing {
+        let offer = Offer { checksums, entries };
+        Outgoing {
+            encoded: frame::encode_body(&Sealed::Offer(offer.clone())).unwrap(),
+            offer,
+            sources: vec![],
+        }
+    }
 
     fn ws(listener: &TcpListener) -> Url {
         Url::parse(&format!("ws://{}", listener.local_addr().unwrap())).unwrap()
@@ -271,14 +365,20 @@ mod tests {
         }
     }
 
-    /// Pairs a sender with a receiver that uses `receiver_code(code)`.
-    async fn pair(
+    /// Pairs a sender of `outgoing` with a receiver that uses `receiver_code(code)`.
+    async fn pair_with(
         url: &Url,
+        outgoing: &Outgoing,
         receiver_code: impl FnOnce(Code) -> Code,
-    ) -> (Result<Relay, RelayError>, Result<Relay, RelayError>) {
+    ) -> (
+        Result<Relay, RelayError>,
+        Result<(Relay, Offer), RelayError>,
+    ) {
         let (code_tx, code_rx) = oneshot::channel();
         tokio::join!(
-            pair_as_sender(url, APP, |code| code_tx.send(code.clone()).unwrap()),
+            pair_as_sender(url, APP, outgoing, |code: &Code| code_tx
+                .send(code.clone())
+                .unwrap()),
             async {
                 let code = receiver_code(code_rx.await.unwrap());
                 pair_as_receiver(url, APP, &code).await
@@ -286,20 +386,33 @@ mod tests {
         )
     }
 
+    async fn pair(
+        url: &Url,
+        receiver_code: impl FnOnce(Code) -> Code,
+    ) -> (Result<Relay, RelayError>, Result<Relay, RelayError>) {
+        let outgoing = offer_of(None, vec![file("a", None)]);
+        let (sender, receiver) = pair_with(url, &outgoing, receiver_code).await;
+        (sender, receiver.map(|(relay, _)| relay))
+    }
+
     #[tokio::test]
-    async fn both_sides_pair_through_the_relay_and_swap_connection_info() {
+    async fn the_offer_comes_first_and_connection_info_once_accepted() {
         let url = start_relay().await;
-        let (sender, receiver) = pair(&url, |code| code).await;
-        let (mut sender, mut receiver) = (sender.unwrap(), receiver.unwrap());
+        let outgoing = offer_of(Some(Algorithm::Sha256), vec![file("a", Some(&[1; 32]))]);
+        let (sender, receiver) = pair_with(&url, &outgoing, |code| code).await;
+        let (mut sender, (mut receiver, offered)) = (sender.unwrap(), receiver.unwrap());
+        assert_eq!(offered, outgoing.offer);
         assert_eq!(sender.transport, Transport::Iroh);
         assert_eq!(receiver.transport, Transport::Iroh);
 
         let (sent, received) = tokio::join!(
             async {
+                assert_eq!(sender.answer().await.unwrap(), Answer::Accepted);
                 sender.send_connection(iroh_info("sender")).await.unwrap();
                 sender.connection().await.unwrap()
             },
             async {
+                receiver.accept().await.unwrap();
                 let info = receiver.connection().await.unwrap();
                 receiver
                     .send_connection(iroh_info("receiver"))
@@ -310,6 +423,69 @@ mod tests {
         );
         assert_eq!(sent, iroh_info("receiver"));
         assert_eq!(received, iroh_info("sender"));
+    }
+
+    #[tokio::test]
+    async fn a_rejected_offer_ends_the_session() {
+        let url = start_relay().await;
+        let (sender, receiver) = pair(&url, |code| code).await;
+        let (mut sender, receiver) = (sender.unwrap(), receiver.unwrap());
+
+        receiver.reject(Some("not now".into())).await.unwrap();
+        assert_eq!(
+            sender.answer().await.unwrap(),
+            Answer::Rejected(Some("not now".into()))
+        );
+        // Nothing but the relay's goodbye follows.
+        let err = sender.connection().await.err().unwrap();
+        assert!(
+            matches!(
+                err,
+                RelayError::Relay {
+                    code: ErrorCode::PeerLeft,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_large_offer_spans_many_frames() {
+        let url = start_relay().await;
+        // Checksums do not compress.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let entries: Vec<_> = (0..50_000)
+            .map(|i| {
+                let mut digest = [0; 32];
+                for chunk in digest.chunks_mut(8) {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    chunk.copy_from_slice(&state.to_le_bytes());
+                }
+                file(&format!("file-{i}.bin"), Some(&digest))
+            })
+            .collect();
+        let outgoing = offer_of(Some(Algorithm::Sha256), entries);
+        assert!(
+            outgoing.encoded.len() > 40 * fsend_proto::relay::MAX_FRAME_BYTES,
+            "{} bytes",
+            outgoing.encoded.len()
+        );
+
+        let (sender, receiver) = pair_with(&url, &outgoing, |code| code).await;
+        sender.unwrap();
+        assert_eq!(receiver.unwrap().1, outgoing.offer);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_offer_fails_the_receiver() {
+        let url = start_relay().await;
+        let outgoing = offer_of(None, vec![file("..", None)]);
+        let (_sender, receiver) = pair_with(&url, &outgoing, |code| code).await;
+        let err = receiver.err().unwrap();
+        assert!(matches!(err, RelayError::InvalidOffer(_)), "{err}");
     }
 
     #[tokio::test]
@@ -354,7 +530,10 @@ mod tests {
             let _ = ws.next().await;
         });
 
-        let err = pair_as_sender(&url, APP, |_| {}).await.err().unwrap();
+        let err = pair_as_sender(&url, APP, &offer_of(None, vec![file("a", None)]), |_| {})
+            .await
+            .err()
+            .unwrap();
         assert!(matches!(err, RelayError::Protocol(_)), "{err}");
     }
 
@@ -368,7 +547,10 @@ mod tests {
             let _ = ws.close(None).await;
         });
 
-        let err = pair_as_sender(&url, APP, |_| {}).await.err().unwrap();
+        let err = pair_as_sender(&url, APP, &offer_of(None, vec![file("a", None)]), |_| {})
+            .await
+            .err()
+            .unwrap();
         assert!(matches!(err, RelayError::Closed), "{err}");
     }
 
@@ -377,7 +559,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = ws(&listener);
         drop(listener);
-        let result = pair_as_sender(&url, APP, |_| {}).await;
+        let result =
+            pair_as_sender(&url, APP, &offer_of(None, vec![file("a", None)]), |_| {}).await;
         assert!(matches!(result, Err(RelayError::Connect(_))));
     }
 }

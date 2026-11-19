@@ -20,7 +20,10 @@ use axum::{
 };
 use fsend_proto::{
     code::Nameplate,
-    relay::{ClientMessage, ErrorCode, PATH, ServerMessage, Transport, VERSION},
+    relay::{
+        ClientMessage, ErrorCode, MAX_FRAME_BYTES, MAX_SIGNAL_BYTES, PATH, ServerMessage,
+        Transport, VERSION,
+    },
 };
 use serde::Deserialize;
 use tokio::{
@@ -30,10 +33,8 @@ use tokio::{
 };
 use tracing::info;
 
-/// Largest frame a client may send.
-pub const MAX_MESSAGE_BYTES: usize = 32 * 1024;
-/// Signals one client may send per session.
-pub const MAX_SIGNALS: usize = 4;
+/// Signals queued for a peer that is still reading earlier ones.
+const QUEUED_SIGNALS: usize = 4;
 /// Nameplates tried before a nearly full relay reports itself busy.
 const NAMEPLATE_TRIES: usize = 64;
 /// Time for any single write to a client.
@@ -45,7 +46,8 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct Config {
     /// How long a session waits for its receiver.
     pub session_ttl: Duration,
-    /// How long the two sides may signal after the join.
+    /// How long the two sides may signal after the join, the receiver's
+    /// decision on the offer included.
     pub pair_timeout: Duration,
     /// Sessions open at once, waiting or pairing.
     pub max_sessions: usize,
@@ -56,7 +58,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             session_ttl: Duration::from_secs(5 * 60),
-            pair_timeout: Duration::from_secs(60),
+            pair_timeout: Duration::from_secs(10 * 60),
             max_sessions: 10_000,
             ping_interval: Duration::from_secs(20),
         }
@@ -110,9 +112,8 @@ struct Link {
 
 impl Link {
     fn pair() -> (Self, Self) {
-        // Each side sends at most MAX_SIGNALS, so these never fill up.
-        let (a_tx, a_rx) = mpsc::channel(MAX_SIGNALS);
-        let (b_tx, b_rx) = mpsc::channel(MAX_SIGNALS);
+        let (a_tx, a_rx) = mpsc::channel(QUEUED_SIGNALS);
+        let (b_tx, b_rx) = mpsc::channel(QUEUED_SIGNALS);
         (
             Self {
                 to_peer: a_tx,
@@ -182,8 +183,8 @@ impl Relay {
 }
 
 async fn upgrade(ws: WebSocketUpgrade, State(relay): State<Arc<Relay>>) -> Response {
-    ws.max_message_size(MAX_MESSAGE_BYTES)
-        .max_frame_size(MAX_MESSAGE_BYTES)
+    ws.max_message_size(MAX_FRAME_BYTES)
+        .max_frame_size(MAX_FRAME_BYTES)
         .on_upgrade(move |ws| connection(Socket::new(ws), relay))
 }
 
@@ -308,7 +309,8 @@ async fn join(ws: Socket, relay: Arc<Relay>, nameplate: Nameplate, transports: V
 }
 
 /// Announces the pairing, then relays binary signal frames both ways until
-/// either side leaves or the deadline passes.
+/// either side leaves or the deadline passes. A side's frames are only read
+/// while its peer has room for them, so a slow peer holds back a fast one.
 async fn forward(mut ws: Socket, config: &Config, peer: Peer) {
     let Peer {
         transport,
@@ -321,38 +323,50 @@ async fn forward(mut ws: Socket, config: &Config, peer: Peer) {
     let deadline = sleep_until(deadline);
     tokio::pin!(deadline);
     let mut ping = pinger(config.ping_interval);
-    let mut signals = 0;
+    let mut signal_bytes = 0;
     loop {
+        let room = link.to_peer.capacity() > 0;
+        if !room {
+            // Unread frames hold the client's pong back while the peer catches up.
+            ws.excuse();
+            ping.reset();
+        }
         tokio::select! {
             // Report `expired`, not `peer_left`, when both fire.
             biased;
             _ = &mut deadline => {
                 return ws.fail(ErrorCode::Expired).await;
             }
-            _ = ping.tick() => {
+            _ = ping.tick(), if room => {
                 if !ws.ping().await {
                     return;
                 }
+                // A ping can wait behind frames; the client gets a full period to answer.
+                ping.reset();
             }
             forwarded = link.from_peer.recv() => match forwarded {
                 Some(data) => {
                     if !ws.send(Message::Binary(data)).await {
                         return;
                     }
+                    // Its pong queues behind the frames; that they go out shows it is there.
+                    ws.excuse();
                 }
                 None => {
                     return ws.fail(ErrorCode::PeerLeft).await;
                 }
             },
-            incoming = ws.recv() => {
+            // Wakes once the peer has taken a signal, to read the next.
+            _ = link.to_peer.reserve(), if !room => {}
+            incoming = ws.recv(), if room => {
                 let Some(frame) = incoming else { return };
-                signals += 1;
                 let data = match frame {
-                    Frame::Binary(data) if signals <= MAX_SIGNALS => data,
+                    Frame::Binary(data) if signal_bytes + data.len() <= MAX_SIGNAL_BYTES => data,
                     _ => return ws.fail(ErrorCode::Protocol).await,
                 };
-                // Forwarded verbatim. Only fails once the peer is gone, which
-                // `from_peer` reports next.
+                signal_bytes += data.len();
+                // Forwarded verbatim; there is room. Only fails once the peer
+                // is gone, which `from_peer` reports next.
                 let _ = link.to_peer.try_send(data);
             }
         }
@@ -388,6 +402,11 @@ impl Socket {
         Self { ws, answered: true }
     }
 
+    /// Counts the last ping as answered, for a client whose pong is held up.
+    fn excuse(&mut self) {
+        self.answered = true;
+    }
+
     /// Pings, unless the last ping went unanswered: the client is gone.
     async fn ping(&mut self) -> bool {
         if !std::mem::replace(&mut self.answered, false) {
@@ -420,13 +439,15 @@ impl Socket {
     }
 
     /// The next data frame, `None` once closed.
+    /// Anything the client sends shows it is there, as a pong does.
     async fn recv(&mut self) -> Option<Frame> {
         loop {
-            match self.ws.recv().await? {
+            let message = self.ws.recv().await?;
+            self.answered = true;
+            match message {
                 Ok(Message::Text(text)) => return Some(Frame::Text(text)),
                 Ok(Message::Binary(data)) => return Some(Frame::Binary(data)),
-                Ok(Message::Pong(_)) => self.answered = true,
-                Ok(Message::Ping(_)) => {}
+                Ok(Message::Pong(_) | Message::Ping(_)) => {}
                 Ok(Message::Close(_)) | Err(_) => return None,
             }
         }

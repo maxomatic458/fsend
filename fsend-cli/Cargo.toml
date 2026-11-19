@@ -13,7 +13,7 @@ homepage.workspace = true
 
 [dependencies]
 fsend-core.workspace = true
-fsend-proto.workspace = true
+fsend-proto = { workspace = true, features = ["clap"] }
 clap.workspace = true
 color-eyre = "0.6.5"
 colored = "3.1.1"
@@ -51,7 +51,7 @@ assets = [
 ]
 
 [build-dependencies]
-fsend-proto.workspace = true
+fsend-proto = { workspace = true, features = ["clap"] }
 clap.workspace = true
 clap_complete = "4.6.11"
 clap_mangen = "0.3.3"

@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use fsend_proto::code::Code;
+use fsend_proto::peer::checksum::Algorithm;
 use url::Url;
 
 pub const DEFAULT_RELAY_URL: &str = "wss://relay.fsend.sh";
@@ -38,6 +39,19 @@ pub enum Mode {
         /// Send the data as is instead of zstd-compressing it where that helps.
         #[clap(long)]
         no_compression: bool,
+
+        /// Offer a checksum of every file, which the receiver checks the
+        /// received files against. Reads every file before the share code is
+        /// shown.
+        #[clap(
+            long,
+            value_enum,
+            value_name = "ALGORITHM",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "sha256"
+        )]
+        checksums: Option<Algorithm>,
     },
     /// Receive files or folders using a share code.
     #[clap(name = "receive", aliases = &["r"])]

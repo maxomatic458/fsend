@@ -107,6 +107,8 @@ pub struct Conflict {
 pub struct Plan {
     /// Files to receive whatever the policy: new ones and resumed ones, in offer order.
     pub files: Vec<AcceptedFile>,
+    /// Files already complete, left out of the accept, in offer order.
+    pub complete: Vec<u32>,
     /// Directories to create, in offer order.
     pub dirs: Vec<u32>,
     pub conflicts: Vec<Conflict>,
@@ -160,7 +162,7 @@ pub fn plan(entries: &[Entry], local: &[Local], verified: &[u32]) -> Plan {
             (Entry::File { size, .. }, Local::File { size: len }) => {
                 let prefix = len == 0 || (len <= *size && verified.contains(&id));
                 match prefix {
-                    true if len == *size => {}
+                    true if len == *size => plan.complete.push(id),
                     true => plan.files.push(AcceptedFile { id, offset: len }),
                     false => plan.conflicts.push(conflict(true)),
                 }
@@ -179,6 +181,7 @@ mod tests {
         Entry::File {
             path: path.iter().map(|s| s.to_string()).collect(),
             size,
+            checksum: None,
         }
     }
 

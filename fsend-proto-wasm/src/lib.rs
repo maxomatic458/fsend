@@ -72,7 +72,8 @@ fn thrown(error: PairingError) -> JsError {
     JsError::new(&json(&error))
 }
 
-// `Pake` and `Channel` take and return whole binary relay frames.
+// `Pake` and `Channel` take and return whole binary relay frames; a sealed
+// message may take several.
 
 #[wasm_bindgen]
 pub struct Pake {
@@ -112,19 +113,22 @@ pub struct Channel(pairing::Channel);
 
 #[wasm_bindgen]
 impl Channel {
-    /// `message` is a JSON `Sealed`.
-    pub fn seal(&mut self, message: &str) -> Result<Vec<u8>, JsError> {
-        let sealed = self.0.seal(&serde_json::from_str(message)?);
-        Ok(Signal::Sealed(sealed).encode())
+    /// The frames of `message`, a JSON `Sealed`.
+    pub fn seal(&mut self, message: &str) -> Result<Vec<js_sys::Uint8Array>, JsError> {
+        let frames = self
+            .0
+            .seal(&serde_json::from_str(message)?)
+            .map_err(thrown)?;
+        Ok(frames
+            .iter()
+            .map(|frame| js_sys::Uint8Array::from(frame.as_slice()))
+            .collect())
     }
 
-    /// The JSON `Sealed` in the peer's next frame.
-    pub fn open(&mut self, frame: &[u8]) -> Result<String, JsError> {
-        let Some(Signal::Sealed(sealed)) = Signal::decode(frame) else {
-            return Err(thrown(PairingError::UnexpectedSignal));
-        };
-        let message = self.0.open(&sealed).map_err(thrown)?;
-        Ok(json(&message))
+    /// The JSON `Sealed` once the peer's `frame` completes a message.
+    pub fn open(&mut self, frame: &[u8]) -> Result<Option<String>, JsError> {
+        let message = self.0.open(frame).map_err(thrown)?;
+        Ok(message.map(|message| json(&message)))
     }
 }
 
@@ -264,16 +268,10 @@ pub fn negotiate(version: u32, min_version: u32) -> Option<u32> {
     peer::negotiate(version, min_version)
 }
 
-/// Checks `entries`, a JSON `Entry[]`, against the offer rules.
+/// Checks `offer`, a JSON `Offer`, against the offer rules.
 #[wasm_bindgen(js_name = validateOffer)]
-pub fn validate_offer(entries: &str) -> Result<(), JsError> {
-    Ok(offer::validate(&serde_json::from_str::<Vec<_>>(entries)?)?)
-}
-
-/// The control frame of an offer of `entries`, a JSON `Entry[]`, once they are valid.
-#[wasm_bindgen(js_name = encodeOffer)]
-pub fn encode_offer(entries: &str) -> Result<Vec<u8>, JsError> {
-    Ok(offer::encode(&serde_json::from_str::<Vec<_>>(entries)?)?)
+pub fn validate_offer(offer: &str) -> Result<(), JsError> {
+    Ok(offer::validate(&serde_json::from_str(offer)?)?)
 }
 
 /// Checks `files`, a JSON `AcceptedFile[]`, against the offered `entries`.
@@ -362,7 +360,8 @@ mod bindings {
         code::NAMEPLATE_LEN,
         pairing::{ConnectionInfo, Sealed},
         peer::{
-            AcceptedFile, Cancel, CheckedFile, Entry, ErrorReport, Hello,
+            AcceptedFile, Cancel, CheckedFile, Entry, ErrorReport, Hello, Node, Offer,
+            checksum::{Algorithm, Digest},
             progress::TopEntry,
             resume::{Conflict, ConflictPolicy, Local, Plan},
         },
@@ -393,7 +392,11 @@ mod bindings {
             Hello::decl(&cfg),
             Cancel::decl(&cfg),
             ErrorReport::decl(&cfg),
+            Offer::decl(&cfg),
+            Node::decl(&cfg),
+            Algorithm::decl(&cfg),
             Entry::decl(&cfg),
+            Digest::decl(&cfg),
             AcceptedFile::decl(&cfg),
             CheckedFile::decl(&cfg),
             Fingerprint::decl(&cfg),

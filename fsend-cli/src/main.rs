@@ -14,12 +14,13 @@ use cli::{Args, Mode, OnConflict};
 use fsend_core::connect::{connect_as_receiver, connect_as_sender};
 use fsend_core::relay::{pair_as_receiver, pair_as_sender};
 use fsend_core::transfer::{
-    self, Answer, ConnectionKind, Event, TransferError, build_offer, missing_paths,
+    self, ConnectionKind, Event, Outgoing, TransferError, build_offer, missing_paths,
 };
 use fsend_core::{CancellationToken, Error};
 use fsend_proto::code::Code;
+use fsend_proto::peer::checksum::{self, Algorithm};
 use fsend_proto::peer::resume::{Conflict, ConflictPolicy};
-use fsend_proto::peer::{self, Entry, progress::TopEntry};
+use fsend_proto::peer::{self, Entry, Node, Offer};
 use url::Url;
 
 mod cli;
@@ -53,7 +54,17 @@ async fn run() -> color_eyre::Result<()> {
         Mode::Send {
             files,
             no_compression,
-        } => run_send(&args.relay_url, &args.download_url, files, !no_compression).await?,
+            checksums,
+        } => {
+            run_send(
+                &args.relay_url,
+                &args.download_url,
+                files,
+                !no_compression,
+                checksums,
+            )
+            .await?
+        }
         Mode::Receive {
             on_conflict,
             output_dir,
@@ -117,10 +128,14 @@ async fn run_send(
     download_url: &Url,
     files: Vec<PathBuf>,
     compress: bool,
+    checksums: Option<Algorithm>,
 ) -> Result<(), Error> {
-    let outgoing = build_offer(&files)?;
+    let mut outgoing = build_offer(&files)?;
+    if let Some(algorithm) = checksums {
+        add_checksums(&mut outgoing, algorithm).await?;
+    }
 
-    let mut relay = pair_as_sender(relay_url, APP, |code| {
+    let mut relay = pair_as_sender(relay_url, APP, &outgoing, |code| {
         let link = code.link(download_url.as_str());
         let code = code.to_string();
         println!("Code: {}\n", code.bright_white());
@@ -131,6 +146,7 @@ async fn run_send(
     })
     .await?;
 
+    println!("Waiting for peer to accept files...");
     let mut transport = connect_as_sender(&mut relay).await?;
     drop(relay);
     announce_connection(transport.as_ref()).await;
@@ -156,38 +172,61 @@ async fn run_receive(
     on_conflict: OnConflict,
     auto_accept: bool,
 ) -> Result<(), Error> {
-    let mut relay = pair_as_receiver(relay_url, APP, &code).await?;
+    let (mut relay, offer) = pair_as_receiver(relay_url, APP, &code).await?;
+    // The prompts block, so they leave the async workers to the relay and the transfer.
+    if auto_accept {
+        println!("Auto-accepting files.");
+    } else if !tokio::task::block_in_place(|| accept_files(&offer)) {
+        relay.reject(None).await?;
+        return Err(TransferError::Declined.into());
+    }
     let mut transport = connect_as_receiver(&mut relay).await?;
     drop(relay);
     announce_connection(transport.as_ref()).await;
 
     let mut progress = Progress::default();
-    // The prompts block, so they leave the async workers to the transfer.
-    let mut decide = Answer {
-        accept: |offered: &[TopEntry]| {
-            if auto_accept {
-                println!("Auto-accepting files.");
-                Some(output_dir.clone())
-            } else if tokio::task::block_in_place(|| accept_files(offered)) {
-                Some(output_dir.clone())
-            } else {
-                None
-            }
-        },
-        resolve: |entries: &[Entry], conflicts: &[Conflict]| {
-            tokio::task::block_in_place(|| resolve_conflicts(entries, conflicts, on_conflict))
-        },
-    };
     transfer::receive_files(
         transport.as_mut(),
-        &mut decide,
+        &offer,
+        &output_dir,
+        &mut |entries: &[Entry], conflicts: &[Conflict]| {
+            tokio::task::block_in_place(|| resolve_conflicts(entries, conflicts, on_conflict))
+        },
         &mut |event| progress.on_event(event),
         CancellationToken::new(),
     )
     .await?;
 
+    if offer.checksums.is_some() {
+        println!("\nChecksums verified.");
+    }
     println!("\nTransfer complete.");
     Ok(())
+}
+
+async fn add_checksums(outgoing: &mut Outgoing, algorithm: Algorithm) -> Result<(), Error> {
+    let bar = byte_bar(outgoing.size(), "Computing checksums", "green");
+    outgoing
+        .add_checksums(algorithm, &mut |done| bar.set_position(done))
+        .await?;
+    bar.finish_and_clear();
+    Ok(())
+}
+
+/// A bar of `total` bytes, labelled `prefix`.
+fn byte_bar(total: u64, prefix: &'static str, color: &str) -> ProgressBar {
+    let template = format!(
+        "{{spinner:.green}} {{prefix}} [{{bar:40.{color}/blue}}] {{bytes}}/{{total_bytes}} ({{eta}})"
+    );
+    let bar = ProgressBar::new(total);
+    bar.set_style(
+        ProgressStyle::default_bar()
+            .template(&template)
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+    bar.set_prefix(prefix);
+    bar
 }
 
 async fn announce_connection(transport: &dyn transfer::Transport) {
@@ -199,13 +238,22 @@ async fn announce_connection(transport: &dyn transfer::Transport) {
 }
 
 #[derive(Default)]
-struct Progress(Option<CliProgressBars>);
+struct Progress {
+    verifying: Option<ProgressBar>,
+    bars: Option<CliProgressBars>,
+}
 
 impl Progress {
     fn on_event(&mut self, event: Event) {
         match event {
-            Event::Offered => println!("Waiting for peer to accept files..."),
+            Event::Verifying { done, total } => self
+                .verifying
+                .get_or_insert_with(|| byte_bar(total, "Verifying existing files", "cyan"))
+                .set_position(done),
             Event::Started { entries, present } => {
+                if let Some(bar) = self.verifying.take() {
+                    bar.finish_and_clear();
+                }
                 let (here, total) = (
                     present.iter().sum::<u64>(),
                     entries.iter().map(|e| e.size).sum(),
@@ -222,10 +270,10 @@ impl Progress {
                     .zip(present)
                     .map(|(entry, present)| (entry.name.clone(), *present, entry.size))
                     .collect();
-                self.0 = Some(CliProgressBars::new(&initial));
+                self.bars = Some(CliProgressBars::new(&initial));
             }
             Event::Progress { entry, bytes } => {
-                if let Some(bars) = &mut self.0 {
+                if let Some(bars) = &mut self.bars {
                     bars.update(entry, bytes);
                 }
             }
@@ -233,42 +281,92 @@ impl Progress {
     }
 }
 
-fn accept_files(files: &[TopEntry]) -> bool {
+/// Shows the offer and asks whether to take it.
+fn accept_files(offer: &Offer) -> bool {
     println!("The following files will be received:\n");
 
-    let longest = files
-        .iter()
-        .map(|f| f.name.chars().count())
+    let longest = (offer.entries.iter())
+        .map(|node| node.name().chars().count())
         .max()
         .unwrap_or(0)
         + 1;
-    let total_size: u64 = files.iter().map(|f| f.size).sum();
+    let total_size: u64 = offer.entries.iter().map(Node::size).sum();
 
-    for file in files {
-        let size_str = HumanBytes(file.size).to_string();
-        let name = &file.name;
-        let display = if file.dir {
+    for node in &offer.entries {
+        let size_str = HumanBytes(node.size()).to_string();
+        let name = node.name();
+        let display = if node.is_dir() {
             format!("{}/", name).blue()
         } else {
             format!("{} ", name).blue()
         };
-        println!(
+        let line = format!(
             " - {:<width$} {:>10}",
             display,
             size_str.red(),
             width = longest
         );
+        match (node, offer.checksums) {
+            (Node::Dir { .. }, _) => println!("{line}  {}", files_in(node.files()).dimmed()),
+            (
+                Node::File {
+                    checksum: Some(digest),
+                    ..
+                },
+                Some(algorithm),
+            ) => {
+                println!("{line}\n     {} {digest}", algorithm.to_string().dimmed())
+            }
+            (Node::File { .. }, _) => println!("{line}"),
+        }
     }
 
-    println!(
-        "\nTotal size: {}\n",
-        HumanBytes(total_size).to_string().red()
-    );
+    println!("\nTotal size: {}", HumanBytes(total_size).to_string().red());
+    if let Some(algorithm) = offer.checksums {
+        println!("Checksums: {algorithm} for every file, checked as the files arrive.");
+    }
+    println!();
 
-    dialoguer::Confirm::with_theme(&ColorfulTheme::default())
-        .with_prompt("Accept these files?")
-        .interact()
-        .unwrap_or(false)
+    // Top-level files show everything there is already.
+    let mut choices = vec!["Accept", "Decline"];
+    if offer.entries.iter().any(Node::is_dir) {
+        choices.push("List All Files");
+    }
+    loop {
+        let choice = dialoguer::Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Accept these files?")
+            .items(&choices)
+            .default(0)
+            .interact()
+            .unwrap_or(1);
+        match choice {
+            0 => return true,
+            2 => list_files(offer),
+            _ => return false,
+        }
+    }
+}
+
+fn files_in(count: u64) -> String {
+    match count {
+        1 => "1 file".into(),
+        n => format!("{n} files"),
+    }
+}
+
+/// Every offered file, as `sha256sum` and its kin list them if it has checksums.
+fn list_files(offer: &Offer) {
+    println!();
+    match checksum::listing(offer) {
+        Some(listing) => print!("{listing}"),
+        None => {
+            for entry in offer.flatten().iter().filter(|entry| !entry.is_dir()) {
+                let size = HumanBytes(entry.size()).to_string();
+                println!("{size:>10}  {}", entry.path().join("/"));
+            }
+        }
+    }
+    println!();
 }
 
 /// Lists the conflicts and picks what to do with them.
@@ -441,6 +539,29 @@ mod tests {
         let mut bars = CliProgressBars::new(&[]);
         assert!(bars.bars.is_empty() && bars.total.is_none());
         bars.update(0, 5);
+    }
+
+    #[test]
+    fn checksums_take_an_optional_algorithm() {
+        let parse = |args: &[&str]| {
+            let args = ["fsend", "send"].iter().chain(args);
+            match Args::try_parse_from(args).map(|args| args.mode) {
+                Ok(Mode::Send {
+                    files, checksums, ..
+                }) => Ok((files.len(), checksums)),
+                Ok(_) => unreachable!("a send"),
+                Err(e) => Err(e.kind()),
+            }
+        };
+        let sha256 = Some(Algorithm::Sha256);
+        assert_eq!(parse(&["a"]), Ok((1, None)));
+        // A path after the bare flag is not its value.
+        assert_eq!(parse(&["--checksums", "a"]), Ok((1, sha256)));
+        assert_eq!(parse(&["a", "--checksums=sha256"]), Ok((1, sha256)));
+        assert_eq!(
+            parse(&["--checksums=md5", "a"]),
+            Err(clap::error::ErrorKind::InvalidValue)
+        );
     }
 
     #[test]

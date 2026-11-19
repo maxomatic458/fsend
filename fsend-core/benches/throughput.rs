@@ -14,11 +14,10 @@ use std::thread;
 use std::time::Instant;
 
 use fsend_core::iroh::IrohTransfer;
-use fsend_core::transfer::{Answer, Event, Transport, build_offer, receive_files, send_files};
+use fsend_core::transfer::{Event, Transport, build_offer, receive_files, send_files};
 use fsend_core::webrtc::{WebRtcConfig, WebRtcTransfer};
 use fsend_proto::pairing::ConnectionInfo;
 use fsend_proto::peer::Entry;
-use fsend_proto::peer::progress::TopEntry;
 use fsend_proto::peer::resume::{Conflict, ConflictPolicy};
 use iroh::Endpoint;
 use iroh::endpoint::presets;
@@ -78,21 +77,22 @@ fn send_harness(payload: PathBuf, transfer: impl Future<Output = Box<dyn Transpo
     });
 }
 
+/// Receives the offer of `payload`, which pairing would bring, into `out`.
 fn receive_harness(
+    payload: PathBuf,
     out: PathBuf,
     bytes: u64,
     transfer: impl Future<Output = Box<dyn Transport>>,
 ) -> f64 {
     runtime().block_on(async {
+        let offer = build_offer(&[payload]).expect("offer").offer;
         let mut transfer = transfer.await;
         let mut started = None;
-        let out_dir = out.clone();
         receive_files(
             transfer.as_mut(),
-            &mut Answer {
-                accept: |_: &[TopEntry]| Some(out_dir.clone()),
-                resolve: |_: &[Entry], _: &[Conflict]| ConflictPolicy::Replace,
-            },
+            &offer,
+            &out,
+            &mut |_: &[Entry], _: &[Conflict]| ConflictPolicy::Replace,
             &mut |event| {
                 if matches!(event, Event::Started { .. }) {
                     started = Some(Instant::now());
@@ -143,9 +143,9 @@ fn bench_iroh(payload: &Path, out: &Path, bytes: u64) -> f64 {
         }
     });
     let receiver = thread::spawn({
-        let out = out.to_path_buf();
+        let (payload, out) = (payload.to_path_buf(), out.to_path_buf());
         move || {
-            receive_harness(out, bytes, async {
+            receive_harness(payload, out, bytes, async {
                 let endpoint = IrohTransfer::bind(presets::Minimal).await.unwrap();
                 peer_tx.send(loopback_info(&endpoint)).unwrap();
                 let peer = addr_rx.recv().unwrap();
@@ -187,9 +187,9 @@ fn bench_webrtc(payload: &Path, out: &Path, bytes: u64) -> f64 {
         }
     });
     let receiver = thread::spawn({
-        let out = out.to_path_buf();
+        let (payload, out) = (payload.to_path_buf(), out.to_path_buf());
         move || {
-            receive_harness(out, bytes, async {
+            receive_harness(payload, out, bytes, async {
                 let offer = offer_rx.recv().unwrap();
                 let (mut answerer, answer) = WebRtcTransfer::create_answerer_with(&offer, &config)
                     .await

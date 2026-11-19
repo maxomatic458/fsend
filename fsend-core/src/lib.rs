@@ -1,3 +1,4 @@
+mod checksum;
 pub mod connect;
 pub mod iroh;
 pub mod relay;

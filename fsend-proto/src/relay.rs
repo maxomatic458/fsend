@@ -1,9 +1,15 @@
 use serde::{Deserialize, Serialize};
 
 use crate::code::Nameplate;
+use crate::peer::limits;
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const PATH: &str = "/relay";
+/// Largest frame a client sends, text or binary.
+pub const MAX_FRAME_BYTES: usize = 32 * 1024;
+/// Binary frame bytes a client may send in a session: the largest sealed
+/// offer, with room for its frame headers and the other signals.
+pub const MAX_SIGNAL_BYTES: usize = limits::MAX_FRAME_BYTES + 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -70,18 +76,18 @@ mod tests {
     fn client_messages_keep_their_wire_format() {
         pinned(
             ClientMessage::Create {
-                version: 1,
+                version: 2,
                 transports: vec![Transport::Iroh, Transport::Webrtc],
             },
-            r#"{"type":"create","version":1,"transports":["iroh","webrtc"]}"#,
+            r#"{"type":"create","version":2,"transports":["iroh","webrtc"]}"#,
         );
         pinned(
             ClientMessage::Join {
-                version: 1,
+                version: 2,
                 nameplate: "K7Q2".parse().unwrap(),
                 transports: vec![Transport::Webrtc],
             },
-            r#"{"type":"join","version":1,"nameplate":"K7Q2","transports":["webrtc"]}"#,
+            r#"{"type":"join","version":2,"nameplate":"K7Q2","transports":["webrtc"]}"#,
         );
     }
 
@@ -114,7 +120,7 @@ mod tests {
         for json in [
             r#"{"type":"motd","text":"hi"}"#,
             r#"{"type":"error","code":"teapot","message":""}"#,
-            r#"{"type":"create","version":1,"transports":[]}"#,
+            r#"{"type":"create","version":2,"transports":[]}"#,
         ] {
             assert!(
                 serde_json::from_str::<ServerMessage>(json).is_err(),
@@ -140,8 +146,8 @@ mod tests {
     #[test]
     fn unknown_transports_are_rejected() {
         for json in [
-            r#"{"type":"create","version":1,"transports":["iroh","quic"]}"#,
-            r#"{"type":"join","version":1,"nameplate":"K7Q2","transports":["quic"]}"#,
+            r#"{"type":"create","version":2,"transports":["iroh","quic"]}"#,
+            r#"{"type":"join","version":2,"nameplate":"K7Q2","transports":["quic"]}"#,
         ] {
             assert!(
                 serde_json::from_str::<ClientMessage>(json).is_err(),

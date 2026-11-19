@@ -104,6 +104,7 @@ mod tests {
         Entry::File {
             path: path.iter().map(|p| p.to_string()).collect(),
             size,
+            checksum: None,
         }
     }
 
@@ -150,6 +151,7 @@ mod tests {
         let file = |path: &str, size| Entry::File {
             path: vec![path.into()],
             size,
+            checksum: None,
         };
         let entries = [file("a", 10), file("b", 0), file("c", 5), file("d", 4)];
         let files = [

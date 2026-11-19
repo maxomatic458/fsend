@@ -8,8 +8,9 @@ pub const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 pub const COMPRESS_ABOVE: usize = 1024;
 
 pub const MAX_ENTRIES: usize = 1_000_000;
-/// Components in a path.
-pub const MAX_DEPTH: usize = 64;
+/// Components in a path. Each directory nests the offer's JSON two levels
+/// deeper, which the JSON parser allows 127 of.
+pub const MAX_DEPTH: usize = 60;
 pub const MAX_COMPONENT_BYTES: usize = 255;
 /// A path's components joined with `/`.
 pub const MAX_PATH_BYTES: usize = 4096;

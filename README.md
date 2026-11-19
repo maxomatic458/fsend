@@ -83,10 +83,14 @@ or open in a browser:
   https://fsend.sh/receive#K7Q29XMV4P
 ```
 
+With `--checksums` (SHA-256, or `--checksums=<ALGORITHM>`), the offer carries a checksum of every file, which the receiver can compare with published ones before accepting; every received file is checked against it.
+
 #### Receiving files
 ```bash
 $ fsend receive K7Q29XMV4P
 ```
+
+The offer is shown before the two sides connect, so declining it shares no IP addresses.
 
 ## Licenses
 * fsend-relay, fsend-core and fsend-cli are licensed under MIT. See [LICENCE](fsend-relay/LICENCE), [LICENCE](fsend-core/LICENCE) and [LICENCE](fsend-cli/LICENCE).
