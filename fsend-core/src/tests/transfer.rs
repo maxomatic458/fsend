@@ -204,6 +204,8 @@ fn errors_tell_the_peer_what_it_needs_to_know() {
     assert_eq!(code(TransferError::Declined), None);
     assert_eq!(code(TransferError::PeerDeclined(None)), None);
     assert_eq!(code(TransferError::PeerCancelled(None)), None);
+    // A cancel is said with a cancel message, not an error.
+    assert_eq!(code(TransferError::Cancelled), None);
     assert_eq!(code(TransferError::Disconnected("x".into())), None);
     assert_eq!(
         code(TransferError::Peer {
@@ -216,27 +218,31 @@ fn errors_tell_the_peer_what_it_needs_to_know() {
 
 #[test]
 fn user_errors_are_worded_for_humans() {
-    colored::control::set_override(false);
-
     assert_eq!(
         TransferError::Declined.user_error().as_deref(),
         Some("Transfer declined.")
     );
     assert_eq!(
+        TransferError::Cancelled.user_error().as_deref(),
+        Some("Transfer cancelled.")
+    );
+    assert!(TransferError::Declined.is_deliberate() && TransferError::Cancelled.is_deliberate());
+    assert!(!TransferError::PeerCancelled(None).is_deliberate());
+    assert_eq!(
         TransferError::PeerDeclined(None).user_error().as_deref(),
-        Some("error: the peer declined the files")
+        Some("the peer declined the files")
     );
     assert_eq!(
         TransferError::PathsNotFound(vec!["a".into()])
             .user_error()
             .as_deref(),
-        Some("error: 1 path does not exist:\n - a")
+        Some("1 path does not exist:\n - a")
     );
     assert_eq!(
         TransferError::PathsNotFound(vec!["a".into(), "b/c".into()])
             .user_error()
             .as_deref(),
-        Some("error: 2 paths do not exist:\n - a\n - b/c")
+        Some("2 paths do not exist:\n - a\n - b/c")
     );
     let lost = TransferError::Disconnected("timed out".into())
         .user_error()

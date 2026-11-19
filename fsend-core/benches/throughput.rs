@@ -1,4 +1,4 @@
-// Throughput of a CLI transfer over iroh and WebRTC:
+// Throughput of a transfer over iroh and WebRTC:
 //
 //     cargo bench
 //     FSEND_BENCH_MIB=1024 FSEND_BENCH_RUNS=5 cargo bench
@@ -13,9 +13,10 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
 
-use fsend_cli::iroh::IrohTransfer;
-use fsend_cli::transfer::{Event, Transport, build_offer, receive_files, send_files};
-use fsend_cli::webrtc::{WebRtcConfig, WebRtcTransfer};
+use fsend_core::CancellationToken;
+use fsend_core::iroh::IrohTransfer;
+use fsend_core::transfer::{Callbacks, Event, Transport, build_offer, receive_files, send_files};
+use fsend_core::webrtc::{WebRtcConfig, WebRtcTransfer};
 use fsend_proto::pairing::ConnectionInfo;
 use fsend_proto::peer::resume::ConflictPolicy;
 use iroh::Endpoint;
@@ -63,9 +64,16 @@ fn send_harness(payload: PathBuf, transfer: impl Future<Output = Box<dyn Transpo
     runtime().block_on(async {
         let outgoing = build_offer(&[payload]).expect("offer");
         let mut transfer = transfer.await;
-        send_files(transfer.as_mut(), &outgoing, compress(), &mut |_| {})
-            .await
-            .expect("send");
+        let cancel = CancellationToken::new();
+        send_files(
+            transfer.as_mut(),
+            &outgoing,
+            compress(),
+            &mut |_| {},
+            &cancel,
+        )
+        .await
+        .expect("send");
     });
 }
 
@@ -78,18 +86,18 @@ fn receive_harness(
         let mut transfer = transfer.await;
         let mut started = None;
         let out_dir = out.clone();
-        receive_files(
-            transfer.as_mut(),
-            &mut |_| Some(out_dir.clone()),
-            &mut |_, _| ConflictPolicy::Replace,
-            &mut |event| {
+        let mut handler = Callbacks {
+            accept: |_: &[_]| Some(out_dir.clone()),
+            resolve: |_: &[_], _: &[_]| ConflictPolicy::Replace,
+            event: |event: Event| {
                 if matches!(event, Event::Started { .. }) {
                     started = Some(Instant::now());
                 }
             },
-        )
-        .await
-        .expect("receive");
+        };
+        receive_files(transfer.as_mut(), &mut handler, &CancellationToken::new())
+            .await
+            .expect("receive");
         let secs = started.expect("offer accepted").elapsed().as_secs_f64();
         bytes as f64 / secs / (1024.0 * 1024.0)
     })

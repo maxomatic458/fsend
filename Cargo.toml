@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["fsend-cli", "fsend-proto", "fsend-proto-wasm", "fsend-relay"]
+members = ["fsend-cli", "fsend-core", "fsend-proto", "fsend-proto-wasm", "fsend-relay"]
 
 [workspace.package]
 edition = "2024"
@@ -10,6 +10,7 @@ repository = "https://github.com/maxomatic458/fsend"
 homepage = "https://fsend.sh"
 
 [workspace.dependencies]
+fsend-core = { path = "fsend-core", version = "0.1.0" }
 fsend-proto = { path = "fsend-proto", version = "0.1.0" }
 clap = { version = "4.6.7", features = ["derive"] }
 serde = { version = "1.0.229", features = ["derive"] }
