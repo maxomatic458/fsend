@@ -15,7 +15,7 @@ pub const SAMPLE_BYTES: u64 = 1024 * 1024;
 pub struct Fingerprint(pub u128);
 
 impl Fingerprint {
-    /// The `(start, end)` byte ranges of a file's first `len` bytes that are hashed, in order.
+    /// The `(start, end)` byte ranges that are hashed, in order.
     pub fn ranges(len: u64) -> Vec<(u64, u64)> {
         if len <= 2 * SAMPLE_BYTES {
             vec![(0, len)]
@@ -134,9 +134,8 @@ impl Plan {
     }
 }
 
-/// Plans the receive of a valid offer. `verified` holds the ids of the checked files whose
-/// fingerprints matched: those resume, or are complete. Other existing files
-/// conflict, and so does anything in the way of an offered entry.
+/// `verified` holds the checked files whose fingerprints matched: those resume
+/// or are complete. Other existing files conflict.
 pub fn plan(entries: &[Entry], local: &[Local], verified: &[u32]) -> Plan {
     let mut plan = Plan::default();
     let verified: HashSet<u32> = verified.iter().copied().collect();

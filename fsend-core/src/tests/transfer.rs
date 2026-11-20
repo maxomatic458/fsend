@@ -1,5 +1,138 @@
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use tokio::io::{DuplexStream, ReadBuf};
+use tokio::sync::watch;
+use tokio_util::sync::WaitForCancellationFutureOwned;
+
 use super::test_support::*;
 use super::*;
+
+/// One end of an in-memory connection.
+struct Memory {
+    control: Option<Aborting>,
+    data: Option<Aborting>,
+    aborted: CancellationToken,
+    /// Once closed: whether this side was done.
+    done: watch::Sender<Option<bool>>,
+    peer: watch::Receiver<Option<bool>>,
+}
+
+/// A stream that fails once its connection is aborted.
+struct Aborting {
+    stream: DuplexStream,
+    aborted: Pin<Box<WaitForCancellationFutureOwned>>,
+}
+
+impl Aborting {
+    fn new(stream: DuplexStream, aborted: &CancellationToken) -> Self {
+        Self {
+            stream,
+            aborted: Box::pin(aborted.clone().cancelled_owned()),
+        }
+    }
+
+    fn check(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+        match self.aborted.as_mut().poll(cx) {
+            Poll::Ready(()) => Err(io::ErrorKind::ConnectionReset.into()),
+            Poll::Pending => Ok(()),
+        }
+    }
+}
+
+impl AsyncRead for Aborting {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.check(cx)?;
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Aborting {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.check(cx)?;
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.check(cx)?;
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.check(cx)?;
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+#[async_trait]
+impl Transport for Memory {
+    fn connection_kind(&self) -> ConnectionKind {
+        ConnectionKind::Unknown
+    }
+
+    async fn control(&mut self) -> Result<Box<dyn ByteStream>, Error> {
+        let stream = self.control.take().ok_or(Error::Internal("taken"))?;
+        Ok(Box::new(stream))
+    }
+
+    async fn data(&mut self) -> Result<Box<dyn ByteStream>, Error> {
+        let stream = self.data.take().ok_or(Error::Internal("taken"))?;
+        Ok(Box::new(stream))
+    }
+
+    async fn closed(&mut self) -> Result<(), Error> {
+        let lost = || Error::Disconnected("the peer gave up".into());
+        tokio::select! {
+            _ = self.aborted.cancelled() => Err(lost()),
+            done = self.peer.wait_for(Option::is_some) => match done.map(|done| *done) {
+                Ok(Some(true)) => Ok(()),
+                _ => Err(lost()),
+            },
+        }
+    }
+
+    async fn close(&mut self, ok: bool) {
+        (self.control, self.data) = (None, None);
+        self.done.send_replace(Some(ok));
+    }
+}
+
+fn pair() -> Pin<Box<dyn Future<Output = Peers> + Send>> {
+    Box::pin(async {
+        let aborted = CancellationToken::new();
+        let (control, peer_control) = tokio::io::duplex(4 * BUF_SIZE);
+        let (data, peer_data) = tokio::io::duplex(4 * BUF_SIZE);
+        let (sender_done, sender_closed) = watch::channel(None);
+        let (receiver_done, receiver_closed) = watch::channel(None);
+        let end = |control, data, done, peer| Memory {
+            control: Some(Aborting::new(control, &aborted)),
+            data: Some(Aborting::new(data, &aborted)),
+            aborted: aborted.clone(),
+            done,
+            peer,
+        };
+        let abort = || -> AbortFn {
+            let aborted = aborted.clone();
+            Box::new(move || aborted.cancel())
+        };
+        Peers {
+            sender: Box::new(end(control, data, sender_done, receiver_closed)),
+            receiver: Box::new(end(peer_control, peer_data, receiver_done, sender_closed)),
+            abort_sender: abort(),
+            abort_receiver: abort(),
+        }
+    })
+}
+
+transport_suite!();
 
 fn file(path: &[&str], size: u64) -> Entry {
     Entry::File {
@@ -16,7 +149,7 @@ fn dir(path: &[&str]) -> Entry {
 }
 
 #[test]
-fn offers_a_tree_parents_first() {
+fn offers_a_tree_parents_first_by_name() {
     let tmp = tempfile::tempdir().unwrap();
     let root = sample_tree(tmp.path());
 
@@ -36,12 +169,17 @@ fn offers_a_tree_parents_first() {
     );
     assert_eq!(outgoing.sources[4], root.join("nested/b.txt"));
 
-    let single = build_offer(&[root.join("a.txt")]).unwrap();
-    assert_eq!(single.offer.flatten(), [file(&["a.txt"], 10_000)]);
+    let picked = build_offer(&[root.join("nested"), root.join("a.txt")]).unwrap();
+    let names: Vec<_> = picked.offer.entries.iter().map(Node::name).collect();
+    assert_eq!(names, ["a.txt", "nested"]);
+    assert_eq!(
+        picked.sources[..2],
+        [root.join("a.txt"), root.join("nested")]
+    );
 }
 
 #[test]
-fn dot_is_announced_under_its_real_name() {
+fn dot_is_offered_under_its_real_name() {
     let tmp = tempfile::tempdir().unwrap();
     let root = sample_tree(tmp.path());
     let name = |path: PathBuf| {
@@ -54,7 +192,7 @@ fn dot_is_announced_under_its_real_name() {
     assert_eq!(name(root.join("nested/..")), "album");
     assert!(matches!(
         build_offer(&["/".into()]),
-        Err(TransferError::Io(e)) if e.kind() == io::ErrorKind::InvalidInput
+        Err(Error::Io(e)) if e.kind() == io::ErrorKind::InvalidInput
     ));
 }
 
@@ -63,22 +201,21 @@ fn an_unsendable_selection_fails_before_pairing() {
     let tmp = tempfile::tempdir().unwrap();
     assert!(matches!(
         build_offer(&[tmp.path().join("nope")]),
-        Err(TransferError::PathsNotFound(p)) if p == [tmp.path().join("nope")]
+        Err(Error::PathsNotFound(p)) if p == [tmp.path().join("nope")]
     ));
 
     // Fine on this system, but not a portable name.
     write(&tmp.path().join("a\\b"), b"x");
     assert!(matches!(
         build_offer(&[tmp.path().join("a\\b")]),
-        Err(TransferError::Unsendable(OfferError::Entry { id: 0, .. }))
+        Err(Error::Unsendable(OfferError::Entry { id: 0, .. }))
     ));
 
-    // The same name twice.
     write(&tmp.path().join("x/same"), b"1");
     write(&tmp.path().join("y/same"), b"2");
     assert!(matches!(
         build_offer(&[tmp.path().join("x/same"), tmp.path().join("y/same")]),
-        Err(TransferError::Unsendable(OfferError::Entry {
+        Err(Error::Unsendable(OfferError::Entry {
             id: 1,
             reason: EntryError::Duplicate
         }))
@@ -104,13 +241,12 @@ async fn received_files_are_truncated_to_the_offered_size() {
     let path = tmp.path().join("f.bin");
     write(&path, &bytes(100, 9));
 
-    // Truncate to a shorter size.
     let mut f = open_for_receive(&path, 0).await.unwrap();
     f.write_all(&bytes(30, 1)).await.unwrap();
     finish_received_file(&mut f, 30).await.unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), bytes(30, 1));
 
-    // Resume keeps the prefix and appends.
+    // Resuming keeps the prefix.
     let mut f = open_for_receive(&path, 30).await.unwrap();
     f.write_all(&bytes(5, 2)).await.unwrap();
     finish_received_file(&mut f, 35).await.unwrap();
@@ -118,7 +254,6 @@ async fn received_files_are_truncated_to_the_offered_size() {
     expected.extend(bytes(5, 2));
     assert_eq!(std::fs::read(&path).unwrap(), expected);
 
-    // Creates missing files.
     let fresh = tmp.path().join("new.bin");
     let mut f = open_for_receive(&fresh, 0).await.unwrap();
     finish_received_file(&mut f, 0).await.unwrap();
@@ -134,7 +269,7 @@ async fn control_messages_round_trip_over_a_byte_stream() {
     );
 
     let messages = [
-        SenderMessage::Hello(peer::hello(None)),
+        SenderMessage::Hashes { hashes: vec![] },
         // Compressed, and bigger than any single WebRTC message.
         SenderMessage::Hashes {
             hashes: (0..3000).map(|i| Fingerprint(i * 31)).collect(),
@@ -164,7 +299,7 @@ async fn control_messages_round_trip_over_a_byte_stream() {
     ] {
         a.send_frame(&frame).await.unwrap();
         assert!(
-            matches!(b.recv().await, Err(TransferError::Protocol(_))),
+            matches!(b.recv().await, Err(Error::Protocol(_))),
             "{frame:?}"
         );
     }
@@ -172,133 +307,37 @@ async fn control_messages_round_trip_over_a_byte_stream() {
     drop(c);
     assert!(matches!(
         ReceiverControl::new(Box::new(d)).recv().await,
-        Err(TransferError::Disconnected(_))
+        Err(Error::Disconnected(_))
     ));
 }
 
 #[test]
 fn errors_tell_the_peer_what_it_needs_to_know() {
-    let code = |error: TransferError| error.report().map(|report| report.code);
+    let code = |error: Error| report(&error).map(|report| report.code);
     assert_eq!(
-        code(TransferError::Io(io::Error::other("disk full"))),
+        code(Error::Io(io::Error::other("full"))),
         Some(ErrorCode::Io)
     );
-    assert_eq!(
-        code(TransferError::Version {
-            version: 9,
-            min_version: 9
-        }),
-        Some(ErrorCode::Version)
-    );
-    assert_eq!(
-        code(TransferError::Protocol("x".into())),
-        Some(ErrorCode::Protocol)
-    );
-    assert_eq!(code(TransferError::Timeout("x")), Some(ErrorCode::Timeout));
-    assert_eq!(
-        code(TransferError::Internal("x")),
-        Some(ErrorCode::Internal)
-    );
+    assert_eq!(code(Error::Protocol("x".into())), Some(ErrorCode::Protocol));
+    assert_eq!(code(Error::Timeout("x")), Some(ErrorCode::Timeout));
+    assert_eq!(code(Error::Internal("x")), Some(ErrorCode::Internal));
     // The peer already knows, cannot be told, or is better not told.
-    assert_eq!(code(TransferError::ChecksumMismatch("a".into())), None);
-    assert_eq!(code(TransferError::Declined), None);
-    assert_eq!(code(TransferError::PeerDeclined(None)), None);
-    assert_eq!(code(TransferError::PeerCancelled(None)), None);
-    assert_eq!(code(TransferError::Disconnected("x".into())), None);
-    assert_eq!(
-        code(TransferError::Peer {
-            code: ErrorCode::Io,
-            message: "x".into()
-        }),
-        None
-    );
-}
-
-/// A GUI runs each transfer on a task of its own.
-#[test]
-fn transfers_can_be_spawned() {
-    fn spawnable<A, B, F: Future + Send + 'static>(_: fn(A, B) -> F) {}
-    async fn send(mut transport: Box<dyn Transport>, outgoing: Outgoing) {
-        let _ = send_files(
-            transport.as_mut(),
-            &outgoing,
-            true,
-            &mut |_| {},
-            CancellationToken::new(),
-        )
-        .await;
-    }
-    async fn receive(mut transport: Box<dyn Transport>, mut resolve: Box<dyn Resolve>) {
-        let _ = receive_files(
-            transport.as_mut(),
-            &Offer::default(),
-            Path::new("out"),
-            resolve.as_mut(),
-            &mut |_| {},
-            CancellationToken::new(),
-        )
-        .await;
-    }
-    spawnable(send);
-    spawnable(receive);
+    assert_eq!(code(Error::ChecksumMismatch("a".into())), None);
+    assert_eq!(code(Error::PeerCancelled(None)), None);
+    assert_eq!(code(Error::Disconnected("x".into())), None);
+    let peer = Error::Peer(ErrorReport {
+        code: ErrorCode::Io,
+        message: "x".into(),
+    });
+    assert_eq!(code(peer), None);
 }
 
 #[test]
-fn user_errors_are_worded_for_humans() {
-    assert_eq!(
-        TransferError::Declined.user_message().as_deref(),
-        Some("transfer declined")
-    );
-    assert_eq!(
-        TransferError::PeerDeclined(None).user_message().as_deref(),
-        Some("the peer declined the files")
-    );
-    assert_eq!(
-        TransferError::PathsNotFound(vec!["a".into()])
-            .user_message()
-            .as_deref(),
-        Some("1 path does not exist:\n - a")
-    );
-    assert_eq!(
-        TransferError::PathsNotFound(vec!["a".into(), "b/c".into()])
-            .user_message()
-            .as_deref(),
-        Some("2 paths do not exist:\n - a\n - b/c")
-    );
-    let lost = TransferError::Disconnected("timed out".into())
-        .user_message()
-        .unwrap();
-    assert!(lost.contains("timed out") && lost.contains("resume"));
-    let version = TransferError::Version {
-        version: 9,
-        min_version: 7,
+fn a_lost_peer_is_told_apart_from_other_io_errors() {
+    for kind in [io::ErrorKind::ConnectionReset, io::ErrorKind::BrokenPipe] {
+        let error: Error = io::Error::from(kind).into();
+        assert!(matches!(error, Error::Disconnected(_)), "{error:?}");
     }
-    .user_message()
-    .unwrap();
-    assert!(version.contains("7 to 9") && version.contains("Update"));
-    let peer_version = TransferError::Peer {
-        code: ErrorCode::Version,
-        message: "versions 5 to 6 are supported".into(),
-    }
-    .user_message()
-    .unwrap();
-    assert!(peer_version.contains("5 to 6") && peer_version.contains("Update"));
-
-    for error in [
-        TransferError::PeerCancelled(None),
-        TransferError::Timeout("x"),
-        TransferError::PeerTimeout,
-        TransferError::Unsendable(OfferError::Empty),
-        TransferError::ChecksumMismatch("a".into()),
-    ] {
-        assert!(error.user_message().is_some(), "{error:?}");
-    }
-    for error in [
-        TransferError::Protocol("x".into()),
-        TransferError::Internal("x"),
-        TransferError::UnexpectedConnectionInfo,
-        TransferError::Io(io::Error::other("x")),
-    ] {
-        assert!(error.user_message().is_none(), "{error:?}");
-    }
+    let error: Error = io::Error::from(io::ErrorKind::StorageFull).into();
+    assert!(matches!(error, Error::Io(_)), "{error:?}");
 }

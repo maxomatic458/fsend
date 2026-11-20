@@ -55,20 +55,19 @@ pub fn encode(message: &impl Serialize) -> Result<Vec<u8>, FrameError> {
     Ok(frame)
 }
 
-/// `u8 flags | payload` of a frame of `message`, without the length: how sealed pairing messages carry theirs.
+/// A frame of `message` without its length, as sealed pairing messages carry it.
 pub fn encode_body(message: &impl Serialize) -> Result<Vec<u8>, FrameError> {
     let mut frame = encode(message)?;
     frame.drain(..HEADER_BYTES);
     Ok(frame)
 }
 
-/// The message in a body from [`encode_body`].
 pub fn decode_body<M: DeserializeOwned>(body: &[u8]) -> Result<M, FrameError> {
     let (&flags, payload) = body.split_first().ok_or(FrameError::Empty)?;
     decode(flags, payload)
 }
 
-/// The frame of `head` and the compressed `payload` if it is smaller than the raw frame of `payload`, else that one.
+/// The frame of `head` and the compressed `payload`, or the raw frame of `payload` if that is smaller.
 pub(super) fn compact(head: &[u8], payload: &[u8]) -> Vec<u8> {
     // The compressed frame must beat the raw one; zstd needs a few bytes more room than it writes.
     let raw_len = HEADER_BYTES + 1 + payload.len();
@@ -86,7 +85,7 @@ pub(super) fn compact(head: &[u8], payload: &[u8]) -> Vec<u8> {
     frame
 }
 
-/// Appends `payload` compressed to `out`, within its spare room; false, leaving `out` as it was, if it does not fit.
+/// Appends `payload` compressed to `out` within its spare room; false if it does not fit.
 fn compress_into(payload: &[u8], out: &mut Vec<u8>) -> bool {
     let start = out.len();
     COMPRESSOR.with_borrow_mut(|compressor| {
@@ -106,7 +105,6 @@ fn compress_into(payload: &[u8], out: &mut Vec<u8>) -> bool {
     })
 }
 
-/// A frame of `flags` and the `payload` parts, joined.
 pub(super) fn frame(flags: u8, payload: &[&[u8]]) -> Vec<u8> {
     let len = payload.iter().map(|part| part.len()).sum::<usize>();
     let mut frame = Vec::with_capacity(HEADER_BYTES + 1 + len);
@@ -155,7 +153,6 @@ impl Deframer {
         Some((len, &self.buffer[HEADER_BYTES..end]))
     }
 
-    /// The flags and payload of the next complete frame.
     pub(super) fn next(&mut self) -> Result<Option<(u8, Vec<u8>)>, FrameError> {
         let Some(header) = self.buffer.first_chunk::<HEADER_BYTES>() else {
             return Ok(None);
@@ -239,7 +236,6 @@ mod tests {
         Ok(out)
     }
 
-    /// Frames from the receiver.
     fn from_receiver(bytes: &[u8]) -> Result<Vec<ReceiverMessage>, FrameError> {
         decode_all(bytes)
     }
@@ -252,6 +248,7 @@ mod tests {
                     offset: id as u64 * 7,
                 })
                 .collect(),
+            window: 1 << 20,
         }
     }
 
@@ -298,6 +295,7 @@ mod tests {
             ReceiverMessage::Done,
             ReceiverMessage::Accept {
                 files: (0..300).map(|id| AcceptedFile { id, offset: 0 }).collect(),
+                window: 1 << 20,
             },
             ReceiverMessage::Ack { bytes: 7 },
         ];

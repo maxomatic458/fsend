@@ -52,18 +52,13 @@ pub fn validate(offer: &Offer) -> Result<(), OfferError> {
     rules.check(&offer.entries, 0, 0)
 }
 
-/// Checks entries one by one, in offer order.
 struct Rules {
     digest_len: Option<usize>,
-    /// Entries checked so far.
     entries: usize,
-    /// Bytes of the files checked so far.
     total: u64,
 }
 
 impl Rules {
-    /// Checks the entries of a directory `depth` components deep, whose path
-    /// is `path_bytes` long.
     fn check(&mut self, nodes: &[Node], depth: usize, path_bytes: usize) -> Result<(), OfferError> {
         let mut names = HashSet::with_capacity(nodes.len());
         for node in nodes {
@@ -141,8 +136,7 @@ impl Offer {
         out
     }
 
-    /// Checksums the files under `algorithm` with `digests`, one per file in
-    /// offer order.
+    /// Sets the checksums, one digest per file in offer order.
     pub fn set_checksums(
         &mut self,
         algorithm: Algorithm,
@@ -161,7 +155,7 @@ impl Offer {
     }
 }
 
-/// [`crate::pairing::Sealed::Offer`] as it goes on the wire, borrowing the offer.
+/// [`crate::pairing::Sealed::Offer`], borrowing the offer.
 #[derive(Serialize)]
 #[serde(tag = "type", rename = "offer")]
 struct OfferRef<'a> {

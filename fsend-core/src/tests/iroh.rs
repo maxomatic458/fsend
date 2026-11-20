@@ -1,4 +1,3 @@
-use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 
@@ -9,7 +8,6 @@ async fn local_endpoint() -> Endpoint {
     IrohTransfer::bind(presets::Minimal).await.unwrap()
 }
 
-/// The endpoint's loopback address on whatever ports it bound.
 fn loopback_info(endpoint: &Endpoint) -> ConnectionInfo {
     let addrs = endpoint
         .bound_sockets()
@@ -58,16 +56,25 @@ fn pair() -> Pin<Box<dyn Future<Output = Peers> + Send>> {
     })
 }
 
+// The transfer suite runs in full over memory; these depend on the transport.
+transport_suite!(
+    sends_a_file_larger_than_the_buffers,
+    sends_a_directory_tree,
+    interrupted_by_the_receiver_then_resumed,
+    interrupted_by_the_sender_then_resumed,
+    cancelled_by_the_receiver_then_resumed,
+    cancelled_by_the_sender_then_resumed,
+    a_file_changed_after_hashing_fails_verification,
+    a_file_that_vanishes_fails_both_sides,
+    messages_survive_the_wire,
+    a_closed_peer_fails_the_control_stream,
+);
+
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "timing: cargo test --release -p fsend-core -- --ignored"]
-async fn compression_is_no_bottleneck() {
-    crate::transfer::test_support::suite::compression_is_no_bottleneck(pair).await
+#[ignore = "timing: cargo test --release -p fsend-core -- --ignored --nocapture"]
+async fn throughput() {
+    crate::transfer::test_support::suite::throughput(pair).await
 }
-
-// The behaviour every transport must have.
-transport_suite!();
-
-// iroh specifics.
 
 #[tokio::test]
 async fn connection_over_loopback_is_direct() {
@@ -102,10 +109,7 @@ async fn a_peer_that_gave_up_is_reported_as_lost() {
     let (mut sender, mut receiver) = connected_pair().await;
     receiver.close(false).await;
     let result = sender.closed().await;
-    assert!(
-        matches!(result, Err(TransferError::Disconnected(_))),
-        "{result:?}"
-    );
+    assert!(matches!(result, Err(Error::Disconnected(_))), "{result:?}");
 
     let (mut sender, mut receiver) = connected_pair().await;
     receiver.close(true).await;
@@ -160,12 +164,12 @@ fn connection_info_ignores_what_it_cannot_parse() {
     };
     assert!(matches!(
         IrohTransfer::addr_from_connection_info(&bad_id),
-        Err(TransferError::NodeId(_))
+        Err(Error::Protocol(_))
     ));
 
     let webrtc = ConnectionInfo::WebRtc { sdp: String::new() };
     assert!(matches!(
         IrohTransfer::addr_from_connection_info(&webrtc),
-        Err(TransferError::UnexpectedConnectionInfo)
+        Err(Error::Protocol(_))
     ));
 }

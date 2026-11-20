@@ -11,7 +11,7 @@ use super::{Entry, Offer};
 /// Bytes of the longest digest any algorithm produces.
 pub const MAX_DIGEST_BYTES: usize = 64;
 
-/// How the files of an offer are checksummed; one for the whole offer.
+/// One for the whole offer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
@@ -21,7 +21,6 @@ pub enum Algorithm {
 }
 
 impl Algorithm {
-    /// Bytes of its digests.
     pub fn digest_len(self) -> usize {
         match self {
             Self::Sha256 => 32,
@@ -106,7 +105,6 @@ impl<'de> Deserialize<'de> for Digest {
     }
 }
 
-/// Hashes a file's bytes as they come, under the [`Algorithm`] it is from.
 #[derive(Debug, Clone)]
 pub struct Hasher(State);
 
@@ -129,9 +127,7 @@ impl Hasher {
     }
 }
 
-/// The checksums of an offer as `sha256sum` and its kin print them, a
-/// `<digest>  <path>` line per file; `None` if it has none. Offered names need
-/// no escaping.
+/// `<digest>  <path>` lines as `sha256sum` prints them; `None` without checksums.
 pub fn listing(offer: &Offer) -> Option<String> {
     offer.checksums?;
     let mut out = String::new();

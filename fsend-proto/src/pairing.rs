@@ -26,7 +26,6 @@ pub enum ConnectionInfo {
         node_id: String,
         #[cfg_attr(feature = "ts", ts(type = "Array<string>"))]
         addrs: Vec<SocketAddr>,
-        /// URLs of the iroh relays it is reachable through.
         relays: Vec<String>,
     },
 }
@@ -40,11 +39,8 @@ pub enum Sealed {
     Confirm {
         app: String,
     },
-    /// Sender: what it offers.
     Offer(Offer),
-    /// Receiver: the user wants the offer, so the two sides connect.
     Accept,
-    /// Receiver: the user does not want the offer.
     Reject {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "ts", ts(optional))]
@@ -65,7 +61,7 @@ pub enum Role {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum PairingError {
-    #[error("the codes do not match")]
+    #[error("the codes did not match (a code works only once)")]
     WrongCode,
     #[error("invalid SPAKE2 message")]
     InvalidPake,
@@ -141,12 +137,10 @@ impl Pake {
     }
 }
 
-/// Seals and opens messages with per-direction keys and counter nonces; takes
-/// and returns whole relay frames.
+/// Per-direction keys and counter nonces; takes and returns whole relay frames.
 pub struct Channel {
     seal: Direction,
     open: Direction,
-    /// The peer's sealed message so far, while its parts arrive.
     parts: Vec<u8>,
 }
 
@@ -189,14 +183,13 @@ impl Channel {
         }
     }
 
-    /// The relay frames of `message`, sealed; as many as its size takes.
+    /// As many relay frames as its size takes.
     pub fn seal(&mut self, message: &Sealed) -> Result<Vec<Vec<u8>>, PairingError> {
         let plaintext = frame::encode_body(message).map_err(|_| PairingError::TooLarge)?;
         Ok(self.seal_plaintext(&plaintext))
     }
 
-    /// Like [`Channel::seal`], for a message already encoded, such as by
-    /// [`crate::peer::offer::encode`].
+    /// Like [`Channel::seal`], for an already encoded message.
     pub fn seal_plaintext(&mut self, plaintext: &[u8]) -> Vec<Vec<u8>> {
         let ciphertext = self
             .seal
@@ -213,8 +206,7 @@ impl Channel {
             .collect()
     }
 
-    /// Takes the peer's next frame; the message once its last part is in.
-    /// Failing on the first message (the confirm) means the codes differ.
+    /// The message once its last part is in; failing on the confirm means the codes differ.
     pub fn open(&mut self, frame: &[u8]) -> Result<Option<Sealed>, PairingError> {
         let (last, part) = match Signal::decode(frame) {
             Some(Signal::Sealed(part)) => (true, part),
@@ -294,14 +286,12 @@ mod tests {
         })
     }
 
-    /// The single frame of `message`.
     fn sealed(channel: &mut Channel, message: &Sealed) -> Vec<u8> {
         let mut frames = channel.seal(message).unwrap();
         assert_eq!(frames.len(), 1);
         frames.pop().unwrap()
     }
 
-    /// The message in `frames`, opened one frame at a time.
     fn open_all(channel: &mut Channel, frames: &[Vec<u8>]) -> Result<Sealed, PairingError> {
         let (last, parts) = frames.split_last().unwrap();
         for part in parts {

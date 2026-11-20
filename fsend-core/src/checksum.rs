@@ -8,7 +8,8 @@ use fsend_proto::peer::checksum::{Algorithm, Hasher};
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 
-use crate::transfer::{Outgoing, TransferError};
+use crate::Error;
+use crate::transfer::Outgoing;
 
 /// Files hashed in parallel.
 const HASHERS: usize = 4;
@@ -16,13 +17,12 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const CHUNK_BYTES: usize = 1024 * 1024;
 
 impl Outgoing {
-    /// Adds a checksum under `algorithm` to every file, reading each whole;
     /// `on_progress` gets the bytes hashed so far, of [`Outgoing::size`].
     pub async fn add_checksums(
         &mut self,
         algorithm: Algorithm,
         on_progress: &mut (dyn FnMut(u64) + Send),
-    ) -> Result<(), TransferError> {
+    ) -> Result<(), Error> {
         let entries = self.offer.flatten();
         let jobs = (entries.iter().zip(&self.sources))
             .filter(|(entry, _)| !entry.is_dir())
@@ -37,12 +37,11 @@ impl Outgoing {
 
 #[derive(Default)]
 struct Shared {
-    /// Bytes hashed so far.
     done: AtomicU64,
     stop: AtomicBool,
 }
 
-/// Stops the hashing threads once the hashing is dropped.
+/// Stops the hashing threads when dropped.
 struct StopOnDrop(Arc<Shared>);
 
 impl Drop for StopOnDrop {
@@ -51,9 +50,7 @@ impl Drop for StopOnDrop {
     }
 }
 
-/// Hashes the first `len` bytes of each `(path, len)` under `algorithm`, a few
-/// files at once; `on_progress` gets the bytes hashed so far. Returns the
-/// hashers in order, to go on with or finish.
+/// The hashers of each `(path, len)` in order, to go on with or finish.
 pub(crate) async fn hash_files(
     algorithm: Algorithm,
     jobs: Vec<(PathBuf, u64)>,
@@ -92,7 +89,6 @@ pub(crate) async fn hash_files(
         .collect())
 }
 
-/// Feeds `hasher` the first `len` bytes at `path`.
 fn hash_file(mut hasher: Hasher, path: &Path, len: u64, shared: &Shared) -> io::Result<Hasher> {
     // A file received from the start may not exist yet.
     if len == 0 {

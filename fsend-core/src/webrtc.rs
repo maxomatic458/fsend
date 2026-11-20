@@ -22,38 +22,44 @@ use webrtc::peer_connection::{
 };
 use webrtc::runtime::TokioRuntime;
 
-use crate::transfer::*;
-use fsend_proto::peer::limits::RECV_WINDOW;
+use fsend_proto::peer::limits::WINDOW;
 
-pub(crate) const DEFAULT_STUN_SERVERS: &[&str] = &[
+use crate::Error;
+use crate::transfer::{ByteStream, ConnectionKind, Transport};
+
+const DEFAULT_STUN_SERVERS: &[&str] = &[
     "stun:stun.l.google.com:19302",
     "stun:stun1.l.google.com:19302",
 ];
 
-pub(crate) const DEFAULT_BIND_ADDRS: [SocketAddr; 2] = [
+const DEFAULT_BIND_ADDRS: [SocketAddr; 2] = [
     SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
     SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
 ];
-/// Largest data channel message sent: every peer takes it, and Chromium takes it fastest.
-pub(crate) const MAX_MESSAGE_BYTES: usize = 16384;
-/// Largest data channel message taken: browsers send larger messages faster.
+/// Every peer takes it, and Chromium takes it fastest.
+const MAX_MESSAGE_BYTES: usize = 16384;
+/// Browsers send larger messages faster.
 const MAX_INCOMING_MESSAGE_BYTES: u32 = 256 * 1024;
 
-/// Per-channel send buffer.
 const MAX_BUFFERED_BYTES: usize = 1024 * 1024;
-/// Received bytes a channel queues; the peer protocol's window keeps a well-behaved peer below it.
-const MAX_QUEUED_BYTES: usize = 2 * RECV_WINDOW as usize;
+/// The window keeps a well-behaved peer below it.
+const MAX_QUEUED_BYTES: usize = 2 * WINDOW as usize;
 const ICE_GATHERING_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Everything that can fail here happens while connecting.
+impl From<webrtc::error::Error> for Error {
+    fn from(e: webrtc::error::Error) -> Self {
+        Self::Connect(format!("webrtc: {e}"))
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct WebRtcConfig {
     pub stun_servers: Vec<String>,
-    /// Local UDP addresses to bind.
     pub bind_addrs: Vec<SocketAddr>,
     /// Whether to offer loopback candidates.
     pub loopback: bool,
-    /// ICE `(disconnected, failed, keep-alive)` timeouts.
-    /// `None` keeps the webrtc crate defaults.
+    /// ICE `(disconnected, failed, keep-alive)` timeouts, or the defaults.
     pub ice_timeouts: Option<(Duration, Duration, Duration)>,
 }
 
@@ -68,7 +74,6 @@ impl Default for WebRtcConfig {
     }
 }
 
-/// State of the peer connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LinkState {
     Connecting,
@@ -88,7 +93,6 @@ fn mark_closed(tx: &watch::Sender<LinkState>, reason: impl Into<String>) {
     });
 }
 
-/// Resolves with the reason once the link is closed.
 async fn closed(link: &mut Link) -> String {
     match link.wait_for(|s| matches!(s, LinkState::Closed(_))).await {
         Ok(state) => match &*state {
@@ -109,9 +113,7 @@ struct DcStream {
     link: Link,
     opened: Arc<Notify>,
     reader: StreamReader<UnboundedReceiverStream<io::Result<Bytes>>, Bytes>,
-    /// Bytes received but not read yet.
     queued: Arc<AtomicUsize>,
-    /// The send in progress.
     inflight: Option<Pin<Box<dyn Future<Output = io::Result<()>> + Send>>>,
 }
 
@@ -122,7 +124,7 @@ impl DcStream {
         link_tx: Arc<watch::Sender<LinkState>>,
         link: Link,
     ) -> Self {
-        // The poller must never wait on the reader: a blocked poller stalls the channel for good.
+        // A blocked poller stalls the channel for good, so it never waits on the reader.
         let (tx, rx) = mpsc::unbounded_channel::<io::Result<Bytes>>();
         let opened = Arc::new(Notify::new());
         let queued = Arc::new(AtomicUsize::new(0));
@@ -179,14 +181,14 @@ impl DcStream {
         }
     }
 
-    async fn wait_open(&mut self) -> Result<(), TransferError> {
+    async fn wait_open(&mut self) -> Result<(), Error> {
         if self.dc.ready_state().await == Ok(RTCDataChannelState::Open) {
             return Ok(());
         }
         tokio::select! {
             biased;
             _ = self.opened.notified() => Ok(()),
-            reason = closed(&mut self.link) => Err(TransferError::Disconnected(reason)),
+            reason = closed(&mut self.link) => Err(Error::Disconnected(reason)),
         }
     }
 }
@@ -292,7 +294,7 @@ pub struct WebRtcTransfer {
     gathered: Arc<Notify>,
     control: Option<DcStream>,
     data: Option<DcStream>,
-    /// Answerer only: channels the offerer opens arrive here.
+    /// Answerer: the offerer's channels arrive here.
     pending: Option<mpsc::Receiver<Arc<dyn DataChannel>>>,
 }
 
@@ -301,7 +303,7 @@ impl WebRtcTransfer {
         config: &WebRtcConfig,
         pending: Option<mpsc::Receiver<Arc<dyn DataChannel>>>,
         incoming: Option<mpsc::Sender<Arc<dyn DataChannel>>>,
-    ) -> Result<Self, TransferError> {
+    ) -> Result<Self, Error> {
         let (link_tx, link) = watch::channel(LinkState::Connecting);
         let link_tx = Arc::new(link_tx);
         let gathered = Arc::new(Notify::new());
@@ -357,10 +359,7 @@ impl WebRtcTransfer {
     }
 
     /// The local SDP once ICE gathering is done.
-    async fn local_sdp(
-        pc: &Arc<dyn PeerConnection>,
-        gathered: &Notify,
-    ) -> Result<String, TransferError> {
+    async fn local_sdp(pc: &Arc<dyn PeerConnection>, gathered: &Notify) -> Result<String, Error> {
         if tokio::time::timeout(ICE_GATHERING_TIMEOUT, gathered.notified())
             .await
             .is_err()
@@ -370,16 +369,14 @@ impl WebRtcTransfer {
         pc.local_description()
             .await
             .map(|d| d.sdp)
-            .ok_or(TransferError::Internal("no local description"))
+            .ok_or(Error::Internal("no local description"))
     }
 
-    pub async fn create_offerer() -> Result<(Self, String), TransferError> {
+    pub async fn create_offerer() -> Result<(Self, String), Error> {
         Self::create_offerer_with(&WebRtcConfig::default()).await
     }
 
-    pub async fn create_offerer_with(
-        config: &WebRtcConfig,
-    ) -> Result<(Self, String), TransferError> {
+    pub async fn create_offerer_with(config: &WebRtcConfig) -> Result<(Self, String), Error> {
         let mut this = Self::new(config, None, None).await?;
 
         let control = this.pc.create_data_channel("control", None).await?;
@@ -393,20 +390,20 @@ impl WebRtcTransfer {
         Ok((this, sdp))
     }
 
-    pub async fn set_answer(&mut self, answer_sdp: &str) -> Result<(), TransferError> {
+    pub async fn set_answer(&mut self, answer_sdp: &str) -> Result<(), Error> {
         let answer = RTCSessionDescription::answer(answer_sdp.to_string())?;
         self.pc.set_remote_description(answer).await?;
         Ok(())
     }
 
-    pub async fn create_answerer(offer_sdp: &str) -> Result<(Self, String), TransferError> {
+    pub async fn create_answerer(offer_sdp: &str) -> Result<(Self, String), Error> {
         Self::create_answerer_with(offer_sdp, &WebRtcConfig::default()).await
     }
 
     pub async fn create_answerer_with(
         offer_sdp: &str,
         config: &WebRtcConfig,
-    ) -> Result<(Self, String), TransferError> {
+    ) -> Result<(Self, String), Error> {
         let (dc_tx, dc_rx) = mpsc::channel::<Arc<dyn DataChannel>>(4);
         let this = Self::new(config, Some(dc_rx), Some(dc_tx)).await?;
 
@@ -418,16 +415,16 @@ impl WebRtcTransfer {
         Ok((this, sdp))
     }
 
-    /// Waits for the peer connection and both data channels to be ready.
-    pub async fn wait_connected(&mut self) -> Result<(), TransferError> {
+    /// Also waits for both data channels.
+    pub async fn wait_connected(&mut self) -> Result<(), Error> {
         let state = self
             .link
             .wait_for(|s| *s != LinkState::Connecting)
             .await
-            .map_err(|_| TransferError::Internal("state watcher dropped"))?
+            .map_err(|_| Error::Internal("state watcher dropped"))?
             .clone();
         if let LinkState::Closed(reason) = state {
-            return Err(TransferError::Disconnected(reason));
+            return Err(Error::Disconnected(reason));
         }
 
         if let Some(mut pending) = self.pending.take() {
@@ -435,8 +432,8 @@ impl WebRtcTransfer {
             while dcs.len() < 2 {
                 let dc = tokio::select! {
                     biased;
-                    dc = pending.recv() => dc.ok_or(TransferError::Internal("data channels never arrived"))?,
-                    reason = closed(&mut self.link) => return Err(TransferError::Disconnected(reason)),
+                    dc = pending.recv() => dc.ok_or(Error::Internal("data channels never arrived"))?,
+                    reason = closed(&mut self.link) => return Err(Error::Disconnected(reason)),
                 };
                 dcs.push(dc);
             }
@@ -468,24 +465,24 @@ impl Transport for WebRtcTransfer {
         ConnectionKind::WebRtc
     }
 
-    async fn control(&mut self) -> Result<Box<dyn ByteStream>, TransferError> {
+    async fn control(&mut self) -> Result<Box<dyn ByteStream>, Error> {
         let stream = self
             .control
             .take()
-            .ok_or(TransferError::Internal("control stream already taken"))?;
+            .ok_or(Error::Internal("control stream already taken"))?;
         Ok(Box::new(stream))
     }
 
-    async fn data(&mut self) -> Result<Box<dyn ByteStream>, TransferError> {
+    async fn data(&mut self) -> Result<Box<dyn ByteStream>, Error> {
         let stream = self
             .data
             .take()
-            .ok_or(TransferError::Internal("data stream already taken"))?;
+            .ok_or(Error::Internal("data stream already taken"))?;
         Ok(Box::new(stream))
     }
 
     /// Always Ok: WebRTC cannot tell a hang-up from a lost link.
-    async fn closed(&mut self) -> Result<(), TransferError> {
+    async fn closed(&mut self) -> Result<(), Error> {
         let reason = closed(&mut self.link).await;
         tracing::debug!("peer hung up: {reason}");
         Ok(())

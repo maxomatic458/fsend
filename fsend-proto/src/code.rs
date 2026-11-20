@@ -153,7 +153,6 @@ fn random_symbols(len: usize) -> String {
     out
 }
 
-/// Whether `s` is exactly `len` canonical symbols.
 fn is_canonical(s: &str, len: usize) -> bool {
     s.len() == len && s.bytes().all(|b| ALPHABET.contains(&b))
 }

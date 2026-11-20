@@ -16,8 +16,7 @@ fn is_managed_checkout(dir: &Path) -> bool {
         .windows(2)
         .any(|w| w[0] == "registry" && w[1] == "src");
 
-    // Verify builds run from `<target-dir>/package/<pkg>-<ver>`; the parent name
-    // alone matches, as `--target-dir` varies.
+    // Verify builds run from `<target-dir>/package/<pkg>-<ver>`.
     let from_package = dir.parent().and_then(Path::file_name) == Some(OsStr::new("package"));
 
     from_registry || from_package
@@ -33,8 +32,7 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    // Re-runs only when the files above change; `touch build.rs` to rebuild a
-    // deleted dist/.
+    // Re-runs only when these change; `touch build.rs` to rebuild dist/.
     let completions = manifest_dir.join("dist/completions");
     let man_dir = manifest_dir.join("dist/man");
     fs::create_dir_all(&completions)?;

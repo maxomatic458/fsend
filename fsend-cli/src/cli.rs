@@ -40,9 +40,8 @@ pub enum Mode {
         #[clap(long)]
         no_compression: bool,
 
-        /// Offer a checksum of every file, which the receiver checks the
-        /// received files against. Reads every file before the share code is
-        /// shown.
+        /// Offer a checksum of every file for the receiver to check. Reads every
+        /// file before the share code is shown.
         #[clap(
             long,
             value_enum,

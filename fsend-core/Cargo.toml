@@ -31,8 +31,3 @@ webrtc = "0.21.1"
 fsend-relay = { path = "../fsend-relay" }
 tempfile = "3.27.0"
 tokio = { workspace = true, features = ["rt-multi-thread"] }
-
-# `cargo bench`: throughput over iroh and WebRTC, see benches/throughput.rs
-[[bench]]
-name = "throughput"
-harness = false
