@@ -109,7 +109,8 @@ describe("share links on an open receive page", () => {
             assert.equal(session.code(), "K7Q29XMV4P");
 
             await first.done;
-            assert.match(first.record.error ?? "", /cancelled/);
+            // Nothing connected yet, so the sender only learns the receiver left.
+            assert.match(first.record.error ?? "", /The other side left/);
             // The cancelled attempt says nothing more.
             await sleep(50);
             assert.equal(session.state(), "input");

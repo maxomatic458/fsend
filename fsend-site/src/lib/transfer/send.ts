@@ -1,62 +1,75 @@
 import { CONCURRENT_FILES, MAX_BUFFERED_BYTES } from "../../config";
 import { openSenderSession, type Link } from "../transport/session";
 import { dataMessageBytes, getConnectionType } from "../transport/webrtc";
-import { buildOffer, entrySize, fingerprintOf, type Outgoing, type Source } from "../files/tree";
+import { buildOffer, entrySize, fingerprintOf, topIndices, type Source } from "../files/tree";
 import {
     IDLE_TIMEOUT_MS,
     MAX_BLOCK_BYTES,
-    MIN_RECV_WINDOW,
+    MIN_WINDOW,
     checkAccept,
     checkLengths,
     Progress,
     encodeOffer,
+    flattenOffer,
     loadProto,
-    presentBytes,
-    topEntries,
     type AcceptedFile,
+    type Algorithm,
     type Bytes,
     type Entry,
+    type Offer,
     type ReceiverMessage,
 } from "../proto";
-import {
-    Peer,
-    TransferFailure,
-    type SenderPeer,
-    messageOf,
-    protocolError,
-    transferring,
-    unexpected,
-} from "./peer";
+import { Peer, type SenderPeer, messageOf, protocolError, transferring, unexpected } from "./peer";
 import type { TransferListener } from "./events";
 import { eachAtOnce } from "../parallel";
 import { createCodec } from "./codec";
 import type { SelectedEntry } from "../types";
+import { addChecksums } from "./checksums";
 
 const RECEIVER_IDLE = "the receiver stopped responding";
+
+/** The offer, its entries by id, and the source of each. */
+interface Sending {
+    offer: Offer;
+    entries: Entry[];
+    sources: (Source | null)[];
+}
 /// Blocks compressing while one is sent.
 const ENCODING_AHEAD = 3;
+
+export interface SendOptions {
+    /// Offers a checksum of every file under this algorithm, reading every file first.
+    checksums?: Algorithm;
+}
 
 export async function runSend(
     entries: SelectedEntry[],
     emit: TransferListener,
     abort: AbortSignal,
+    { checksums }: SendOptions = {},
 ): Promise<void> {
     let link: Link | null = null;
 
     try {
-        const outgoing = await buildOffer(entries);
+        const { offer, files: sources } = await buildOffer(entries);
         await loadProto();
-        let offer: Bytes;
+        if (checksums) {
+            const onProgress = (done: number, total: number) =>
+                emit({ type: "hashing", done, total });
+            await addChecksums(offer, sources, checksums, onProgress, abort);
+        }
+        let plaintext: Bytes;
         try {
-            offer = encodeOffer(outgoing.entries);
+            plaintext = encodeOffer(offer);
         } catch (err) {
             throw new Error(`Cannot send these files: ${messageOf(err)}`);
         }
+        const sending = { offer, entries: flattenOffer(offer), sources };
 
-        link = await openSenderSession(abort, {
+        link = await openSenderSession(plaintext, abort, {
             onCode: (code, expiresInSecs) => emit({ type: "code", code, expiresInSecs }),
-            onWaitingPeer: () => emit({ type: "waitingPeer" }),
-            onHandshaking: () => emit({ type: "handshaking" }),
+            onOffered: () => emit({ type: "waitingAccept" }),
+            onAccepted: () => emit({ type: "handshaking" }),
         });
         const { dataChannel } = link;
 
@@ -67,7 +80,7 @@ export async function runSend(
 
         const peer = Peer.sender(link, abort);
         const messageBytes = dataMessageBytes(link.pc);
-        await peer.explained(() => send(peer, dataChannel, messageBytes, outgoing, offer, emit));
+        await peer.explained(() => send(peer, dataChannel, messageBytes, sending, emit));
         emit({ type: "complete" });
     } catch (err) {
         if (!abort.aborted) emit({ type: "error", message: messageOf(err) });
@@ -80,17 +93,10 @@ async function send(
     peer: SenderPeer,
     channel: RTCDataChannel,
     messageBytes: number,
-    { entries, files: sources }: Outgoing,
-    offer: Bytes,
+    { offer, entries, sources }: Sending,
     emit: TransferListener,
 ): Promise<void> {
-    const window = await peer.hello("the receiver did not say hello in time");
-    if (window === undefined || window < MIN_RECV_WINDOW) {
-        throw protocolError("the receiver announced no usable window");
-    }
-
-    peer.sendFrame(offer);
-    emit({ type: "waitingAccept" });
+    // No timeout: the receiver's user may be deciding about storage or conflicts.
     let answer = await peer.next();
     if (answer.type === "check") {
         try {
@@ -105,18 +111,16 @@ async function send(
         peer.send({ type: "hashes", hashes });
         answer = await peer.next();
     }
-    if (answer.type === "reject") {
-        throw new TransferFailure("The receiver rejected the files");
-    }
     if (answer.type !== "accept") throw unexpected(answer);
-    const { files } = answer;
+    const { files, window } = answer;
+    if (window < MIN_WINDOW) throw protocolError("the receiver's window is too small");
     try {
         checkAccept(entries, files);
     } catch (err) {
         throw protocolError(messageOf(err));
     }
-    const [tops, topOf] = topEntries(entries);
-    emit(transferring(tops, presentBytes(entries, files)));
+    emit(transferring(offer, entries, files));
+    const topOf = topIndices(entries);
 
     let sent = 0;
     let acked = 0;
@@ -130,7 +134,7 @@ async function send(
 
     channel.bufferedAmountLowThreshold = MAX_BUFFERED_BYTES / 2;
     const reader = new BlockReader(entries, sources, files);
-    const progress = new Progress(entries, files, topOf);
+    const progress = new Progress(entries, files);
     const codec = reader.done ? undefined : await createCodec();
     try {
         const encoding: { size: number; frame: Promise<Bytes> }[] = [];
@@ -167,8 +171,8 @@ async function send(
             const end = Math.min(offset + messageBytes, block.length);
             channel.send(block.subarray(offset, end));
             const now = Math.floor((size * end) / block.length);
-            for (const [entry, n] of progress.advance(now - counted)) {
-                emit({ type: "progress", entry, bytes: n });
+            for (const [id, n] of progress.advance(now - counted)) {
+                emit({ type: "progress", entry: topOf[id], bytes: n });
             }
             counted = now;
         }

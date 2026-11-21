@@ -6,10 +6,14 @@ import {
     Role,
     newCode,
     parseServerMessage,
+    validateOffer,
+    type Bytes,
     type Channel,
     type ClientMessage,
     type ConnectionInfo,
-    type ErrorCode,
+    type Offer,
+    type RelayError,
+    type Sealed,
     type ServerMessage,
     type Transport,
 } from "../proto";
@@ -19,12 +23,17 @@ const TRANSPORTS: Transport[] = ["webrtc"];
 
 type Reply = Exclude<ServerMessage, { type: "error" }>;
 
+/** The receiver's answer to the offer. */
+export type Answer = Extract<Sealed, { type: "accept" | "reject" }>;
+
 /** A WebSocket to the relay; pair it first, then swap connection info. */
 export class Relay {
     private frames: (string | Uint8Array)[] = [];
     private closed = false;
     private wake: (() => void) | null = null;
     private channel: Channel | null = null;
+    private onClose: () => void = () => {};
+    private whenClosed = new Promise<void>((resolve) => (this.onClose = resolve));
 
     private constructor(private ws: WebSocket) {
         ws.onmessage = (ev) => {
@@ -35,6 +44,7 @@ export class Relay {
         ws.onclose = () => {
             this.closed = true;
             this.notify();
+            this.onClose();
         };
     }
 
@@ -50,8 +60,11 @@ export class Relay {
         });
     }
 
-    /** Creates a session and pairs with whoever joins it. */
-    async pairAsSender(onCode: (code: string, expiresInSecs: number) => void): Promise<void> {
+    /** Creates a session, pairs with whoever joins it and offers them `plaintext`, from `encodeOffer`. */
+    async pairAsSender(
+        plaintext: Uint8Array,
+        onCode: (code: string, expiresInSecs: number) => void,
+    ): Promise<void> {
         this.send({
             type: "create",
             version: RELAY_VERSION,
@@ -63,9 +76,11 @@ export class Relay {
         onCode(code, expires_in);
         await this.expect("paired");
         await this.handshake(code, Role.Sender);
+        this.sendFrames(this.paired().sealPlaintext(plaintext));
     }
 
-    async pairAsReceiver(code: string): Promise<void> {
+    /** Joins the session of `code`; returns the sender's offer, checked. */
+    async pairAsReceiver(code: string): Promise<Offer> {
         this.send({
             type: "join",
             version: RELAY_VERSION,
@@ -74,29 +89,63 @@ export class Relay {
         });
         await this.expect("paired");
         await this.handshake(code, Role.Receiver);
+        const message = await this.sealed();
+        if (message.type !== "offer") throw pairingError("expected an offer");
+        const { type: _, ...offer } = message;
+        try {
+            validateOffer(offer);
+        } catch (err) {
+            const reason = err instanceof Error ? err.message : String(err);
+            throw new Error(`The sender offered files that cannot be received: ${reason}`);
+        }
+        return offer;
     }
 
     /** SPAKE2, then each side's sealed confirm proves both used the same code. */
     private async handshake(code: string, role: Role): Promise<void> {
         const pake = Pake.start(code);
         this.ws.send(pake.message);
-        const channel = pake.finish(await this.signal(), role);
-        this.ws.send(channel.seal({ type: "confirm", app: APP }));
-        const confirm = channel.open(await this.signal());
-        if (confirm.type !== "confirm") {
+        this.channel = pake.finish(await this.signal(), role);
+        this.sendSealed({ type: "confirm", app: APP });
+        if ((await this.sealed()).type !== "confirm") {
             throw pairingError("expected a confirm message");
         }
-        this.channel = channel;
+    }
+
+    /** Sender: waits for the receiver's user to answer the offer. */
+    async answer(): Promise<Answer> {
+        const message = await this.sealed();
+        if (message.type !== "accept" && message.type !== "reject") {
+            throw pairingError("expected an answer to the offer");
+        }
+        return message;
+    }
+
+    accept(): void {
+        this.sendSealed({ type: "accept" });
+    }
+
+    /** Ends the session. */
+    reject(): void {
+        this.sendSealed({ type: "reject" });
+        this.close();
+    }
+
+    /** Fails once the relay ends the session, as it does when the other side leaves. */
+    async ended(): Promise<never> {
+        await this.whenClosed;
+        await this.next();
+        throw pairingError("unexpected message");
     }
 
     sendConnection(info: ConnectionInfo): void {
-        this.ws.send(this.paired().seal({ type: "connection", info }));
+        this.sendSealed({ type: "connection", info });
     }
 
     async connection(): Promise<ConnectionInfo> {
-        const message = this.paired().open(await this.signal());
+        const message = await this.sealed();
         if (message.type !== "connection") {
-            throw pairingError("repeated confirm message");
+            throw pairingError("expected connection details");
         }
         return message.info;
     }
@@ -112,6 +161,22 @@ export class Relay {
 
     private send(message: ClientMessage): void {
         this.ws.send(JSON.stringify(message));
+    }
+
+    private sendSealed(message: Sealed): void {
+        this.sendFrames(this.paired().seal(message));
+    }
+
+    private sendFrames(frames: Bytes[]): void {
+        for (const frame of frames) this.ws.send(frame);
+    }
+
+    /** The peer's next sealed message, which may span several frames. */
+    private async sealed(): Promise<Sealed> {
+        for (;;) {
+            const message = this.paired().open(await this.signal());
+            if (message) return message;
+        }
     }
 
     private async expect<T extends Reply["type"]>(type: T): Promise<Extract<Reply, { type: T }>> {
@@ -141,9 +206,7 @@ export class Relay {
                 continue;
             }
             const message = parse(frame);
-            if (message.type === "error") {
-                throw new Error(describe(message.code, message.message));
-            }
+            if (message.type === "error") throw new Error(describe(message.code));
             return message;
         }
     }
@@ -166,8 +229,8 @@ function pairingError(message: string): Error {
     return new Error(`Pairing failed: ${message}.`);
 }
 
-function describe(code: ErrorCode, message: string): string {
-    switch (code) {
+function describe(error: RelayError): string {
+    switch (error) {
         case "not_found":
             return "No transfer with this code. Check the code; a code works only once.";
         case "expired":
@@ -181,6 +244,6 @@ function describe(code: ErrorCode, message: string): string {
         case "busy":
             return "The relay is busy. Try again in a moment.";
         case "protocol":
-            return `Relay error: ${message}.`;
+            return "The relay refused a message from this page. Reload it and try again.";
     }
 }

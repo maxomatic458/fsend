@@ -1,5 +1,6 @@
 import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 
 import {
     installBrowserEnv,
@@ -62,10 +63,11 @@ async function start(
         sendSignal = new AbortController().signal,
         recvSignal = new AbortController().signal,
         recv = makeRecorder(),
+        sendOptions,
     } = {},
 ) {
     const send = makeRecorder();
-    const senderDone = runSend(makeEntries(spec, mode), send.emit, sendSignal);
+    const senderDone = runSend(makeEntries(spec, mode), send.emit, sendSignal, sendOptions);
     const code = await waitFor(() => send.record.code, { label: "share code" });
     const receiverDone = runReceive(code, sink, policy, recv.emit, recvSignal, options);
     return { send, recv, senderDone, receiverDone };
@@ -206,8 +208,59 @@ describe("complete transfers (File System Access API)", () => {
             send.emit,
             new AbortController().signal,
         );
-        assert.match(send.record.error ?? "", /offered twice/);
+        assert.match(send.record.error ?? "", /taken in its directory/);
         assert.equal(send.record.code, null, "no code is handed out");
+    });
+});
+
+describe("the offer", () => {
+    test("arrives before the peers connect, sorted by name at every level", async () => {
+        const spec = { "b.txt": bytes(3, 1), a: { "z.bin": bytes(2, 2), "m.bin": bytes(1, 3) } };
+        let connections;
+        const recv = makeRecorder({
+            onOffered: (e) => {
+                connections = peerConnections.length;
+                e.accept();
+            },
+        });
+        const { senderDone, receiverDone } = await start(spec, { recv });
+        await Promise.all([senderDone, receiverDone]);
+
+        assert.ok(connections <= 1, "at most the sender has prepared its connection");
+        assert.deepEqual(recv.record.offered, {
+            entries: [
+                {
+                    kind: "dir",
+                    name: "a",
+                    entries: [
+                        { kind: "file", name: "m.bin", size: 1 },
+                        { kind: "file", name: "z.bin", size: 2 },
+                    ],
+                },
+                { kind: "file", name: "b.txt", size: 3 },
+            ],
+        });
+        assert.equal(recv.record.complete, true);
+    });
+
+    test("declining it connects nothing", async () => {
+        const recv = makeRecorder({ onOffered: (e) => e.reject() });
+        const { send, senderDone, receiverDone } = await start({ "a.bin": bytes(10, 4) }, { recv });
+        await Promise.all([senderDone, receiverDone]);
+
+        assert.ok(peerConnections.length <= 1, "only the sender prepared a connection");
+        assert.match(send.record.error ?? "", /rejected/);
+    });
+
+    test("one larger than a relay frame arrives whole", async () => {
+        // Names that hardly compress, so the sealed offer spans many frames.
+        const names = Array.from({ length: 3000 }, (_, i) =>
+            Array.from(bytes(12, i + 1), (b) => b.toString(16).padStart(2, "0")).join(""),
+        );
+        const spec = { d: Object.fromEntries(names.map((name, i) => [name, bytes(1, i)])) };
+        const { dirHandle, recv } = await transfer(spec);
+        assert.equal(recv.complete, true);
+        assertFiles(dirHandle.snapshot(), expectedSnapshot(spec));
     });
 });
 
@@ -718,12 +771,11 @@ describe("compression", () => {
 });
 
 describe("protocol errors", () => {
-    const offer = {
-        type: "offer",
-        entries: [{ kind: "file", path: ["a"], size: 1 }],
-    };
     for (const [name, frame] of [
-        ["a message only the sender sends", () => encodeFrame(offer, Role.Sender)],
+        [
+            "a message only the sender sends",
+            () => encodeFrame({ type: "hashes", hashes: [] }, Role.Sender),
+        ],
         ["an unknown message", () => jsonFrame('{"type":"resume"}')],
         ["a malformed message", () => jsonFrame('{"type":"accept"}')],
         [
@@ -732,16 +784,17 @@ describe("protocol errors", () => {
         ],
     ]) {
         test(`${name} from the receiver fails the sender`, async () => {
-            const recv = makeRecorder({
-                onOffered: (e) => {
-                    // Ahead of the receiver's accept.
-                    peerConnections[1]._channels.get("control").send(frame());
-                    e.accept();
-                },
-            });
+            const sink = createFolderSink(new MemoryDirectoryHandle());
+            // Connected by then, and ahead of the receiver's accept.
+            const prepare = sink.prepare;
+            sink.prepare = (tops) => {
+                peerConnections[1]._channels.get("control").send(frame());
+                return prepare(tops);
+            };
+            const recv = makeRecorder();
             const { send, senderDone, receiverDone } = await start(
                 { "a.bin": bytes(500, 5) },
-                { recv },
+                { recv, sink },
             );
             await Promise.all([senderDone, receiverDone]);
 
@@ -751,6 +804,97 @@ describe("protocol errors", () => {
             assert.match(recv.record.error ?? "", /^The other side failed/);
         });
     }
+});
+
+describe("checksums", () => {
+    const sha256 = (data) => createHash("sha256").update(data).digest("hex");
+    const withChecksums = { sendOptions: { checksums: "sha256" } };
+    const MIB = 1024 * 1024;
+
+    test("come with every file and are checked as it arrives", async () => {
+        const spec = {
+            "a.bin": bytes(300_000, 1),
+            d: { "b.bin": bytes(10, 2), "empty.bin": new Uint8Array(0) },
+        };
+        const { dirHandle, send, recv } = await transfer(spec, withChecksums);
+
+        assert.equal(recv.error, null);
+        assertFiles(dirHandle.snapshot(), expectedSnapshot(spec));
+        const [a, d] = recv.offered.entries;
+        assert.equal(recv.offered.checksums, "sha256");
+        assert.equal(a.checksum, sha256(spec["a.bin"]));
+        assert.deepEqual(
+            d.entries.map((file) => file.checksum),
+            [sha256(spec.d["b.bin"]), sha256(spec.d["empty.bin"])],
+        );
+        assert.ok(send.states.includes("hashing"));
+        assert.ok(!recv.states.includes("verifying"), "nothing was here to check");
+    });
+
+    test("a file changed on the way fails the receiver, which the sender only sees leave", async () => {
+        const spec = { "a.bin": bytes(200_000, 3) };
+        const dir = new MemoryDirectoryHandle();
+        const { send, recv, senderDone, receiverDone } = await start(spec, {
+            sink: createFolderSink(dir),
+            ...withChecksums,
+        });
+        const channel = await waitFor(() => peerConnections[0]?._channels.get("data"), {
+            label: "sender data channel",
+        });
+        // The block goes raw, so its last byte here is a file byte.
+        const realSend = channel.send.bind(channel);
+        let tampered = false;
+        channel.send = (data) => {
+            if (!tampered) {
+                data = new Uint8Array(data);
+                data[data.length - 1] ^= 1;
+                tampered = true;
+            }
+            realSend(data);
+        };
+        await Promise.all([senderDone, receiverDone]);
+
+        assert.equal(
+            recv.record.error,
+            "a.bin does not match its checksum. Delete it to receive it again.",
+        );
+        assert.ok(send.record.error, "the sender fails too");
+        assert.doesNotMatch(send.record.error, /checksum/, "but is not told why");
+        assert.equal(dir.snapshot()["a.bin"].length, 200_000, "kept for the user to look at");
+    });
+
+    test("what is already here is checked before resuming", async () => {
+        const spec = { "done.bin": bytes(5000, 4), "part.bin": bytes(300_000, 5) };
+        const dir = new MemoryDirectoryHandle();
+        (await dir.getFileHandle("done.bin", { create: true })).bytes = spec["done.bin"];
+        (await dir.getFileHandle("part.bin", { create: true })).bytes = spec["part.bin"].slice(
+            0,
+            100_000,
+        );
+
+        const { send, recv } = await transfer(spec, { dir, ...withChecksums });
+
+        assert.equal(recv.error, null);
+        assertFiles(dir.snapshot(), expectedSnapshot(spec));
+        assert.ok(recv.states.includes("verifying"));
+        assert.equal(send.progress, 200_000, "only the missing part crosses the wire");
+    });
+
+    test("a complete file that differs fails before anything is accepted", async () => {
+        // Past 2 MiB, the fingerprint samples only the ends.
+        const offered = bytes(3 * MIB, 6);
+        const local = offered.slice();
+        local[1.5 * MIB] ^= 1;
+        const dir = new MemoryDirectoryHandle();
+        (await dir.getFileHandle("f.bin", { create: true })).bytes = local;
+
+        const { send, recv } = await transfer({ "f.bin": offered }, { dir, ...withChecksums });
+
+        assert.match(recv.error ?? "", /^f\.bin does not match its checksum/);
+        assert.ok(send.error, "the sender sees the receiver leave");
+        assert.ok(!send.states.includes("transferring"), "nothing was accepted");
+        assert.deepEqual(dir.snapshot()["f.bin"], local);
+    });
 });
 
 describe("resuming an interrupted download", () => {

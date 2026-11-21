@@ -1,4 +1,4 @@
-import { BlockDecoder, encodeBlock, type Bytes } from "../proto";
+import { BlockDecoder, Hasher, encodeBlock, type Algorithm, type Bytes } from "../proto";
 
 /** What a batch of data stream bytes completed. */
 export interface Decoded {
@@ -9,27 +9,57 @@ export interface Decoded {
     empty: boolean;
 }
 
-/** The data stream's block codec: a worker where there is one, else this thread. */
+/**
+ * The data stream's block codec, and the checksums of the files in it: a worker
+ * where there is one, else this thread. Requests run in order.
+ */
 export interface BlockCodec {
     /** The block frame of `bytes`, which are handed over and unusable afterwards. */
     encode(bytes: Uint8Array): Promise<Bytes>;
     /** Takes `chunks` of the data stream, in order, handing them over too; throws on a malformed block. */
     decode(chunks: Uint8Array[]): Promise<Decoded>;
+    /** Feeds `bytes`, handed over too, to the hasher of file `id`. */
+    hash(id: number, algorithm: Algorithm, bytes: Uint8Array): Promise<void>;
+    /** The checksum of what file `id` was fed; its hasher starts over. */
+    digest(id: number, algorithm: Algorithm): Promise<string>;
     close(): void;
 }
 
 export type CodecRequest =
     | { id: number; type: "encode"; bytes: Uint8Array }
-    | { id: number; type: "decode"; chunks: Uint8Array[] };
+    | { id: number; type: "decode"; chunks: Uint8Array[] }
+    | { id: number; type: "hash"; file: number; algorithm: Algorithm; bytes: Uint8Array }
+    | { id: number; type: "digest"; file: number; algorithm: Algorithm };
 
 export type CodecResponse =
-    { id: number; frame: Bytes } | ({ id: number } & Decoded) | { id: number; error: string };
+    | { id: number; frame: Bytes }
+    | ({ id: number } & Decoded)
+    | { id: number; digest?: string }
+    | { id: number; error: string };
 
-/** Runs a request against `decoder`; the worker and this thread share it. */
-export function serve(request: CodecRequest, decoder: BlockDecoder): CodecResponse {
+/** What a codec keeps between requests; the worker and this thread share it. */
+export interface CodecState {
+    decoder: BlockDecoder;
+    hashers: Map<number, Hasher>;
+}
+
+export const codecState = (): CodecState => ({ decoder: new BlockDecoder(), hashers: new Map() });
+
+/** Runs a request against `state`. */
+export function serve(request: CodecRequest, { decoder, hashers }: CodecState): CodecResponse {
     try {
         if (request.type === "encode") {
             return { id: request.id, frame: encodeBlock(request.bytes) };
+        }
+        if (request.type === "hash" || request.type === "digest") {
+            const hasher = hashers.get(request.file) ?? new Hasher(request.algorithm);
+            if (request.type === "digest") {
+                hashers.delete(request.file);
+                return { id: request.id, digest: hasher.finish() };
+            }
+            hasher.update(request.bytes);
+            hashers.set(request.file, hasher);
+            return { id: request.id };
         }
         for (const chunk of request.chunks) decoder.push(chunk);
         const blocks = [];
@@ -73,10 +103,10 @@ export async function createCodec(): Promise<BlockCodec> {
 }
 
 function inThread(): BlockCodec {
-    const decoder = new BlockDecoder();
+    const state = codecState();
     let id = 0;
     const run = <T>(request: CodecRequest): Promise<T> => {
-        const response = serve(request, decoder);
+        const response = serve(request, state);
         return "error" in response
             ? Promise.reject(new Error(response.error))
             : Promise.resolve(response as T);
@@ -85,6 +115,12 @@ function inThread(): BlockCodec {
         encode: (bytes) =>
             run<{ frame: Bytes }>({ id: ++id, type: "encode", bytes }).then((r) => r.frame),
         decode: (chunks) => run<Decoded>({ id: ++id, type: "decode", chunks }),
+        hash: (file, algorithm, bytes) =>
+            run<object>({ id: ++id, type: "hash", file, algorithm, bytes }).then(() => {}),
+        digest: (file, algorithm) =>
+            run<{ digest: string }>({ id: ++id, type: "digest", file, algorithm }).then(
+                (r) => r.digest,
+            ),
         close: () => {},
     };
 }
@@ -110,7 +146,7 @@ function inWorker(worker: Worker): BlockCodec {
         if ("error" in response) pending.reject(new Error(response.error));
         else pending.resolve(response);
     };
-    worker.onerror = () => fail(new Error("The compression worker failed"));
+    worker.onerror = () => fail(new Error("The transfer worker failed"));
 
     const run = <T>(request: CodecRequest, transfer: Transferable[]) =>
         new Promise<T>((resolve, reject) => {
@@ -131,9 +167,17 @@ function inWorker(worker: Worker): BlockCodec {
                 { id: ++id, type: "decode", chunks },
                 chunks.map((chunk) => chunk.buffer),
             ),
+        hash: (file, algorithm, bytes) =>
+            run<object>({ id: ++id, type: "hash", file, algorithm, bytes }, [bytes.buffer]).then(
+                () => {},
+            ),
+        digest: (file, algorithm) =>
+            run<{ digest: string }>({ id: ++id, type: "digest", file, algorithm }, []).then(
+                (r) => r.digest,
+            ),
         close: () => {
             worker.terminate();
-            fail(new Error("The compression worker was closed"));
+            fail(new Error("The transfer worker was closed"));
         },
     };
 }

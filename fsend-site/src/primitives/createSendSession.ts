@@ -1,8 +1,12 @@
 import { createMemo, createSignal } from "solid-js";
 import { runSend } from "../lib/transfer/send";
-import { buildOffer, offerSizeBytes } from "../lib/files/tree";
+import { buildOffer, offerSize } from "../lib/files/tree";
 import { createTransferRun, stepOf } from "./createTransferRun";
 import type { SelectedEntry } from "../lib/types";
+import type { Algorithm } from "../lib/proto";
+
+/// How the files are checksummed, if the user asks for checksums.
+const ALGORITHM: Algorithm = "sha256";
 
 export interface SelectedItem {
     entry: SelectedEntry;
@@ -14,6 +18,7 @@ export interface SelectedItem {
 
 type SendState =
     | "selecting"
+    | "hashing"
     | "connecting"
     | "waiting"
     | "handshaking"
@@ -29,6 +34,10 @@ export function createSendSession() {
     const [items, setItems] = createSignal<SelectedItem[]>([]);
     const [shareCode, setShareCode] = createSignal("");
     const [expiresAtMs, setExpiresAtMs] = createSignal(0);
+    /// Whether every file is offered with its checksum.
+    const [checksums, setChecksums] = createSignal(false);
+    /// 0-100 while the files are read for their checksums.
+    const [hashed, setHashed] = createSignal(0);
 
     const entries = createMemo(() => items().map((item) => item.entry));
     const selectionSizeBytes = createMemo(() =>
@@ -39,7 +48,7 @@ export function createSendSession() {
         let measured: Partial<SelectedItem>;
         try {
             measured = {
-                sizeBytes: offerSizeBytes((await buildOffer([item.entry])).entries),
+                sizeBytes: offerSize((await buildOffer([item.entry])).offer),
             };
         } catch (err) {
             measured = { error: err instanceof Error ? err.message : String(err) };
@@ -78,6 +87,10 @@ export function createSendSession() {
             (event) => {
                 if (current !== attempt) return;
                 switch (event.type) {
+                    case "hashing":
+                        setHashed(event.total > 0 ? (event.done / event.total) * 100 : 100);
+                        setState(event.done < event.total ? "hashing" : "connecting");
+                        break;
                     case "code":
                         setShareCode(event.code);
                         setExpiresAtMs(Date.now() + event.expiresInSecs * 1000);
@@ -111,6 +124,7 @@ export function createSendSession() {
                 }
             },
             signal,
+            { checksums: checksums() ? ALGORITHM : undefined },
         );
     };
 
@@ -133,6 +147,10 @@ export function createSendSession() {
         entries,
         shareCode,
         expiresAtMs,
+        algorithm: ALGORITHM,
+        checksums,
+        setChecksums,
+        hashed,
         items,
         selectionSizeBytes,
         add,

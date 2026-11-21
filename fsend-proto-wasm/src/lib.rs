@@ -2,7 +2,9 @@ use fsend_proto::{
     code::{Code, CodeError, Nameplate},
     pairing::{self, PairingError, Signal},
     peer::{
-        ReceiverMessage, SenderMessage, block, frame, limits, offer, progress,
+        Offer, ReceiverMessage, SenderMessage, block,
+        checksum::{self, Algorithm},
+        frame, limits, offer, progress,
         resume::{self, Fingerprint},
     },
     relay::ServerMessage,
@@ -123,6 +125,16 @@ impl Channel {
             .iter()
             .map(|frame| js_sys::Uint8Array::from(frame.as_slice()))
             .collect())
+    }
+
+    /// The frames of a plaintext from [`encode_offer`].
+    #[wasm_bindgen(js_name = sealPlaintext)]
+    pub fn seal_plaintext(&mut self, plaintext: &[u8]) -> Vec<js_sys::Uint8Array> {
+        let frames = self.0.seal_plaintext(plaintext);
+        frames
+            .iter()
+            .map(|frame| js_sys::Uint8Array::from(frame.as_slice()))
+            .collect()
     }
 
     /// The JSON `Sealed` once the peer's `frame` completes a message.
@@ -265,6 +277,41 @@ pub fn crc32(data: &[u8], previous: u32) -> u32 {
 #[wasm_bindgen(js_name = validateOffer)]
 pub fn validate_offer(offer: &str) -> Result<(), JsError> {
     Ok(offer::validate(&serde_json::from_str(offer)?)?)
+}
+
+/// The sealed plaintext of `offer`, a JSON `Offer`; throws unless it follows the offer rules.
+#[wasm_bindgen(js_name = encodeOffer)]
+pub fn encode_offer(offer: &str) -> Result<Vec<u8>, JsError> {
+    Ok(offer::encode(&serde_json::from_str(offer)?)?)
+}
+
+/// JSON `Entry[]` of `offer`, a JSON `Offer`; an entry's id is its index.
+#[wasm_bindgen(js_name = flattenOffer)]
+pub fn flatten_offer(offer: &str) -> Result<String, JsError> {
+    Ok(json(&serde_json::from_str::<Offer>(offer)?.flatten()))
+}
+
+/// Hashes a file's bytes as they come.
+#[wasm_bindgen]
+pub struct Hasher(checksum::Hasher);
+
+#[wasm_bindgen]
+impl Hasher {
+    /// For a JSON `Algorithm`, such as `sha256`.
+    #[wasm_bindgen(constructor)]
+    pub fn new(algorithm: &str) -> Result<Hasher, JsError> {
+        let algorithm: Algorithm = serde_json::from_value(algorithm.into())?;
+        Ok(Self(algorithm.hasher()))
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        self.0.update(data);
+    }
+
+    /// The digest as lowercase hex.
+    pub fn finish(self) -> String {
+        self.0.finish().to_string()
+    }
 }
 
 /// Checks `files`, a JSON `AcceptedFile[]`, against the offered `entries`.

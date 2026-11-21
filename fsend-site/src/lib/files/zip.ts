@@ -1,4 +1,4 @@
-import { crc32, type Entry, type TopEntry } from "../proto";
+import { crc32, type Entry, type Node } from "../proto";
 
 /** A file of a zip, or a folder without `data`. */
 export interface ZipEntry {
@@ -9,7 +9,7 @@ export interface ZipEntry {
 }
 
 /** The name a transfer of several files is saved under. */
-export const zipName = (tops: TopEntry[]): string =>
+export const zipName = (tops: Node[]): string =>
     tops.length === 1 ? `${tops[0].name}.zip` : "fsend-files.zip";
 
 const MAX_U16 = 0xffff;

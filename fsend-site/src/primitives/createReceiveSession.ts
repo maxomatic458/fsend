@@ -10,10 +10,9 @@ import {
 import { createFolderSink, createZipSink } from "../lib/transfer/sinks";
 import { createTransferRun, stepOf } from "./createTransferRun";
 import type { TransferEvent } from "../lib/transfer/events";
-import { CODE_LENGTH, type ConflictPolicy, type TopEntry } from "../lib/proto";
+import { CODE_LENGTH, type ConflictPolicy, type Offer } from "../lib/proto";
 
-type ReceiveState =
-    "input" | "connecting" | "handshaking" | "offered" | "transferring" | "completed" | "error";
+type ReceiveState = "input" | "connecting" | "offered" | "transferring" | "completed" | "error";
 
 export function createReceiveSession() {
     const [state, setState] = createSignal<ReceiveState>("input");
@@ -54,7 +53,7 @@ export function createReceiveSession() {
     };
 
     const [code, setCodeRaw] = createSignal("");
-    const [offered, setOffered] = createSignal<TopEntry[]>([]);
+    const [offered, setOffered] = createSignal<Offer | null>(null);
     const [folder, setFolder] = createSignal<FileSystemDirectoryHandle | null>(null);
     const [policy, setPolicy] = createSignal<ConflictPolicy>("skip");
     /// Existing files that differed from the offer, once the transfer started.
@@ -67,6 +66,8 @@ export function createReceiveSession() {
     const [heldInMemory, setHeldInMemory] = createSignal(false);
     /// Whether the offer was accepted, while the transfer gets ready.
     const [accepted, setAccepted] = createSignal(false);
+    /// 0-100 while what is already here is checked against the checksums.
+    const [verifying, setVerifying] = createSignal<number | null>(null);
     /// Stops waiting for the browser to allow more room, and downloads as a zip.
     let skipAsking = () => {};
 
@@ -104,6 +105,7 @@ export function createReceiveSession() {
         setAskingStorage(false);
         setHeldInMemory(false);
         setAccepted(false);
+        setVerifying(null);
 
         const staging = mode() === "fs" && kind() === "browser" ? storage() : null;
         const sink =
@@ -147,7 +149,7 @@ export function createReceiveSession() {
         run.abort();
         run.setError("");
         accept = reject = null;
-        setOffered([]);
+        setOffered(null);
         setConflicts({ replaced: 0, skipped: 0 });
         setPacking(null);
         setAskingStorage(false);
@@ -181,14 +183,14 @@ export function createReceiveSession() {
             case "connecting":
                 setState("connecting");
                 break;
-            case "handshaking":
-                setState("handshaking");
-                break;
             case "offered":
-                setOffered(event.files);
+                setOffered(event.offer);
                 accept = event.accept;
                 reject = event.reject;
                 setState("offered");
+                break;
+            case "verifying":
+                setVerifying(event.total > 0 ? (event.done / event.total) * 100 : 100);
                 break;
             case "askingStorage":
                 setAskingStorage(true);
@@ -268,6 +270,7 @@ export function createReceiveSession() {
         askingStorage,
         heldInMemory,
         accepted,
+        verifying,
         downloadAsZipInstead: () => skipAsking(),
         isReady,
         chooseFolder,

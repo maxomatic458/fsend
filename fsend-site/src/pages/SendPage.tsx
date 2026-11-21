@@ -3,6 +3,7 @@ import { useNavigate } from "@solidjs/router";
 import { Title, Meta, Link } from "@solidjs/meta";
 import { FiSend } from "solid-icons/fi";
 import { SITE_URL } from "../lib/links";
+import { ALGORITHM_NAMES } from "../lib/proto";
 import { pickFiles, pickDirectory, handleDrop } from "../lib/files/source";
 import { takePendingDrop } from "../lib/pendingDrop";
 import { createSendSession } from "../primitives/createSendSession";
@@ -131,10 +132,24 @@ export function SendPage() {
                         </div>
 
                         <Show when={send.entries().length > 0}>
+                            <label class="w-full max-w-[620px] mt-2 flex items-start gap-2.5 text-sm text-ink-dim cursor-pointer">
+                                <input
+                                    type="checkbox"
+                                    checked={send.checksums()}
+                                    onChange={(e) => send.setChecksums(e.currentTarget.checked)}
+                                    class="mt-0.5 w-4 h-4 shrink-0 accent-accent cursor-pointer"
+                                />
+                                <span>
+                                    <span class="font-semibold text-ink">Include Checksums</span> -
+                                    Compute {" "} 
+                                    {ALGORITHM_NAMES[send.algorithm]} checksums for each file.
+                                    This may take some time for larger files.
+                                </span>
+                            </label>
                             <Button
                                 tone="accent"
                                 size="lg"
-                                class="w-full max-w-[620px] mt-2"
+                                class="w-full max-w-[620px]"
                                 onClick={send.start}
                             >
                                 <span class="flex items-center justify-center gap-2">
@@ -144,6 +159,13 @@ export function SendPage() {
                             </Button>
                         </Show>
                     </div>
+                </Show>
+
+                <Show when={send.state() === "hashing"}>
+                    <Busy
+                        label={`Computing checksums... ${Math.floor(send.hashed())}%`}
+                        onCancel={send.cancel}
+                    />
                 </Show>
 
                 <Show when={send.state() === "connecting"}>

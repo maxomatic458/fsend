@@ -1,5 +1,5 @@
 import { CONCURRENT_FILES } from "../../config";
-import type { Bytes, Entry, Local, TopEntry } from "../proto";
+import type { Bytes, Entry, Local, Node } from "../proto";
 import { formatBytes } from "../format";
 import type { BrowserStorage } from "../files/storage";
 import { Checksums, zipName, zipOffer } from "../files/zip";
@@ -24,8 +24,10 @@ export class NotEnoughRoom extends Error {}
 
 /// Bytes are written into this sink
 export interface TransferSink {
-    /// Called once the offer of `tops` is accepted, before anything is probed.
-    prepare(tops: TopEntry[]): Promise<void>;
+    /// What the user can do about a file kept here that does not match its checksum.
+    mismatchAdvice?: string;
+    /// Called once the offer of the top-level entries `tops` is accepted, before anything is probed.
+    prepare(tops: Node[]): Promise<void>;
     /// What is already at the path of `entry`.
     probe(entry: Entry): Promise<Local>;
     /// The file at `path`, which `probe` found.
@@ -42,11 +44,7 @@ export interface TransferSink {
     write(chunk: Bytes): Promise<void>;
     closeFile(): Promise<void>;
     /// Saves the transfer: downloads it, zipped if needed, unless it already sits in a picked folder.
-    finish(
-        entries: Entry[],
-        tops: TopEntry[],
-        onProgress?: (percent: number) => void,
-    ): Promise<void>;
+    finish(entries: Entry[], tops: Node[], onProgress?: (percent: number) => void): Promise<void>;
     abandon(): Promise<void>;
 }
 
@@ -135,6 +133,10 @@ export function createFolderSink(
     };
 
     return {
+        mismatchAdvice: storage
+            ? "Clear the browser storage to receive it again."
+            : "Delete it to receive it again.",
+
         async prepare(tops) {
             if (storage && isZip(tops)) checksums = new Checksums();
             await storage?.keepOnly(tops);
@@ -340,7 +342,6 @@ export function createZipSink(): TransferSink {
         },
 
         async abandon() {
-            // A partial in-memory transfer is worthless — nothing can resume it.
             files.clear();
             current = null;
         },
@@ -348,7 +349,7 @@ export function createZipSink(): TransferSink {
 }
 
 /// Whether a transfer of `tops` is saved as a zip: anything but a single file.
-const isZip = (tops: TopEntry[]) => tops.length !== 1 || tops[0].dir;
+const isZip = (tops: Node[]) => tops.length !== 1 || tops[0].kind === "dir";
 
 function triggerDownload(blob: Blob, filename: string): void {
     const url = URL.createObjectURL(blob);

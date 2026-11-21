@@ -1,4 +1,4 @@
-import type { TopEntry } from "../proto";
+import type { Node } from "../proto";
 
 /**
  * Where received files go.
@@ -112,7 +112,7 @@ export class BrowserStorage {
     }
 
     /** Drops everything that is not part of `tops`, which may resume. */
-    async keepOnly(tops: TopEntry[]): Promise<void> {
+    async keepOnly(tops: Node[]): Promise<void> {
         const keep = new Set(tops.map((top) => top.name));
         await emptyDir(this.incoming, (name) => !keep.has(name));
         await emptyDir(this.root, (name) => name !== INCOMING);

@@ -18,6 +18,7 @@ import { Choice } from "../components/Choice";
 import { Busy } from "../components/Busy";
 import { StorageUsage } from "../components/StorageUsage";
 import { formatBytes, plural } from "../lib/format";
+import { ALGORITHM_NAMES } from "../lib/proto";
 
 export function ReceivePage() {
     const navigate = useNavigate();
@@ -197,30 +198,40 @@ export function ReceivePage() {
                     <Busy label="Connecting to sender..." onCancel={goBack} />
                 </Show>
 
-                <Show when={receive.state() === "handshaking"}>
-                    <Busy label="Establishing connection..." />
-                </Show>
-
-                <Show when={receive.state() === "offered"}>
-                    <FileOffer
-                        files={receive.offered()}
-                        inMemory={!toFs()}
-                        busy={receive.accepted()}
-                        onAccept={receive.acceptOffer}
-                        onReject={receive.rejectOffer}
-                    />
-                    <Show when={receive.askingStorage()}>
-                        <div class="flex flex-col items-center gap-3 text-center">
-                            <p class="text-sm text-ink-dim">
-                                This transfer needs more browser storage than fsend may use by
-                                default. Allow it when your browser asks, or download it as a zip,
-                                which holds it in memory until it finishes.
-                            </p>
-                            <Button tone="ghost" size="sm" onClick={receive.downloadAsZipInstead}>
-                                Download as Zip Instead
-                            </Button>
-                        </div>
-                    </Show>
+                <Show when={receive.state() === "offered" && receive.offered()}>
+                    {(offer) => (
+                        <>
+                            <FileOffer
+                                offer={offer()}
+                                inMemory={!toFs()}
+                                busy={
+                                    !receive.accepted()
+                                        ? undefined
+                                        : receive.verifying() === null
+                                          ? "Connecting..."
+                                          : `Verifying Existing Files... ${Math.floor(receive.verifying()!)}%`
+                                }
+                                onAccept={receive.acceptOffer}
+                                onReject={receive.rejectOffer}
+                            />
+                            <Show when={receive.askingStorage()}>
+                                <div class="flex flex-col items-center gap-3 text-center">
+                                    <p class="text-sm text-ink-dim">
+                                        This transfer needs more browser storage than fsend may use
+                                        by default. Allow it when your browser asks, or download it
+                                        as a zip, which holds it in memory until it finishes.
+                                    </p>
+                                    <Button
+                                        tone="ghost"
+                                        size="sm"
+                                        onClick={receive.downloadAsZipInstead}
+                                    >
+                                        Download as Zip Instead
+                                    </Button>
+                                </div>
+                            </Show>
+                        </>
+                    )}
                 </Show>
 
                 <Show when={receive.state() === "transferring" || receive.state() === "completed"}>
@@ -260,6 +271,13 @@ export function ReceivePage() {
                                     : "should now be downloading in your browser"}
                             </p>
 
+                            <Show when={receive.offered()?.checksums}>
+                                {(algorithm) => (
+                                    <p class="text-[13px] text-ink-faint mb-4">
+                                        Checksums have been validated for every file.
+                                    </p>
+                                )}
+                            </Show>
                             <Show when={receive.conflicts().skipped > 0}>
                                 <p class="text-[13px] text-ink-faint mb-4">
                                     Skipped{" "}
@@ -285,8 +303,7 @@ export function ReceivePage() {
 
                             <Show when={!toFolder()}>
                                 <p class="text-[13px] text-ink-faint mb-4">
-                                    Check your downloads — saving may still be in progress for a
-                                    large file.
+                                    The files will download shortly!
                                 </p>
                             </Show>
                             <Button tone="accent" onClick={goBack}>

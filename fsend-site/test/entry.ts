@@ -20,13 +20,16 @@ export {
     checkAccept,
     encodeBlock,
     checkLengths,
+    encodeOffer,
     filesToCheck,
     fingerprint,
     fingerprintRanges,
+    flattenOffer,
+    Hasher,
     parseServerMessage,
     planReceive,
-    presentBytes,
-    topEntries,
+    Progress,
     validateOffer,
 } from "../src/lib/proto";
+export { buildOffer, byName, presentBytes } from "../src/lib/files/tree";
 export { formatBytes, formatTime } from "../src/lib/format";

@@ -1,27 +1,26 @@
 import { CONCURRENT_FILES } from "../../config";
-import { openReceiverSession, type Link } from "../transport/session";
+import { connectReceiver, pairReceiver, type Link } from "../transport/session";
+import type { Relay } from "../transport/relay";
 import { getConnectionType } from "../transport/webrtc";
-import { entrySize, fingerprintOf } from "../files/tree";
+import { entrySize, fingerprintOf, topIndices } from "../files/tree";
 import {
     ACK_INTERVAL_MS,
     ACK_STEP,
-    HELLO_TIMEOUT_MS,
     IDLE_TIMEOUT_MS,
-    RECV_WINDOW,
+    WINDOW,
     Progress,
     acceptPlan,
     filesToCheck,
+    flattenOffer,
     planReceive,
-    presentBytes,
-    topEntries,
-    validateOffer,
     type AcceptedFile,
+    type Algorithm,
     type Bytes,
     type CheckedFile,
     type ConflictPolicy,
     type Entry,
     type Local,
-    type TopEntry,
+    type Offer,
 } from "../proto";
 import {
     Peer,
@@ -35,6 +34,7 @@ import {
 import { NotEnoughRoom, type Asking, type TransferSink } from "./sinks";
 import type { TransferListener } from "./events";
 import { createCodec, type BlockCodec } from "./codec";
+import { expectChecksum, verifyPresent } from "./checksums";
 
 const SENDER_IDLE = "the sender stopped sending";
 
@@ -54,30 +54,39 @@ export async function runReceive(
     abort: AbortSignal,
     options: ReceiveOptions = {},
 ): Promise<void> {
+    let relay: Relay | null = null;
     let link: Link | null = null;
     // The sink in use, which the fallback may replace before anything is written.
     let current = sink;
 
     try {
         emit({ type: "connecting" });
-
-        link = await openReceiverSession(code, abort, {
-            onHandshaking: () => emit({ type: "handshaking" }),
-        });
+        let offer: Offer;
+        ({ relay, offer } = await pairReceiver(code, abort));
+        if (!(await decide(offer, relay, emit, abort))) {
+            relay.reject();
+            throw new TransferFailure("Transfer rejected");
+        }
+        link = await connectReceiver(relay, abort);
+        relay = null;
 
         getConnectionType(link.pc)
             .then((kind) => emit({ type: "connectionType", kind }))
             .catch(() => {});
 
         const peer = Peer.receiver(link, abort);
-        const { entries, tops } = await peer.explained(() =>
-            receive(peer, sink, policy, emit, options, (next) => (current = next)),
+        const entries = flattenOffer(offer);
+        await peer.explained(() =>
+            receive(peer, offer, entries, sink, policy, emit, options, (next) => (current = next)),
         );
         link.close();
 
-        await current.finish(entries, tops, (percent) => emit({ type: "packing", percent }));
+        await current.finish(entries, offer.entries, (percent) =>
+            emit({ type: "packing", percent }),
+        );
         emit({ type: "complete" });
     } catch (err) {
+        relay?.close();
         await current.abandon();
         if (!abort.aborted) emit({ type: "error", message: messageOf(err) });
     } finally {
@@ -85,47 +94,44 @@ export async function runReceive(
     }
 }
 
-/** Returns the offer received, and its top-level entries. */
+/** Whether the user takes `offer`; fails if the sender leaves or the user cancels meanwhile. */
+function decide(
+    offer: Offer,
+    relay: Relay,
+    emit: TransferListener,
+    abort: AbortSignal,
+): Promise<boolean> {
+    const ended = relay.ended();
+    ended.catch(() => {});
+    return Promise.race([
+        new Promise<boolean>((resolve) =>
+            emit({
+                type: "offered",
+                offer,
+                accept: () => resolve(true),
+                reject: () => resolve(false),
+            }),
+        ),
+        ended,
+        new Promise<never>((_, reject) => {
+            const aborted = () => reject(new DOMException("Aborted", "AbortError"));
+            if (abort.aborted) aborted();
+            else abort.addEventListener("abort", aborted, { once: true });
+        }),
+    ]);
+}
+
 async function receive(
     peer: ReceiverPeer,
+    offer: Offer,
+    entries: Entry[],
     sink: TransferSink,
     policy: ConflictPolicy,
     emit: TransferListener,
     { fallback, skipAsking }: ReceiveOptions,
     use: (sink: TransferSink) => void,
-): Promise<{ entries: Entry[]; tops: TopEntry[] }> {
-    await peer.hello("the sender did not say hello in time", RECV_WINDOW);
-    const offer = await peer.next(HELLO_TIMEOUT_MS, "the sender did not make an offer in time");
-    if (offer.type !== "offer") throw unexpected(offer);
-    const { entries } = offer;
-    try {
-        validateOffer(entries);
-    } catch (err) {
-        throw new TransferFailure(`Invalid offer: ${messageOf(err)}`, {
-            code: "invalid_offer",
-            message: messageOf(err),
-        });
-    }
-    const [tops, topOf] = topEntries(entries);
-
-    const accepted = await Promise.race([
-        new Promise<boolean>((resolve) =>
-            emit({
-                type: "offered",
-                files: tops,
-                accept: () => resolve(true),
-                reject: () => resolve(false),
-            }),
-        ),
-        peer.stopped,
-    ]);
-    if (!accepted) {
-        peer.send({ type: "reject" });
-        await peer.goodbye();
-        throw new TransferFailure("Transfer rejected");
-    }
-
-    let { plan, files } = await planFor(peer, sink, entries, tops, policy);
+): Promise<void> {
+    let { plan, files } = await planFor(peer, sink, offer, entries, policy);
     const asking: Asking = {
         start: () => emit({ type: "askingStorage" }),
         skipped: skipAsking ?? new Promise(() => {}),
@@ -141,7 +147,7 @@ async function receive(
         sink = fallback();
         use(sink);
         emit({ type: "heldInMemory" });
-        ({ plan, files } = await planFor(peer, sink, entries, tops, policy));
+        ({ plan, files } = await planFor(peer, sink, offer, entries, policy));
     }
     // Before accepting, as the sender then waits for acks only so long.
     for (const { id, offset } of files) {
@@ -149,44 +155,55 @@ async function receive(
             await Promise.race([sink.reopen(entries[id].path, offset), peer.stopped]);
         }
     }
-    peer.send({ type: "accept", files });
-    emit(transferring(tops, presentBytes(entries, files)));
-    if (plan.conflicts.length > 0) {
-        const replaced =
-            policy === "replace"
-                ? plan.conflicts.filter((conflict) => conflict.replaceable).length
-                : 0;
-        emit({
-            type: "conflicts",
-            replaced,
-            skipped: plan.conflicts.length - replaced,
-        });
-    }
-
-    for (const id of plan.dirs) await sink.createDir(entries[id].path);
-    const codec = files.some(({ id, offset }) => entrySize(entries[id]) > offset)
-        ? await createCodec()
-        : undefined;
+    const algorithm = offer.checksums;
+    const receiving = files.some(({ id, offset }) => entrySize(entries[id]) > offset);
+    const codec = receiving || algorithm ? await createCodec() : undefined;
     try {
-        await receiveData(peer, sink, entries, files, topOf, codec, emit);
+        if (algorithm) {
+            const checked = verifyPresent(
+                codec!,
+                algorithm,
+                entries,
+                plan.complete,
+                files,
+                (path) => sink.read(path),
+                (done, total) => emit({ type: "verifying", done, total }),
+                sink.mismatchAdvice,
+            );
+            await Promise.race([checked, peer.stopped]);
+        }
+        peer.send({ type: "accept", files, window: WINDOW });
+        emit(transferring(offer, entries, files));
+        if (plan.conflicts.length > 0) {
+            const replaced =
+                policy === "replace"
+                    ? plan.conflicts.filter((conflict) => conflict.replaceable).length
+                    : 0;
+            emit({
+                type: "conflicts",
+                replaced,
+                skipped: plan.conflicts.length - replaced,
+            });
+        }
+        for (const id of plan.dirs) await sink.createDir(entries[id].path);
+        await receiveData(peer, sink, entries, files, codec, algorithm, emit);
     } finally {
         codec?.close();
     }
 
     peer.send({ type: "done" });
     await peer.goodbye();
-    return { entries, tops };
 }
 
 /** What to receive into `sink`, given what it already holds. */
 async function planFor(
     peer: ReceiverPeer,
     sink: TransferSink,
+    offer: Offer,
     entries: Entry[],
-    tops: TopEntry[],
     policy: ConflictPolicy,
 ) {
-    await sink.prepare(tops);
+    await sink.prepare(offer.entries);
     const local: Local[] = [];
     for (const entry of entries) local.push(await sink.probe(entry));
     const checked = filesToCheck(entries, local);
@@ -201,15 +218,27 @@ async function receiveData(
     sink: TransferSink,
     entries: Entry[],
     files: AcceptedFile[],
-    topOf: number[],
     codec: BlockCodec | undefined,
+    algorithm: Algorithm | undefined,
     emit: TransferListener,
 ): Promise<void> {
+    const topOf = topIndices(entries);
+    // A copy goes to the file's hasher, as the sink may keep the bytes it is given.
+    const hash = (id: number, bytes: Uint8Array) => {
+        if (algorithm && bytes.length > 0) {
+            codec!.hash(id, algorithm, bytes.slice()).catch(() => {});
+        }
+    };
+    const check = async (id: number) => {
+        if (algorithm) {
+            await expectChecksum(codec!, algorithm, entries[id], id, sink.mismatchAdvice);
+        }
+    };
     let written = 0;
     let acked = 0;
     let ackedAt = performance.now();
     // File bytes count as their blocks arrive, in proportion.
-    const progress = new Progress(entries, files, topOf);
+    const progress = new Progress(entries, files);
     let decoded = 0;
     let arrived = 0;
     const blocks: Bytes[] = [];
@@ -234,8 +263,8 @@ async function receiveData(
             decoded += batch.blocks.reduce((n, block) => n + block.length, 0);
             const now = decoded + batch.partial;
             if (now > arrived) {
-                for (const [entry, n] of progress.advance(now - arrived)) {
-                    emit({ type: "progress", entry, bytes: n });
+                for (const [id, n] of progress.advance(now - arrived)) {
+                    emit({ type: "progress", entry: topOf[id], bytes: n });
                 }
                 arrived = now;
             }
@@ -270,7 +299,10 @@ async function receiveData(
             if (pending) {
                 pending = rest < pending.length ? pending.subarray(rest) : undefined;
             }
-            const done = sink.writeFile(entry.path, offset, data);
+            hash(id, data);
+            const done = Promise.all([sink.writeFile(entry.path, offset, data), check(id)]).then(
+                () => {},
+            );
             done.catch(() => {});
             writing.push({ bytes: rest, done });
             if (writing.length >= CONCURRENT_FILES) await settle();
@@ -282,12 +314,15 @@ async function receiveData(
         for (let position = offset; position < size;) {
             const block = pending ?? (await nextBlock());
             const n = Math.min(block.length, size - position);
-            await sink.write(block.subarray(0, n));
+            const chunk = block.subarray(0, n);
+            hash(id, chunk);
+            await sink.write(chunk);
             pending = n < block.length ? block.subarray(n) : undefined;
             position += n;
             wrote(n);
         }
         await sink.closeFile();
+        await check(id);
     }
     while (writing.length > 0) await settle();
     if (pending || blocks.length > 0 || !empty) {

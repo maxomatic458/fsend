@@ -46,7 +46,7 @@ class FakeWebSocket {
     }
 
     _fail(code) {
-        this._json({ type: "error", code, message: code });
+        this._json({ type: "error", code });
         setTimeout(() => this.close(), 0);
     }
 
@@ -60,7 +60,7 @@ class FakeWebSocket {
         if (this._nameplate || this._peer) return this._fail("protocol");
 
         const msg = JSON.parse(frame);
-        if (msg.version !== 1) return this._fail("version");
+        if (msg.version !== 2) return this._fail("version");
         if (!msg.transports?.every((t) => TRANSPORTS.includes(t))) {
             return this._fail("protocol");
         }

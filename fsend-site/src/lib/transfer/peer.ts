@@ -1,20 +1,19 @@
 import { MAX_MESSAGE_BYTES } from "../../config";
 import {
     GOODBYE_TIMEOUT_MS,
-    HELLO_TIMEOUT_MS,
-    PEER_MIN_VERSION,
-    PEER_VERSION,
     FrameDecoder,
     Role,
     encodeFrame,
-    negotiate,
+    type AcceptedFile,
+    type Entry,
     type ErrorReport,
+    type Offer,
     type PeerMessage,
     type ReceiverMessage,
     type SenderMessage,
     type Bytes,
-    type TopEntry,
 } from "../proto";
+import { nodeSize, presentBytes } from "../files/tree";
 import type { Link } from "../transport/session";
 import type { TransferEvent } from "./events";
 
@@ -37,17 +36,11 @@ export const protocolError = (detail: string): TransferFailure =>
         message: detail,
     });
 
-const VERSION_MISMATCH = "The other side runs an incompatible version of fsend. Update both sides.";
-
 /** What a message means where the flow expects another one. */
 export function unexpected(message: PeerMessage): TransferFailure {
     switch (message.type) {
         case "error":
-            return new TransferFailure(
-                message.code === "version"
-                    ? VERSION_MISMATCH
-                    : `The other side failed: ${message.message}`,
-            );
+            return new TransferFailure(`The other side failed: ${message.message}`);
         case "cancel":
             return new TransferFailure("The other side cancelled the transfer");
         default:
@@ -209,26 +202,6 @@ export class Peer<Out extends PeerMessage, In extends PeerMessage> {
         return item === undefined ? undefined : message(item);
     }
 
-    /** Sends our `hello` and checks the peer's; returns the peer's `recv_window`. */
-    async hello(what: string, recvWindow?: number): Promise<number | undefined> {
-        this.send({
-            type: "hello",
-            version: PEER_VERSION,
-            min_version: PEER_MIN_VERSION,
-            features: [],
-            recv_window: recvWindow,
-        });
-        const hello: PeerMessage = await this.next(HELLO_TIMEOUT_MS, what);
-        if (hello.type !== "hello") throw unexpected(hello);
-        if (negotiate(hello.version, hello.min_version) === undefined) {
-            throw new TransferFailure(VERSION_MISMATCH, {
-                code: "version",
-                message: `versions ${PEER_MIN_VERSION} to ${PEER_VERSION} are supported`,
-            });
-        }
-        return hello.recv_window;
-    }
-
     /** Gives the peer a moment to read our last message, until it hangs up or says its last word. */
     async goodbye(): Promise<void> {
         const lastWord = async () => {
@@ -277,7 +250,7 @@ export class Peer<Out extends PeerMessage, In extends PeerMessage> {
 export type SenderPeer = Peer<SenderMessage, ReceiverMessage>;
 export type ReceiverPeer = Peer<ReceiverMessage, SenderMessage>;
 
-const FINAL = new Set(["done", "reject", "cancel", "error"]);
+const FINAL = new Set(["done", "cancel", "error"]);
 
 function message<In>(item: Incoming<In>): In {
     if (item instanceof Uint8Array) {
@@ -286,15 +259,16 @@ function message<In>(item: Incoming<In>): In {
     return item;
 }
 
-/** The `transferring` event for the top-level entries and the bytes of each already present. */
-export function transferring(tops: TopEntry[], present: number[]): TransferEvent {
+/** The `transferring` event for `offer`, once `files` are accepted. */
+export function transferring(offer: Offer, entries: Entry[], files: AcceptedFile[]): TransferEvent {
+    const present = presentBytes(offer, entries, files);
     return {
         type: "transferring",
-        entries: tops.map((top, i) => ({
-            name: top.name,
-            sizeBytes: top.size,
+        entries: offer.entries.map((node, i) => ({
+            name: node.name,
+            sizeBytes: nodeSize(node),
             skipBytes: present[i],
-            isDir: top.dir,
+            isDir: node.kind === "dir",
         })),
     };
 }

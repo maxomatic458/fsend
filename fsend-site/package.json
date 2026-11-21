@@ -1,6 +1,6 @@
 {
   "name": "fsend-site",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Peer-to-peer file transfer in the browser",
   "private": true,
   "type": "module",

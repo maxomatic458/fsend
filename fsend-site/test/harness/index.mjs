@@ -164,7 +164,7 @@ export function makeRecorder({ onOffered } = {}) {
                 record.code = event.code;
                 break;
             case "offered":
-                record.offered = event.files;
+                record.offered = event.offer;
                 if (onOffered) onOffered(event);
                 else event.accept();
                 break;
