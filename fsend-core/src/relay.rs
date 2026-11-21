@@ -264,10 +264,9 @@ mod tests {
     use super::*;
     use fsend_proto::peer::checksum::{Algorithm, Digest};
     use fsend_proto::peer::{Node, frame};
-    use fsend_relay::Config;
     use tokio::{net::TcpListener, sync::oneshot};
 
-    const APP: &str = "fsend-core tests";
+    use crate::transfer::test_support::{APP, start_relay, ws_url};
 
     fn file(name: &str, checksum: Option<&[u8]>) -> Node {
         Node::File {
@@ -285,17 +284,6 @@ mod tests {
             offer,
             sources: vec![],
         }
-    }
-
-    fn ws(listener: &TcpListener) -> Url {
-        Url::parse(&format!("ws://{}", listener.local_addr().unwrap())).unwrap()
-    }
-
-    async fn start_relay() -> Url {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = ws(&listener);
-        tokio::spawn(fsend_relay::serve(listener, Config::default()));
-        url
     }
 
     fn iroh_info(id: &str) -> ConnectionInfo {
@@ -447,7 +435,7 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_relay_message_is_a_protocol_error() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = ws(&listener);
+        let url = ws_url(&listener);
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
@@ -468,7 +456,7 @@ mod tests {
     #[tokio::test]
     async fn a_relay_that_hangs_up_is_a_closed_connection() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = ws(&listener);
+        let url = ws_url(&listener);
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
@@ -485,7 +473,7 @@ mod tests {
     #[tokio::test]
     async fn an_unreachable_relay_is_reported() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = ws(&listener);
+        let url = ws_url(&listener);
         drop(listener);
         let result =
             pair_as_sender(&url, APP, &offer_of(None, vec![file("a", None)]), |_| {}).await;

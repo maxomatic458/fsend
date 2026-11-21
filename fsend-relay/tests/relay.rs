@@ -70,12 +70,7 @@ impl Client {
 
     /// Asserts the relay answers with `code` and closes.
     async fn expect_error(&mut self, code: &str) {
-        let frame = self.recv().await;
-        assert_eq!(
-            (frame["type"].as_str(), frame["code"].as_str()),
-            (Some("error"), Some(code)),
-            "{frame}"
-        );
+        assert_eq!(self.recv().await, json!({"type": "error", "code": code}));
         assert_eq!(self.next().await, None, "the relay closes after an error");
     }
 

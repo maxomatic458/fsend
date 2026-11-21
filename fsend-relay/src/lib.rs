@@ -40,7 +40,7 @@ const NAMEPLATE_TRIES: usize = 64;
 /// Time for any single write to a client.
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// Time for a client to say `create` or `join` after connecting.
-const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+const FIRST_MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -188,7 +188,7 @@ async fn upgrade(ws: WebSocketUpgrade, State(relay): State<Arc<Relay>>) -> Respo
 }
 
 async fn connection(mut ws: Socket, relay: Arc<Relay>) {
-    let text = match timeout(HELLO_TIMEOUT, ws.recv()).await {
+    let text = match timeout(FIRST_MESSAGE_TIMEOUT, ws.recv()).await {
         Ok(Some(Frame::Text(text))) => text,
         Ok(Some(Frame::Binary(_))) => return ws.fail(Error::Protocol).await,
         Ok(None) | Err(_) => return,

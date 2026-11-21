@@ -87,6 +87,19 @@ pub fn json_frame(json: &str) -> Vec<u8> {
     frame
 }
 
+pub const APP: &str = "fsend-core tests";
+
+pub fn ws_url(listener: &tokio::net::TcpListener) -> url::Url {
+    url::Url::parse(&format!("ws://{}", listener.local_addr().unwrap())).unwrap()
+}
+
+pub async fn start_relay() -> url::Url {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = ws_url(&listener);
+    tokio::spawn(fsend_relay::serve(listener, fsend_relay::Config::default()));
+    url
+}
+
 /// Kills the connection from the outside.
 pub type AbortFn = Box<dyn Fn() + Send + Sync>;
 
@@ -351,6 +364,7 @@ macro_rules! transport_suite {
             a_complete_file_that_differs_fails_verification,
             a_file_that_vanishes_fails_both_sides,
             a_receiver_without_a_usable_window_is_rejected,
+            the_sender_keeps_within_the_window,
             unexpected_messages_are_errors,
             unknown_and_wrong_direction_messages_are_errors,
             malformed_frames_are_errors,
@@ -1066,6 +1080,65 @@ pub mod suite {
         let (got, result) = hostile_receiver(pair, &frames(&[accept])).await;
         assert!(is_error(&got[0], ErrorCode::Protocol), "{got:?}");
         assert!(is_protocol_error(&result), "{result:?}");
+    }
+
+    pub async fn the_sender_keeps_within_the_window(pair: PairFn) {
+        let f = fixture();
+        write(&f.src.join("big.bin"), &bytes(4 * MIN_WINDOW as usize, 1));
+        let outgoing = build_offer(&[f.src.join("big.bin")]).unwrap();
+        let Peers {
+            mut sender,
+            mut receiver,
+            ..
+        } = pair().await;
+        let mut on_send = |_: Event<'_>| {};
+        let send = send_files(
+            sender.as_mut(),
+            &outgoing,
+            true,
+            &mut on_send,
+            CancellationToken::new(),
+        );
+
+        let receive = async {
+            let mut control = ReceiverControl::new(receiver.control().await.unwrap());
+            let accept = ReceiverMessage::Accept {
+                files: vec![AcceptedFile { id: 0, offset: 0 }],
+                window: MIN_WINDOW,
+            };
+            control.send(&accept).await.unwrap();
+            let mut data = receiver.data().await.unwrap();
+            let (mut decoder, mut buf, mut got) = (BlockDecoder::default(), vec![0; BUF_SIZE], 0);
+            for acked in [0, MIN_WINDOW] {
+                if acked > 0 {
+                    control
+                        .send(&ReceiverMessage::Ack { bytes: acked })
+                        .await
+                        .unwrap();
+                }
+                // A full window arrives, and nothing past it.
+                while got < acked + MIN_WINDOW {
+                    let n = data.read(&mut buf).await.unwrap();
+                    decoder.push(&buf[..n]);
+                    while let Some(block) = decoder.next_block().unwrap() {
+                        got += block.len() as u64;
+                    }
+                }
+                let more = tokio::time::timeout(Duration::from_millis(300), data.read(&mut buf));
+                assert!(more.await.is_err(), "sent past the window");
+                assert_eq!(got, acked + MIN_WINDOW);
+            }
+            let cancel = ReceiverMessage::Cancel(Cancel { reason: None });
+            control.send(&cancel).await.unwrap();
+            drop((control, data));
+            receiver.close(false).await;
+        };
+
+        let (result, ()) = tokio::join!(send, receive);
+        assert!(
+            matches!(result, Err(Error::PeerCancelled(None))),
+            "{result:?}"
+        );
     }
 
     pub async fn unexpected_messages_are_errors(pair: PairFn) {

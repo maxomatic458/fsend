@@ -2,7 +2,7 @@
 name = "fsend-cli"
 description = "A CLI for fsend, a peer-to-peer file sharing tool"
 keywords = ["file-transfer", "peer-to-peer", "p2p", "cli"]
-version = "0.4.0"
+version = "0.5.0"
 rust-version = "1.91"
 readme = "../README.md"
 edition.workspace = true
