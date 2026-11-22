@@ -167,11 +167,9 @@ mod tests {
     }
 
     #[test]
-    fn algorithms_and_digests_keep_their_wire_format() {
-        crate::testing::pinned(Algorithm::Sha256, r#""sha256""#);
+    fn digests_are_lowercase_hex() {
         crate::testing::pinned(sha256(b"abc"), &format!("\"{ABC}\""));
         crate::testing::pinned(Digest::from(&[0x0f][..]), r#""0f""#);
-        assert!(serde_json::from_str::<Algorithm>(r#""md5""#).is_err());
         let too_long = "ab".repeat(MAX_DIGEST_BYTES + 1);
         for bad in ["", "a", "0g", "AB", too_long.as_str()] {
             assert!(

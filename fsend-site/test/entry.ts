@@ -27,7 +27,6 @@ export {
     fingerprintRanges,
     flattenOffer,
     Hasher,
-    parseServerMessage,
     planReceive,
     Progress,
     validateOffer,

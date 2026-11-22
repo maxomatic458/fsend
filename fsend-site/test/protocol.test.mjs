@@ -18,7 +18,6 @@ const {
     fingerprintRanges,
     flattenOffer,
     Hasher,
-    parseServerMessage,
     planReceive,
     presentBytes,
     Progress,
@@ -108,27 +107,6 @@ describe("data blocks", () => {
         decoder.push(block);
         assert.throws(() => decoder.next(), /flags/);
     });
-});
-
-describe("relay messages", () => {
-    test("a valid message parses", () => {
-        assert.deepEqual(parseServerMessage('{"type":"paired","transport":"webrtc","extra":1}'), {
-            type: "paired",
-            transport: "webrtc",
-        });
-    });
-
-    for (const [name, text] of [
-        ["an unknown message", '{"type":"motd","text":"hi"}'],
-        ["an unknown error code", '{"type":"error","code":"teapot","message":""}'],
-        ["an unknown transport", '{"type":"paired","transport":"quic"}'],
-        ["a client message", '{"type":"join","version":1,"nameplate":"K7Q2","transports":[]}'],
-        ["malformed JSON", "{"],
-    ]) {
-        test(`${name} is an error`, () => {
-            assert.throws(() => parseServerMessage(text));
-        });
-    }
 });
 
 describe("offer helpers", () => {

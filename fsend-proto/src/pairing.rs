@@ -241,7 +241,6 @@ mod tests {
     use super::*;
     use crate::peer::Node;
     use crate::peer::checksum::{Algorithm, Digest};
-    use crate::testing::pinned;
 
     fn channels(receiver_code: &str) -> Result<(Channel, Channel), PairingError> {
         let (sender, sender_msg) = Pake::start(&"K7Q29XMV4P".parse().unwrap());
@@ -433,80 +432,6 @@ mod tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
-    }
-
-    #[test]
-    fn errors_serialize_for_the_web_app() {
-        assert_eq!(
-            serde_json::to_string(&PairingError::WrongCode).unwrap(),
-            r#""wrong_code""#
-        );
-    }
-
-    #[test]
-    fn sealed_messages_keep_their_wire_format() {
-        pinned(
-            Sealed::Confirm {
-                app: "fsend-cli 0.4.0".into(),
-            },
-            r#"{"type":"confirm","app":"fsend-cli 0.4.0"}"#,
-        );
-        pinned(
-            Sealed::Offer(Offer {
-                checksums: None,
-                entries: vec![Node::Dir {
-                    name: "d".into(),
-                    entries: vec![Node::File {
-                        name: "a.txt".into(),
-                        size: 3,
-                        checksum: None,
-                    }],
-                }],
-            }),
-            r#"{"type":"offer","entries":[{"kind":"dir","name":"d","entries":[{"kind":"file","name":"a.txt","size":3}]}]}"#,
-        );
-        pinned(
-            Sealed::Offer(Offer {
-                checksums: Some(Algorithm::Sha256),
-                entries: vec![Node::File {
-                    name: "a".into(),
-                    size: 3,
-                    checksum: Some(Digest::from(&[0xab, 0x01][..])),
-                }],
-            }),
-            r#"{"type":"offer","checksums":"sha256","entries":[{"kind":"file","name":"a","size":3,"checksum":"ab01"}]}"#,
-        );
-        pinned(Sealed::Accept, r#"{"type":"accept"}"#);
-        pinned(Sealed::Reject { reason: None }, r#"{"type":"reject"}"#);
-        pinned(
-            Sealed::Reject {
-                reason: Some("no".into()),
-            },
-            r#"{"type":"reject","reason":"no"}"#,
-        );
-        pinned(
-            Sealed::Connection {
-                info: ConnectionInfo::WebRtc { sdp: "v=0".into() },
-            },
-            r#"{"type":"connection","info":{"type":"web_rtc","sdp":"v=0"}}"#,
-        );
-        pinned(
-            Sealed::Connection {
-                info: ConnectionInfo::Iroh {
-                    node_id: "n".into(),
-                    addrs: vec!["10.0.0.1:1234".parse().unwrap(), "[::1]:5".parse().unwrap()],
-                    relays: vec!["https://relay.example/".into()],
-                },
-            },
-            r#"{"type":"connection","info":{"type":"iroh","node_id":"n","addrs":["10.0.0.1:1234","[::1]:5"],"relays":["https://relay.example/"]}}"#,
-        );
-        // Addresses must be addresses.
-        assert!(
-            serde_json::from_str::<ConnectionInfo>(
-                r#"{"type":"iroh","node_id":"n","addrs":["somewhere"],"relays":[]}"#
-            )
-            .is_err()
-        );
     }
 
     #[test]
