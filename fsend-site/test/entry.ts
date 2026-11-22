@@ -1,6 +1,7 @@
 export { runSend } from "../src/lib/transfer/send";
 export { runReceive } from "../src/lib/transfer/receive";
 export { createFolderSink, createZipSink } from "../src/lib/transfer/sinks";
+export { codecState, serve } from "../src/lib/transfer/codec";
 export { BrowserStorage } from "../src/lib/files/storage";
 export { zipBlob } from "../src/lib/files/zip";
 export { watchDisconnect } from "../src/lib/transport/webrtc";

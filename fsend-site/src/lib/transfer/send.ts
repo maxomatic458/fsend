@@ -150,10 +150,12 @@ async function send(
             for (let m = peer.poll(); m; m = peer.poll()) ack(m);
             while (encoding.length < ENCODING_AHEAD && !reader.done && sent - acked < window) {
                 const bytes = await reader.read(window - (sent - acked));
-                sent += bytes.length;
+                // Read before encode() hands the bytes to the worker, which empties them here.
+                const size = bytes.length;
+                sent += size;
                 const frame = codec!.encode(bytes);
                 frame.catch(() => {});
-                encoding.push({ size: bytes.length, frame });
+                encoding.push({ size, frame });
             }
             const next = encoding.shift();
             if (!next) {

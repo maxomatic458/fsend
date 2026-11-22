@@ -830,7 +830,7 @@ describe("checksums", () => {
             d.entries.map((file) => file.checksum),
             [sha256(spec.d["b.bin"]), sha256(spec.d["empty.bin"])],
         );
-        assert.ok(send.states.includes("hashing"));
+        assert.deepEqual(send.hashing, { done: 300_010, total: 300_010 });
         assert.ok(!recv.states.includes("verifying"), "nothing was here to check");
     });
 
@@ -879,8 +879,33 @@ describe("checksums", () => {
 
         assert.equal(recv.error, null);
         assertFiles(dir.snapshot(), expectedSnapshot(spec));
-        assert.ok(recv.states.includes("verifying"));
+        assert.deepEqual(recv.verifying, { done: 105_000, total: 105_000 });
         assert.equal(send.progress, 200_000, "only the missing part crosses the wire");
+    });
+
+    test("and the rest of the codec work the same without a worker", async () => {
+        const worker = globalThis.Worker;
+        delete globalThis.Worker;
+        try {
+            const spec = { "a.bin": bytes(2 * MIB, 7), "b.bin": bytes(300_000, 8) };
+            const dir = new MemoryDirectoryHandle();
+            (await dir.getFileHandle("b.bin", { create: true })).bytes = spec["b.bin"].slice(
+                0,
+                100_000,
+            );
+
+            const { send, recv } = await transfer(spec, { dir, ...withChecksums });
+
+            assert.equal(recv.error, null);
+            assertFiles(dir.snapshot(), expectedSnapshot(spec));
+            const total = 2 * MIB + 300_000;
+            assert.deepEqual(send.hashing, { done: total, total });
+            assert.deepEqual(recv.verifying, { done: 100_000, total: 100_000 });
+            assert.equal(send.progress, total - 100_000);
+            assert.equal(recv.progress, total - 100_000);
+        } finally {
+            globalThis.Worker = worker;
+        }
     });
 
     test("a complete file that differs fails before anything is accepted", async () => {

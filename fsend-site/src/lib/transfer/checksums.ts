@@ -23,8 +23,9 @@ async function feed(
         const end = Math.min(at + CHUNK_BYTES, len);
         const bytes = new Uint8Array(await source.slice(at, end).arrayBuffer());
         if (bytes.length !== end - at) throw new Error("A file is shorter than expected");
+        // hash() hands the bytes to the worker, which empties them here.
         await codec.hash(id, algorithm, bytes);
-        onBytes(bytes.length);
+        onBytes(end - at);
     }
 }
 

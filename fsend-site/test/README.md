@@ -21,7 +21,7 @@ Node's built-in test runner. The harness loads the wasm from disk. Bundling rath
 mocking means the code under test is the code that ships, with no reimplementation
 to drift out of sync.
 
-`test/harness/` provides the four browser APIs the transfer code touches:
+`test/harness/` provides the five browser APIs the transfer code touches:
 
 | Module          | Stands in for                         | Notes                                                                                                                                                                                                                                                       |
 | --------------- | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -29,6 +29,7 @@ to drift out of sync.
 | `relay.mjs`     | `WebSocket` + fsend-relay             | Speaks relay protocol 2: create, join, paired, and verbatim forwarding of binary signal frames. Pairing runs in the app's real wasm.                                                                                                                        |
 | `fs-access.mjs` | File System Access API                | In-memory directories and files. Writables commit as they go, so an abandoned one leaves partial data behind, which is what resume reads. `snapshot()` flattens a tree to `{ path: bytes }`.                                                                |
 | `dom.mjs`       | Object URLs, anchor download          | Captures what would have been downloaded; `unzip` in `index.mjs` reads the zips back.                                                                                                                                                                       |
+| `worker.mjs`    | `Worker` (the codec worker)           | Runs the real codec in-process. Messages cross by structured clone, so buffers handed to the worker are emptied on the page's side, as in a browser.                                                                                                        |
 
 ## Coverage
 
@@ -52,7 +53,7 @@ to drift out of sync.
 - **Checksums:** they come with every file and match SHA-256; a file changed
   on the way fails the receiver, which the sender only sees leave; what is
   already on disk is checked before resuming; a complete file that differs
-  fails before anything is accepted.
+  fails before anything is accepted; all of it also works without a worker.
 - **Peer protocol building blocks:** the wasm frame codec round-trips messages
   split anywhere, compresses large ones, encodes and decodes only the messages
   of the given side and rejects unknown or malformed messages and frames; the
