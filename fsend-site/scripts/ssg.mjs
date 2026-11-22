@@ -11,7 +11,7 @@ const { renderRoute } = await import(
 );
 
 // Each route supplies its own title/description/canonical, so drop the
-// placeholders from the shell — otherwise every page ships two of each.
+// placeholders from the shell, or every page ships two of each.
 const template = (await readFile(join(DIST, "index.html"), "utf8"))
     .replace(/\s*<title>[\s\S]*?<\/title>/, "")
     .replace(/\s*<meta[^>]*name="description"[^>]*>/, "")

@@ -16,8 +16,11 @@ export interface Decoded {
 export interface BlockCodec {
     /** The block frame of `bytes`, which are handed over and unusable afterwards. */
     encode(bytes: Uint8Array): Promise<Bytes>;
-    /** Takes `chunks` of the data stream, in order, handing them over too; throws on a malformed block. */
-    decode(chunks: Uint8Array[]): Promise<Decoded>;
+    /**
+     * Takes `chunks` of the data stream, in order, handing them over too; throws
+     * on a malformed block, or once its blocks hold more than `budget` file bytes.
+     */
+    decode(chunks: Uint8Array[], budget: number): Promise<Decoded>;
     /** Feeds `bytes`, handed over too, to the hasher of file `id`. */
     hash(id: number, algorithm: Algorithm, bytes: Uint8Array): Promise<void>;
     /** The checksum of what file `id` was fed; its hasher starts over. */
@@ -27,7 +30,7 @@ export interface BlockCodec {
 
 export type CodecRequest =
     | { id: number; type: "encode"; bytes: Uint8Array }
-    | { id: number; type: "decode"; chunks: Uint8Array[] }
+    | { id: number; type: "decode"; chunks: Uint8Array[]; budget: number }
     | { id: number; type: "hash"; file: number; algorithm: Algorithm; bytes: Uint8Array }
     | { id: number; type: "digest"; file: number; algorithm: Algorithm };
 
@@ -63,7 +66,10 @@ export function serve(request: CodecRequest, { decoder, hashers }: CodecState): 
         }
         for (const chunk of request.chunks) decoder.push(chunk);
         const blocks = [];
+        let left = request.budget;
         for (let block = decoder.next(); block; block = decoder.next()) {
+            left -= block.length;
+            if (left < 0) throw new Error("the sender sent past the window");
             blocks.push(block);
         }
         return {
@@ -114,7 +120,7 @@ function inThread(): BlockCodec {
     return {
         encode: (bytes) =>
             run<{ frame: Bytes }>({ id: ++id, type: "encode", bytes }).then((r) => r.frame),
-        decode: (chunks) => run<Decoded>({ id: ++id, type: "decode", chunks }),
+        decode: (chunks, budget) => run<Decoded>({ id: ++id, type: "decode", chunks, budget }),
         hash: (file, algorithm, bytes) =>
             run<object>({ id: ++id, type: "hash", file, algorithm, bytes }).then(() => {}),
         digest: (file, algorithm) =>
@@ -162,9 +168,9 @@ function inWorker(worker: Worker): BlockCodec {
             run<{ frame: Bytes }>({ id: ++id, type: "encode", bytes }, [bytes.buffer]).then(
                 (r) => r.frame,
             ),
-        decode: (chunks) =>
+        decode: (chunks, budget) =>
             run<Decoded>(
-                { id: ++id, type: "decode", chunks },
+                { id: ++id, type: "decode", chunks, budget },
                 chunks.map((chunk) => chunk.buffer),
             ),
         hash: (file, algorithm, bytes) =>

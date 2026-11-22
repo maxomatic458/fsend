@@ -22,7 +22,6 @@ export interface Asking {
 /// The sink has no room for the transfer, even after asking for more.
 export class NotEnoughRoom extends Error {}
 
-/// Bytes are written into this sink
 export interface TransferSink {
     /// What the user can do about a file kept here that does not match its checksum.
     mismatchAdvice?: string;
@@ -57,6 +56,7 @@ export function createFolderSink(
     let writable: FileSystemWritableFileStream | null = null;
     // Partial files opened by `reopen`, by path, until they are written to.
     const reopened = new Map<string, FileSystemWritableFileStream>();
+    let abandoned = false;
     // Kept only for a zip of browser storage.
     let checksums: Checksums | undefined;
 
@@ -205,7 +205,10 @@ export function createFolderSink(
 
         async reopen(path, offset) {
             await writing(async () => {
-                reopened.set(path.join("/"), await writableAt(path, offset));
+                const opened = await writableAt(path, offset);
+                // The transfer may have stopped meanwhile.
+                if (abandoned) await opened.close();
+                else reopened.set(path.join("/"), opened);
             });
         },
 
@@ -246,6 +249,7 @@ export function createFolderSink(
         },
 
         async abandon() {
+            abandoned = true;
             // Closing flushes what arrived, which is what resume reads back.
             await writable?.close().catch(() => {});
             writable = null;

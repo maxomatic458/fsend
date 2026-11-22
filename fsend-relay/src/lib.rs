@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     io,
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -12,9 +13,10 @@ use axum::{
     Router,
     body::Bytes,
     extract::{
-        State, WebSocketUpgrade,
+        ConnectInfo, State, WebSocketUpgrade,
         ws::{Message, Utf8Bytes, WebSocket},
     },
+    http::{HeaderMap, HeaderName},
     response::Response,
     routing::get,
 };
@@ -41,6 +43,8 @@ const NAMEPLATE_TRIES: usize = 64;
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// Time for a client to say `create` or `join` after connecting.
 const FIRST_MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Addresses tracked before those without a connection are forgotten.
+const MAX_TRACKED: usize = 100_000;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -51,6 +55,14 @@ pub struct Config {
     /// Sessions open at once, waiting or pairing.
     pub max_sessions: usize,
     pub ping_interval: Duration,
+    /// Connections open at once from one address.
+    pub connections_per_ip: usize,
+    /// Sessions one address may create or join per minute, all at once if it likes.
+    pub sessions_per_minute: u32,
+    /// The header a proxy in front sets to the client's address, which
+    /// otherwise is the connection's own. Anyone reaching the relay directly can
+    /// set it too.
+    pub ip_header: Option<HeaderName>,
 }
 
 impl Default for Config {
@@ -60,27 +72,72 @@ impl Default for Config {
             pair_timeout: Duration::from_secs(10 * 60),
             max_sessions: 10_000,
             ping_interval: Duration::from_secs(20),
+            connections_per_ip: 32,
+            sessions_per_minute: 30,
+            ip_header: None,
         }
     }
 }
 
-pub fn router(config: Config) -> Router {
+pub async fn serve(listener: TcpListener, config: Config) -> io::Result<()> {
     let relay = Arc::new(Relay {
         config,
         slots: Mutex::default(),
         active: AtomicUsize::new(0),
+        clients: Mutex::default(),
     });
-    Router::new().route(PATH, get(upgrade)).with_state(relay)
-}
-
-pub async fn serve(listener: TcpListener, config: Config) -> io::Result<()> {
-    axum::serve(listener, router(config)).await
+    let router = Router::new().route(PATH, get(upgrade)).with_state(relay);
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
 }
 
 struct Relay {
     config: Config,
     slots: Mutex<HashMap<Nameplate, Slot>>,
     active: AtomicUsize,
+    clients: Mutex<HashMap<IpAddr, Client>>,
+}
+
+/// What one address uses of the relay.
+struct Client {
+    connections: usize,
+    /// Sessions it may still create or join; refills over a minute.
+    allowance: f64,
+    refilled: Instant,
+}
+
+impl Client {
+    fn refill(&mut self, per_minute: u32) {
+        let now = Instant::now();
+        let refilled =
+            now.duration_since(self.refilled).as_secs_f64() * f64::from(per_minute) / 60.0;
+        self.allowance = (self.allowance + refilled).min(f64::from(per_minute));
+        self.refilled = now;
+    }
+}
+
+/// Counts a connection of its address while it lives.
+struct Connected {
+    relay: Arc<Relay>,
+    ip: IpAddr,
+}
+
+impl Drop for Connected {
+    fn drop(&mut self) {
+        let per_minute = self.relay.config.sessions_per_minute;
+        let mut clients = self.relay.clients();
+        let Some(client) = clients.get_mut(&self.ip) else {
+            return;
+        };
+        client.connections -= 1;
+        client.refill(per_minute);
+        if client.connections == 0 && client.allowance >= f64::from(per_minute) {
+            clients.remove(&self.ip);
+        }
+    }
 }
 
 enum Slot {
@@ -140,6 +197,45 @@ impl Relay {
         self.slots.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn clients(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, Client>> {
+        self.clients.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A connection from `ip`, unless it has too many open.
+    fn connect(self: &Arc<Self>, ip: IpAddr) -> Option<Connected> {
+        let mut clients = self.clients();
+        if clients.len() >= MAX_TRACKED {
+            clients.retain(|_, client| client.connections > 0);
+        }
+        let client = clients.entry(ip).or_insert_with(|| Client {
+            connections: 0,
+            allowance: f64::from(self.config.sessions_per_minute),
+            refilled: Instant::now(),
+        });
+        if client.connections >= self.config.connections_per_ip {
+            return None;
+        }
+        client.connections += 1;
+        Some(Connected {
+            relay: self.clone(),
+            ip,
+        })
+    }
+
+    /// Whether the address of `connected` may create or join another session now.
+    fn attempt(&self, connected: &Connected) -> bool {
+        let mut clients = self.clients();
+        let Some(client) = clients.get_mut(&connected.ip) else {
+            return false;
+        };
+        client.refill(self.config.sessions_per_minute);
+        if client.allowance < 1.0 {
+            return false;
+        }
+        client.allowance -= 1.0;
+        true
+    }
+
     /// Opens a session under a fresh nameplate, or `None` when full.
     fn open(self: &Arc<Self>, transports: Vec<Transport>) -> Option<(Nameplate, Joined, Active)> {
         if self.active.fetch_add(1, Ordering::Relaxed) >= self.config.max_sessions {
@@ -181,13 +277,39 @@ impl Relay {
     }
 }
 
-async fn upgrade(ws: WebSocketUpgrade, State(relay): State<Arc<Relay>>) -> Response {
+async fn upgrade(
+    ws: WebSocketUpgrade,
+    State(relay): State<Arc<Relay>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let connected = relay.connect(client_ip(&relay.config, &headers, addr));
     ws.max_message_size(MAX_FRAME_BYTES)
         .max_frame_size(MAX_FRAME_BYTES)
-        .on_upgrade(move |ws| connection(Socket::new(ws), relay))
+        .on_upgrade(move |ws| async move {
+            let ws = Socket::new(ws);
+            match connected {
+                Some(connected) => connection(ws, relay, connected).await,
+                None => ws.fail(Error::Busy).await,
+            }
+        })
 }
 
-async fn connection(mut ws: Socket, relay: Arc<Relay>) {
+/// The client's address, an IPv6 one by its /64, which one host usually has all of.
+fn client_ip(config: &Config, headers: &HeaderMap, addr: SocketAddr) -> IpAddr {
+    let ip = (config.ip_header.as_ref())
+        .and_then(|name| headers.get(name)?.to_str().ok()?.trim().parse().ok())
+        .unwrap_or(addr.ip());
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(Ipv6Addr::from_bits(v6.to_bits() & !u128::from(u64::MAX))),
+        },
+        v4 => v4,
+    }
+}
+
+async fn connection(mut ws: Socket, relay: Arc<Relay>, connected: Connected) {
     let text = match timeout(FIRST_MESSAGE_TIMEOUT, ws.recv()).await {
         Ok(Some(Frame::Text(text))) => text,
         Ok(Some(Frame::Binary(_))) => return ws.fail(Error::Protocol).await,
@@ -196,7 +318,11 @@ async fn connection(mut ws: Socket, relay: Arc<Relay>) {
     if !has_supported_version(&text) {
         return ws.fail(Error::Version).await;
     }
-    match serde_json::from_str::<ClientMessage>(&text) {
+    let message = serde_json::from_str::<ClientMessage>(&text);
+    if message.is_ok() && !relay.attempt(&connected) {
+        return ws.fail(Error::Busy).await;
+    }
+    match message {
         Ok(ClientMessage::Create { transports, .. }) => create(ws, relay, transports).await,
         Ok(ClientMessage::Join {
             nameplate,

@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use axum::http::HeaderName;
 use fsend_proto::relay::{MAX_FRAME_BYTES, MAX_SIGNAL_BYTES, VERSION};
 use fsend_relay::Config;
 use futures_util::{SinkExt, StreamExt};
@@ -7,7 +8,7 @@ use serde_json::{Value, json};
 use tokio::{net::TcpListener, time::timeout};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{Error, Message},
+    tungstenite::{Error, Message, client::IntoClientRequest},
 };
 
 async fn start(config: Config) -> String {
@@ -22,6 +23,20 @@ struct Client(WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>);
 impl Client {
     async fn connect(url: &str) -> Self {
         Self(connect_async(url).await.unwrap().0)
+    }
+
+    /// Connects as Cloudflare would for a client at `ip`.
+    async fn connect_as(url: &str, ip: &str) -> Self {
+        let mut request = url.into_client_request().unwrap();
+        (request.headers_mut()).insert("cf-connecting-ip", ip.parse().unwrap());
+        Self(connect_async(request).await.unwrap().0)
+    }
+
+    /// Sends `create`; the relay answers `created` or an error.
+    async fn try_create(&mut self) -> Value {
+        self.send(json!({"type": "create", "version": VERSION, "transports": ["webrtc"]}))
+            .await;
+        self.recv().await
     }
 
     async fn send(&mut self, message: Value) {
@@ -306,6 +321,71 @@ async fn the_session_cap_answers_busy() {
     drop(sender);
     tokio::time::sleep(Duration::from_millis(100)).await;
     Client::create(&url, &["webrtc"]).await;
+}
+
+#[tokio::test]
+async fn one_address_has_a_limit_of_connections() {
+    let url = start(Config {
+        connections_per_ip: 2,
+        ..Config::default()
+    })
+    .await;
+    let (first, _) = Client::create(&url, &["webrtc"]).await;
+    let _second = Client::create(&url, &["webrtc"]).await;
+    Client::connect(&url).await.expect_error("busy").await;
+
+    // Room returns once one closes.
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    Client::create(&url, &["webrtc"]).await;
+}
+
+#[tokio::test]
+async fn one_address_has_a_budget_of_sessions_per_minute() {
+    let url = start(Config {
+        sessions_per_minute: 3,
+        ..Config::default()
+    })
+    .await;
+    let (_sender, nameplate) = Client::create(&url, &["webrtc"]).await;
+    // Joins count too.
+    let mut joined = Client::join(&url, &nameplate, &["webrtc"]).await;
+    assert_eq!(joined.recv().await["type"], "paired");
+    Client::create(&url, &["webrtc"]).await;
+
+    let mut fourth = Client::connect(&url).await;
+    assert_eq!(
+        fourth.try_create().await,
+        json!({"type": "error", "code": "busy"})
+    );
+}
+
+#[tokio::test]
+async fn the_proxy_names_the_address_and_ipv6_counts_by_its_64() {
+    let url = start(Config {
+        connections_per_ip: 1,
+        ip_header: Some(HeaderName::from_static("cf-connecting-ip")),
+        ..Config::default()
+    })
+    .await;
+    let busy = json!({"type": "error", "code": "busy"});
+    let mut held = Vec::new();
+    for (ip, answer) in [
+        ("203.0.113.7", "created"),
+        ("203.0.113.7", "error"),
+        ("203.0.113.8", "created"),
+        ("2001:db8::1:1", "created"),
+        ("2001:db8::2:2", "error"),
+        ("2001:db8:0:1::1", "created"),
+    ] {
+        let mut client = Client::connect_as(&url, ip).await;
+        let got = client.try_create().await;
+        match answer {
+            "created" => assert_eq!(got["type"], "created", "{ip}: {got}"),
+            _ => assert_eq!(got, busy, "{ip}"),
+        }
+        held.push(client);
+    }
 }
 
 #[tokio::test]

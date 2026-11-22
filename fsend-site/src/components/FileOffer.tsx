@@ -48,8 +48,9 @@ export function FileOffer(props: FileOfferProps) {
 
             <Show when={props.inMemory}>
                 <div class="bg-warn-bg text-warn-ink border border-warn-line rounded-lg px-4 py-3 text-sm leading-relaxed">
-                    You are receiving the data directly! This means the transfer will be buffered in memory until it finishes. 
-                    Ensure you have at least {formatBytes(totalBytes())} of free system memory!
+                    You are receiving the data directly! This means the transfer will be buffered in
+                    memory until it finishes. Ensure you have at least {formatBytes(totalBytes())}{" "}
+                    of free system memory!
                 </div>
             </Show>
 

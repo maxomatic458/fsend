@@ -125,6 +125,8 @@ fn push_frame(out: &mut Vec<u8>, flags: u8, payload: &[&[u8]]) {
 #[derive(Debug)]
 pub(super) struct Deframer {
     buffer: Vec<u8>,
+    /// Where the bytes not taken yet start; taken ones go on the next push.
+    start: usize,
     max_len: usize,
 }
 
@@ -132,29 +134,38 @@ impl Deframer {
     pub(super) fn new(max_len: usize) -> Self {
         Self {
             buffer: Vec::new(),
+            start: 0,
             max_len,
         }
     }
 
     pub(super) fn push(&mut self, data: &[u8]) {
+        self.buffer.drain(..self.start);
+        self.start = 0;
         self.buffer.extend_from_slice(data);
+    }
+
+    fn rest(&self) -> &[u8] {
+        &self.buffer[self.start..]
     }
 
     /// Whether no partial frame is buffered.
     pub(super) fn is_empty(&self) -> bool {
-        self.buffer.is_empty()
+        self.rest().is_empty()
     }
 
     /// The length of the first buffered frame, once its header is in, and its bytes so far.
     pub(super) fn first(&self) -> Option<(usize, &[u8])> {
-        let header = self.buffer.first_chunk::<HEADER_BYTES>()?;
+        let rest = self.rest();
+        let header = rest.first_chunk::<HEADER_BYTES>()?;
         let len = u32::from_be_bytes(*header) as usize;
-        let end = self.buffer.len().min(HEADER_BYTES + len);
-        Some((len, &self.buffer[HEADER_BYTES..end]))
+        let end = rest.len().min(HEADER_BYTES + len);
+        Some((len, &rest[HEADER_BYTES..end]))
     }
 
     pub(super) fn next(&mut self) -> Result<Option<(u8, Vec<u8>)>, FrameError> {
-        let Some(header) = self.buffer.first_chunk::<HEADER_BYTES>() else {
+        let rest = self.rest();
+        let Some(header) = rest.first_chunk::<HEADER_BYTES>() else {
             return Ok(None);
         };
         let len = u32::from_be_bytes(*header) as usize;
@@ -164,11 +175,11 @@ impl Deframer {
         if len > self.max_len {
             return Err(FrameError::TooLarge(len));
         }
-        let Some(frame) = self.buffer.get(HEADER_BYTES + 1..HEADER_BYTES + len) else {
+        let Some(frame) = rest.get(HEADER_BYTES + 1..HEADER_BYTES + len) else {
             return Ok(None);
         };
-        let next = (self.buffer[HEADER_BYTES], frame.to_vec());
-        self.buffer.drain(..HEADER_BYTES + len);
+        let next = (rest[HEADER_BYTES], frame.to_vec());
+        self.start += HEADER_BYTES + len;
         Ok(Some(next))
     }
 }

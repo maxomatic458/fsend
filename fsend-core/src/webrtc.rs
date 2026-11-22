@@ -45,6 +45,7 @@ const MAX_BUFFERED_BYTES: usize = 1024 * 1024;
 /// The window keeps a well-behaved peer below it.
 const MAX_QUEUED_BYTES: usize = 2 * WINDOW as usize;
 const ICE_GATHERING_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Everything that can fail here happens while connecting.
 impl From<webrtc::error::Error> for Error {
@@ -417,6 +418,12 @@ impl WebRtcTransfer {
 
     /// Also waits for both data channels.
     pub async fn wait_connected(&mut self) -> Result<(), Error> {
+        tokio::time::timeout(CONNECT_TIMEOUT, self.connected())
+            .await
+            .map_err(|_| Error::Timeout("the peer did not connect in time"))?
+    }
+
+    async fn connected(&mut self) -> Result<(), Error> {
         let state = self
             .link
             .wait_for(|s| *s != LinkState::Connecting)
@@ -428,24 +435,21 @@ impl WebRtcTransfer {
         }
 
         if let Some(mut pending) = self.pending.take() {
-            let mut dcs = Vec::new();
-            while dcs.len() < 2 {
+            let (mut control, mut data) = (None, None);
+            while control.is_none() || data.is_none() {
                 let dc = tokio::select! {
                     biased;
                     dc = pending.recv() => dc.ok_or(Error::Internal("data channels never arrived"))?,
                     reason = closed(&mut self.link) => return Err(Error::Disconnected(reason)),
                 };
-                dcs.push(dc);
+                match dc.label().await.as_deref() {
+                    Ok("control") if control.is_none() => control = Some(dc),
+                    Ok("data") if data.is_none() => data = Some(dc),
+                    _ => return Err(Error::Protocol("an unexpected data channel".into())),
+                }
             }
-            let second = dcs.pop().unwrap();
-            let first = dcs.pop().unwrap();
-            let (control, data) = if first.label().await.as_deref() == Ok("control") {
-                (first, second)
-            } else {
-                (second, first)
-            };
-            self.control = Some(self.attach(control));
-            self.data = Some(self.attach(data));
+            self.control = control.map(|dc| self.attach(dc));
+            self.data = data.map(|dc| self.attach(dc));
         }
 
         for stream in [&mut self.control, &mut self.data] {

@@ -7,7 +7,10 @@ use super::{
     AcceptedFile, CheckedFile, Entry, Node, Offer,
     checksum::{Algorithm, Digest},
     frame,
-    limits::{MAX_COMPONENT_BYTES, MAX_DEPTH, MAX_ENTRIES, MAX_PATH_BYTES, MAX_TOTAL_BYTES},
+    limits::{
+        LISTED_COMPONENT_BYTES, MAX_COMPONENT_BYTES, MAX_DEPTH, MAX_ENTRIES, MAX_LISTED_BYTES,
+        MAX_PATH_BYTES, MAX_TOTAL_BYTES,
+    },
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -20,6 +23,9 @@ pub enum OfferError {
     TooLarge,
     #[error("the offer does not fit in a message")]
     TooLong,
+    /// A small offer can list huge paths: many files deep down long folder names.
+    #[error("the offer's paths take more than {} MiB once listed", MAX_LISTED_BYTES >> 20)]
+    PathsTooLong,
     #[error("entry {id}: {reason}")]
     Entry { id: usize, reason: EntryError },
 }
@@ -48,6 +54,7 @@ pub fn validate(offer: &Offer) -> Result<(), OfferError> {
         digest_len: offer.checksums.map(Algorithm::digest_len),
         entries: 0,
         total: 0,
+        listed: 0,
     };
     rules.check(&offer.entries, 0, 0)
 }
@@ -56,6 +63,7 @@ struct Rules {
     digest_len: Option<usize>,
     entries: usize,
     total: u64,
+    listed: usize,
 }
 
 impl Rules {
@@ -79,6 +87,10 @@ impl Rules {
             let path_bytes = path_bytes + usize::from(depth > 0) + name.len();
             if path_bytes > MAX_PATH_BYTES {
                 return Err(invalid(EntryError::TooLong));
+            }
+            self.listed += path_bytes + LISTED_COMPONENT_BYTES * (depth + 1);
+            if self.listed > MAX_LISTED_BYTES {
+                return Err(OfferError::PathsTooLong);
             }
             if !names.insert(name) {
                 return Err(invalid(EntryError::Duplicate));
@@ -342,6 +354,20 @@ mod tests {
         );
         let many = (0..=MAX_ENTRIES).map(|i| file(&i.to_string(), 0)).collect();
         assert_eq!(validate(&plain(many)), Err(OfferError::TooManyEntries));
+    }
+
+    #[test]
+    fn many_files_deep_down_long_names_are_too_much_to_list() {
+        // Each file lists as about 6 KB, though it is a few bytes on the wire.
+        let deep = |files: usize| {
+            let files = (0..files).map(|i| file(&i.to_string(), 0)).collect();
+            let name = "x".repeat(68);
+            plain(vec![(1..59).fold(dir(&name, files), |inside, _| {
+                dir(&name, vec![inside])
+            })])
+        };
+        assert_eq!(validate(&deep(50_000)), Ok(()));
+        assert_eq!(validate(&deep(100_000)), Err(OfferError::PathsTooLong));
     }
 
     #[test]

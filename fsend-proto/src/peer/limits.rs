@@ -13,6 +13,10 @@ pub const MAX_DEPTH: usize = 60;
 pub const MAX_COMPONENT_BYTES: usize = 255;
 /// A path's components joined with `/`.
 pub const MAX_PATH_BYTES: usize = 4096;
+/// What listing an offer by path may take: every entry's path, plus
+/// [`LISTED_COMPONENT_BYTES`] per component for holding it.
+pub const MAX_LISTED_BYTES: usize = 512 * 1024 * 1024;
+pub const LISTED_COMPONENT_BYTES: usize = 32;
 /// Largest offer total: the largest integer a JavaScript number holds exactly.
 pub const MAX_TOTAL_BYTES: u64 = (1 << 53) - 1;
 

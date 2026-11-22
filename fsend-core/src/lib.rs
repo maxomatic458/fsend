@@ -20,7 +20,7 @@ pub use transfer::{ConnectionKind, Event, Outgoing, build_offer};
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("not found:{}", list(.0))]
+    #[error("not found: {}", list(.0))]
     PathsNotFound(Vec<PathBuf>),
     #[error("cannot send these files: {0}")]
     Unsendable(OfferError),
@@ -62,10 +62,11 @@ pub enum Error {
 }
 
 fn list(paths: &[PathBuf]) -> String {
-    paths
+    let paths: Vec<_> = paths
         .iter()
-        .map(|path| format!("\n - {}", path.display()))
-        .collect()
+        .map(|path| path.display().to_string())
+        .collect();
+    paths.join(", ")
 }
 
 fn reason(reason: &Option<String>) -> String {

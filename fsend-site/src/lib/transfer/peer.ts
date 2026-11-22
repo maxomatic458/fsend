@@ -1,6 +1,7 @@
 import { MAX_MESSAGE_BYTES } from "../../config";
 import {
     GOODBYE_TIMEOUT_MS,
+    WINDOW,
     FrameDecoder,
     Role,
     encodeFrame,
@@ -48,6 +49,9 @@ export function unexpected(message: PeerMessage): TransferFailure {
     }
 }
 
+/// Data stream bytes not read yet; the window keeps a well-behaved peer below it.
+const MAX_QUEUED_BYTES = 2 * WINDOW;
+
 /** What both sides send. */
 type Common = Extract<SenderMessage, ReceiverMessage>;
 
@@ -76,6 +80,12 @@ class Inbox<T> {
         this.error ??= error;
         this.waiting?.reject(this.error);
         this.waiting = undefined;
+    }
+
+    /** Fails at once, dropping what has arrived. */
+    abort(error: Error): void {
+        this.items = [];
+        this.fail(error);
     }
 
     /** The next item, if it has already arrived and `take` wants it. */
@@ -131,6 +141,7 @@ export class Peer<Out extends PeerMessage, In extends PeerMessage> {
     private inbox = new Inbox<Incoming<In>>();
     private decoder: FrameDecoder<In>;
     private gone = false;
+    private queued = 0;
 
     static sender(link: Link, abort: AbortSignal): SenderPeer {
         return new Peer<SenderMessage, ReceiverMessage>(link, abort, Role.Sender);
@@ -155,9 +166,11 @@ export class Peer<Out extends PeerMessage, In extends PeerMessage> {
         link.disconnected.catch(() => (this.gone = true));
         this.stopped.catch((error) => this.inbox.fail(error));
 
-        link.controlChannel.onmessage = (ev: MessageEvent<ArrayBuffer>) => {
-            this.decoder.push(new Uint8Array(ev.data));
+        // A text message, which `binaryType` leaves alone, is a protocol error.
+        link.controlChannel.onmessage = (ev: MessageEvent<unknown>) => {
             try {
+                if (!(ev.data instanceof ArrayBuffer)) throw new Error("a text message");
+                this.decoder.push(new Uint8Array(ev.data));
                 for (let m = this.decoder.next(); m; m = this.decoder.next()) {
                     this.inbox.push(m);
                 }
@@ -165,7 +178,14 @@ export class Peer<Out extends PeerMessage, In extends PeerMessage> {
                 this.inbox.fail(protocolError(messageOf(err)));
             }
         };
-        link.dataChannel.onmessage = (ev: MessageEvent<ArrayBuffer>) => {
+        link.dataChannel.onmessage = (ev: MessageEvent<unknown>) => {
+            if (!(ev.data instanceof ArrayBuffer)) {
+                return this.inbox.abort(protocolError("a text message"));
+            }
+            this.queued += ev.data.byteLength;
+            if (this.queued > MAX_QUEUED_BYTES) {
+                return this.inbox.abort(protocolError("the sender sent past the window"));
+            }
             if (ev.data.byteLength > 0) this.inbox.push(new Uint8Array(ev.data));
         };
     }
@@ -182,8 +202,8 @@ export class Peer<Out extends PeerMessage, In extends PeerMessage> {
     }
 
     /** The next message or data chunk. */
-    receive(timeoutMs?: number, what?: string): Promise<Incoming<In>> {
-        return this.inbox.next(timeoutMs, what);
+    async receive(timeoutMs?: number, what?: string): Promise<Incoming<In>> {
+        return this.taken(await this.inbox.next(timeoutMs, what));
     }
 
     /** The next message; data is not allowed here. */
@@ -193,7 +213,13 @@ export class Peer<Out extends PeerMessage, In extends PeerMessage> {
 
     /** A data chunk that has already arrived, if it is next. */
     pollData(): Uint8Array | undefined {
-        return this.inbox.pollIf((item) => item instanceof Uint8Array) as Uint8Array | undefined;
+        const item = this.inbox.pollIf((item) => item instanceof Uint8Array);
+        return item && (this.taken(item) as Uint8Array);
+    }
+
+    private taken<T extends Incoming<In>>(item: T): T {
+        if (item instanceof Uint8Array) this.queued -= item.length;
+        return item;
     }
 
     /** A message that has already arrived, if any. */

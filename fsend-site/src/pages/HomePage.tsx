@@ -44,7 +44,7 @@ const FAQ_ITEMS = [
         q: "Is there a file size limit?",
         a: () => (
             <>
-                No — files stream straight from one device to the other, so you're limited only by
+                No. Files stream straight from one device to the other, so you're limited only by
                 your connection and the receiver's free disk space or memory (depending on the
                 browser).
             </>
@@ -52,14 +52,15 @@ const FAQ_ITEMS = [
     },
     {
         q: "Do both sides need to be online?",
-        a: () => <>Yes — both tabs have to stay open until the transfer finishes.</>,
+        a: () => <>Yes. Both tabs have to stay open until the transfer finishes.</>,
     },
     {
         q: "Can fsend see my files?",
         a: () => (
             <>
-                No — fsend uses end-to-end encrypted <Ext href={MDN_WEBRTC}>WebRTC</Ext> data
-                channels. File data never touches our servers.
+                No. Files go straight between the two devices over end-to-end encrypted{" "}
+                <Ext href={MDN_WEBRTC}>WebRTC</Ext> data channels, and the list of offered files
+                passes our relay end-to-end encrypted too.
             </>
         ),
     },
@@ -68,8 +69,8 @@ const FAQ_ITEMS = [
         a: () => (
             <>
                 Any browser with <Ext href={MDN_WEBRTC}>WebRTC</Ext>. Chrome, Edge and Opera can
-                directly save files to disk and seamlessly resume transfers. Firefox and Safari need
-                to save them to browser storage first.
+                save files straight to disk and resume transfers there. Firefox and Safari save them
+                to browser storage first.
             </>
         ),
     },
@@ -77,7 +78,7 @@ const FAQ_ITEMS = [
         q: "Can I use it outside the browser?",
         a: () => (
             <>
-                Yes — fsend is available as a command-line tool. You can find the installation
+                Yes, fsend is also available as a command-line tool. You can find the installation
                 instructions on the{" "}
                 <A href="/download" class={LINK_CLASS}>
                     download page
@@ -90,7 +91,7 @@ const FAQ_ITEMS = [
         q: "Is it free?",
         a: () => (
             <>
-                Yes — free and open source. The code is on <Ext href={GITHUB_URL}>GitHub</Ext>.
+                Yes, it's free and open source. The code is on <Ext href={GITHUB_URL}>GitHub</Ext>.
             </>
         ),
     },
@@ -146,7 +147,7 @@ export function HomePage() {
 
     return (
         <div class="flex-1">
-            <Title>fsend — Free P2P File Transfer in Your Browser</Title>
+            <Title>fsend - Free P2P File Transfer in Your Browser</Title>
             <Meta
                 name="description"
                 content="Send files of any size directly between devices, peer-to-peer over WebRTC. End-to-end encrypted, no uploads, no accounts, no size limits. Free and open source."

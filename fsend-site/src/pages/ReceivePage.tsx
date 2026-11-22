@@ -18,7 +18,6 @@ import { Choice } from "../components/Choice";
 import { Busy } from "../components/Busy";
 import { StorageUsage } from "../components/StorageUsage";
 import { formatBytes, plural } from "../lib/format";
-import { ALGORITHM_NAMES } from "../lib/proto";
 
 export function ReceivePage() {
     const navigate = useNavigate();
@@ -77,7 +76,7 @@ export function ReceivePage() {
                 onCancel={receive.keepTransfer}
             />
 
-            <Title>Receive Files — fsend</Title>
+            <Title>Receive Files - fsend</Title>
             <Meta
                 name="description"
                 content="Enter a session code to receive files directly from the sender's device over an encrypted peer-to-peer WebRTC connection. No accounts, no size limits."
@@ -272,11 +271,9 @@ export function ReceivePage() {
                             </p>
 
                             <Show when={receive.offered()?.checksums}>
-                                {(algorithm) => (
-                                    <p class="text-[13px] text-ink-faint mb-4">
-                                        Checksums have been validated for every file.
-                                    </p>
-                                )}
+                                <p class="text-[13px] text-ink-faint mb-4">
+                                    Checksums have been validated for every received file.
+                                </p>
                             </Show>
                             <Show when={receive.conflicts().skipped > 0}>
                                 <p class="text-[13px] text-ink-faint mb-4">

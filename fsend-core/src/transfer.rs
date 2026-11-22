@@ -717,7 +717,7 @@ async fn receive(
     let paths = (entries.iter())
         .map(|entry| local_path(out, entry.path()))
         .collect::<io::Result<Vec<_>>>()?;
-    let local = local_entries(&paths).await?;
+    let (paths, local) = local_entries(paths).await?;
     let checked = resume::to_check(entries, &local);
     let verified = if checked.is_empty() {
         Vec::new()
@@ -841,18 +841,18 @@ impl Present<'_> {
     }
 }
 
-async fn local_entries(paths: &[PathBuf]) -> io::Result<Vec<Local>> {
-    let paths = paths.to_vec();
+/// What is at each of `paths`, which are handed back.
+async fn local_entries(paths: Vec<PathBuf>) -> io::Result<(Vec<PathBuf>, Vec<Local>)> {
     tokio::task::spawn_blocking(move || {
-        paths
-            .iter()
+        let local = (paths.iter())
             .map(|path| match std::fs::metadata(path) {
                 Err(_) => Local::Missing,
                 Ok(m) if m.is_file() => Local::File { size: m.len() },
                 Ok(m) if m.is_dir() => Local::Dir,
                 Ok(_) => Local::Other,
             })
-            .collect()
+            .collect();
+        (paths, local)
     })
     .await
     .map_err(io::Error::other)

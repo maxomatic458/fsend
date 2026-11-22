@@ -254,7 +254,8 @@ async function receiveData(
             }
             let batch;
             try {
-                batch = await codec!.decode(chunks);
+                // The sender keeps within the window from what is written.
+                batch = await codec!.decode(chunks, written + WINDOW - decoded);
             } catch (err) {
                 throw protocolError(messageOf(err));
             }

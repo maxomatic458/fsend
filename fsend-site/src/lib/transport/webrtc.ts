@@ -71,16 +71,16 @@ export async function createAnswerer(offerSdp: string): Promise<{
     const channelsReady = new Promise<{
         controlChannel: RTCDataChannel;
         dataChannel: RTCDataChannel;
-    }>((resolve) => {
-        pc.ondatachannel = (ev) => {
-            ev.channel.binaryType = "arraybuffer";
-            channels.set(ev.channel.label, ev.channel);
-            if (channels.size === 2) {
-                resolve({
-                    controlChannel: channels.get("control")!,
-                    dataChannel: channels.get("data")!,
-                });
+    }>((resolve, reject) => {
+        pc.ondatachannel = ({ channel }) => {
+            channel.binaryType = "arraybuffer";
+            if (!["control", "data"].includes(channel.label) || channels.has(channel.label)) {
+                reject(new Error("The peer opened an unexpected data channel"));
+                return;
             }
+            channels.set(channel.label, channel);
+            const [controlChannel, dataChannel] = [channels.get("control"), channels.get("data")];
+            if (controlChannel && dataChannel) resolve({ controlChannel, dataChannel });
         };
     });
 

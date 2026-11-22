@@ -25,6 +25,7 @@ const {
     runReceive,
     createFolderSink,
     createZipSink,
+    encodeBlock,
     encodeFrame,
     Role,
     MAX_DATA_MESSAGE_BYTES,
@@ -778,6 +779,8 @@ describe("protocol errors", () => {
         ],
         ["an unknown message", () => jsonFrame('{"type":"resume"}')],
         ["a malformed message", () => jsonFrame('{"type":"accept"}')],
+        // A text message would otherwise be read as the length of a byte array.
+        ["a text message", () => "1000000000"],
         [
             "a check of an unknown file",
             () => encodeFrame({ type: "check", files: [{ id: 7, len: 1 }] }, Role.Receiver),
@@ -894,6 +897,47 @@ describe("checksums", () => {
         assert.ok(send.error, "the sender sees the receiver leave");
         assert.ok(!send.states.includes("transferring"), "nothing was accepted");
         assert.deepEqual(dir.snapshot()["f.bin"], local);
+    });
+});
+
+describe("a sender past the window", () => {
+    /**
+     * A receiver that gets `flood` on its data channel ahead of the sender's
+     * data; `busy`, it reads none of it until all has arrived.
+     */
+    async function flooded(flood, { busy = false } = {}) {
+        const sink = createFolderSink(new MemoryDirectoryHandle());
+        const { prepare, reserve } = sink;
+        sink.prepare = (tops) => {
+            const data = peerConnections[0]._channels.get("data");
+            for (const chunk of flood) data.send(chunk);
+            return prepare(tops);
+        };
+        // As when the browser asks the user for more storage.
+        if (busy) sink.reserve = (...args) => sleep(300).then(() => reserve(...args));
+        const { recv, senderDone, receiverDone } = await start(
+            { "a.bin": bytes(500, 8) },
+            { sink },
+        );
+        await Promise.all([senderDone, receiverDone]);
+        return recv.record;
+    }
+
+    test("fails the receiver once too much is queued", async () => {
+        const flood = Array.from({ length: 40 }, () => new Uint8Array(1024 * 1024));
+        const recv = await flooded(flood, { busy: true });
+        assert.match(recv.error ?? "", /sent past the window/);
+    });
+
+    test("fails the receiver before it decompresses too much", async () => {
+        // Each block is a few dozen bytes of zstd for a MiB of zeros.
+        const zeros = encodeBlock(new Uint8Array(1024 * 1024));
+        assert.ok(zeros.length < 1000, `${zeros.length} bytes`);
+        const recv = await flooded(
+            Array.from({ length: 40 }, () => zeros),
+            { busy: true },
+        );
+        assert.match(recv.error ?? "", /sent past the window/);
     });
 });
 

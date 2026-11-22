@@ -19,7 +19,15 @@ import {
     type Offer,
     type ReceiverMessage,
 } from "../proto";
-import { Peer, type SenderPeer, messageOf, protocolError, transferring, unexpected } from "./peer";
+import {
+    Peer,
+    TransferFailure,
+    type SenderPeer,
+    messageOf,
+    protocolError,
+    transferring,
+    unexpected,
+} from "./peer";
 import type { TransferListener } from "./events";
 import { eachAtOnce } from "../parallel";
 import { createCodec } from "./codec";
@@ -158,16 +166,31 @@ async function send(
         codec?.close();
     }
 
+    /** Waits for the channel to take more, as long as the receiver keeps reading. */
+    async function drained() {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const idle = new Promise((_, reject) => {
+            timer = setTimeout(() => {
+                const report = { code: "timeout", message: RECEIVER_IDLE } as const;
+                reject(new TransferFailure(`Timed out: ${RECEIVER_IDLE}`, report));
+            }, IDLE_TIMEOUT_MS);
+        });
+        try {
+            await Promise.race([
+                new Promise((resolve) => (channel.onbufferedamountlow = resolve)),
+                peer.stopped,
+                idle,
+            ]);
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
     /** Sends a block of `size` file bytes, which count in proportion to its bytes sent. */
     async function sendBlock(size: number, block: Bytes) {
         let counted = 0;
         for (let offset = 0; offset < block.length; offset += messageBytes) {
-            if (channel.bufferedAmount > MAX_BUFFERED_BYTES) {
-                await Promise.race([
-                    new Promise((resolve) => (channel.onbufferedamountlow = resolve)),
-                    peer.stopped,
-                ]);
-            }
+            if (channel.bufferedAmount > MAX_BUFFERED_BYTES) await drained();
             const end = Math.min(offset + messageBytes, block.length);
             channel.send(block.subarray(offset, end));
             const now = Math.floor((size * end) / block.length);
@@ -229,8 +252,11 @@ class BlockReader {
             filled += n;
             this.position += n;
         }
-        const sliceBytes = async ({ source, start, end }: (typeof slices)[0]) =>
-            new Uint8Array(await source.slice(start, end).arrayBuffer());
+        const sliceBytes = async ({ source, start, end }: (typeof slices)[0]) => {
+            const bytes = new Uint8Array(await source.slice(start, end).arrayBuffer());
+            if (bytes.length !== end - start) throw new Error("A file is shorter than expected");
+            return bytes;
+        };
         // Part of one file: its bytes are the block.
         if (slices.length === 1) return sliceBytes(slices[0]);
         const bytes = new Uint8Array(length);

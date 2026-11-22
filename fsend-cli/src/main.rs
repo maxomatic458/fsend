@@ -32,7 +32,7 @@ async fn main() -> ExitCode {
     };
 
     match report.downcast_ref::<Error>() {
-        Some(error) => eprintln!("{} {error}", "error:".red()),
+        Some(error) => eprintln!("{} {}", "error:".red(), printable(&error.to_string())),
         None => eprintln!("{report:?}"),
     }
 
@@ -87,6 +87,16 @@ async fn run() -> color_eyre::Result<()> {
     }
 
     Ok(())
+}
+
+/// `text` with control characters escaped: the peer may have written part of it.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| match c.is_control() {
+            true => c.escape_unicode().to_string(),
+            false => c.to_string(),
+        })
+        .collect()
 }
 
 /// At error level, libraries are silenced: webrtc logs errors that are not.
@@ -161,7 +171,7 @@ async fn run_receive(
         .await?;
 
     if receiver.checksums {
-        println!("\nChecksums verified.");
+        println!("\nChecksums verified for every received file.");
     }
     println!("\nTransfer complete.");
     Ok(())
@@ -236,16 +246,22 @@ impl Progress {
         let tops = (offer.entries.iter())
             .map(|node| (node.name().to_owned(), node.size()))
             .collect();
-        // Each offered entry is followed by everything under it.
-        let mut top = 0;
-        let files = (offer.flatten().iter())
-            .map(|entry| {
-                if entry.path().len() == 1 {
-                    top += 1;
+        // Ids count every entry in offer order, each folder before what it holds.
+        fn walk(nodes: &[Node], top: usize, files: &mut Vec<(u64, usize)>) {
+            for node in nodes {
+                match node {
+                    Node::File { size, .. } => files.push((*size, top)),
+                    Node::Dir { entries, .. } => {
+                        files.push((0, top));
+                        walk(entries, top, files);
+                    }
                 }
-                (entry.size(), top - 1)
-            })
-            .collect();
+            }
+        }
+        let mut files = Vec::new();
+        for (top, node) in offer.entries.iter().enumerate() {
+            walk(std::slice::from_ref(node), top, &mut files);
+        }
         Self {
             tops,
             files,
@@ -588,6 +604,14 @@ mod tests {
         let bars = &progress.bars.unwrap().bars;
         assert_eq!(bars[0].position(), 24);
         assert_eq!(bars[1].position(), 5);
+    }
+
+    #[test]
+    fn peer_text_cannot_steer_the_terminal() {
+        assert_eq!(
+            printable("left\u{1b}[2J\u{7}\nüber"),
+            "left\\u{1b}[2J\\u{7}\\u{a}über"
+        );
     }
 
     #[test]

@@ -65,10 +65,10 @@ export function SendPage() {
                 onCancel={exitGuard.cancel}
             />
 
-            <Title>Send Files — fsend</Title>
+            <Title>Send Files - fsend</Title>
             <Meta
                 name="description"
-                content="Drag and drop files or folders to send them directly to another device. No uploads to a server — the transfer is peer-to-peer over WebRTC, end-to-end encrypted."
+                content="Drag and drop files or folders to send them directly to another device. Nothing is uploaded to a server. The transfer runs peer-to-peer over WebRTC and is end-to-end encrypted."
             />
             <Link rel="canonical" href={`${SITE_URL}/send`} />
 
@@ -141,9 +141,8 @@ export function SendPage() {
                                 />
                                 <span>
                                     <span class="font-semibold text-ink">Include Checksums</span> -
-                                    Compute {" "} 
-                                    {ALGORITHM_NAMES[send.algorithm]} checksums for each file.
-                                    This may take some time for larger files.
+                                    Compute {ALGORITHM_NAMES[send.algorithm]} checksums for each
+                                    file. This may take some time for larger files.
                                 </span>
                             </label>
                             <Button
