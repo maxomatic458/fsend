@@ -6,6 +6,7 @@ use std::{
 
 use fsend_server::Config;
 use serde_json::{Value, json};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -73,23 +74,26 @@ async fn report(addr: SocketAddr, report: Value) -> u16 {
     request(addr, "POST", "/stats", &report.to_string()).await.0
 }
 
+async fn open(database: &Path) -> SqlitePool {
+    let options = SqliteConnectOptions::new().filename(database);
+    SqlitePool::connect_with(options).await.unwrap()
+}
+
 /// The rows as `platform transport route bytes`, checking each was stamped with this hour.
-fn rows(database: &Path) -> Vec<String> {
-    let db = rusqlite::Connection::open(database).unwrap();
-    let mut rows = db
-        .prepare(
-            "SELECT hour, unixepoch() - unixepoch(hour), platform || ' ' || transport || ' ' || \
-             route || ' ' || bytes FROM transfers",
-        )
-        .unwrap();
-    rows.query_map([], |row| {
-        let (hour, age): (String, i64) = (row.get(0)?, row.get(1)?);
-        assert!(hour.ends_with(":00") && (0..3600).contains(&age), "{hour}");
-        row.get(2)
-    })
-    .unwrap()
-    .collect::<Result<_, _>>()
-    .unwrap()
+async fn rows(database: &Path) -> Vec<String> {
+    let rows: Vec<(String, i64, String)> = sqlx::query_as(
+        "SELECT hour, unixepoch() - unixepoch(hour), platform || ' ' || transport || ' ' || \
+         route || ' ' || bytes FROM transfers",
+    )
+    .fetch_all(&open(database).await)
+    .await
+    .unwrap();
+    (rows.into_iter())
+        .map(|(hour, age, row)| {
+            assert!(hour.ends_with(":00") && (0..3600).contains(&age), "{hour}");
+            row
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -113,7 +117,7 @@ async fn each_token_counts_one_report() {
     assert_eq!(report(addr, again).await, 403, "a token is used up");
 
     assert_eq!(
-        rows(&database),
+        rows(&database).await,
         [
             "cli iroh direct 100",
             "cli webrtc relay 23",
@@ -142,7 +146,7 @@ async fn reports_without_a_valid_token_count_nothing() {
     }
     let (status, _) = request(addr, "POST", "/stats", "not json").await;
     assert_eq!(status, 400);
-    assert_eq!(rows(&database), Vec::<String>::new());
+    assert_eq!(rows(&database).await, Vec::<String>::new());
 
     // A malformed report leaves the token for a good one.
     assert_eq!(report(addr, web_report(&token, 1)).await, 204);
@@ -154,7 +158,7 @@ async fn an_expired_token_counts_nothing() {
     let (addr, database) = with_stats_for(dir.path(), Duration::ZERO).await;
     let token = receiver_token(addr).await;
     assert_eq!(report(addr, web_report(&token, 1)).await, 403);
-    assert_eq!(rows(&database), Vec::<String>::new());
+    assert_eq!(rows(&database).await, Vec::<String>::new());
 }
 
 #[tokio::test]
@@ -163,7 +167,7 @@ async fn totals_count_the_hours_each_window_touches() {
     let (addr, database) = with_stats(dir.path()).await;
     // Answering means the server has made its tables.
     assert_eq!(request(addr, "GET", "/health", "").await.0, 200);
-    let db = rusqlite::Connection::open(&database).unwrap();
+    let db = open(&database).await;
     // Bytes stamped this many hours before the current hour.
     let rows = [
         (0, 1),
@@ -176,16 +180,18 @@ async fn totals_count_the_hours_each_window_touches() {
         (24 * 400, 128),
     ];
     for (hours, bytes) in rows {
-        db.execute(
-            "INSERT INTO transfers VALUES (strftime('%Y-%m-%d %H:00', 'now', ?1), 'cli', 'iroh', 'direct', ?2)",
-            rusqlite::params![format!("-{hours} hours"), bytes],
+        sqlx::query(
+            "INSERT INTO transfers VALUES (strftime('%Y-%m-%d %H:00', 'now', ?), 'cli', 'iroh', 'direct', ?)",
         )
+        .bind(format!("-{hours} hours"))
+        .bind(bytes)
+        .execute(&db)
+        .await
         .unwrap();
     }
-    let hour_of_day: i64 = db
-        .query_row("SELECT CAST(strftime('%H', 'now') AS INTEGER)", [], |row| {
-            row.get(0)
-        })
+    let (hour_of_day,): (i64,) = sqlx::query_as("SELECT CAST(strftime('%H', 'now') AS INTEGER)")
+        .fetch_one(&db)
+        .await
         .unwrap();
     let today: i64 = (rows.iter())
         .filter(|(hours, _)| *hours <= hour_of_day)

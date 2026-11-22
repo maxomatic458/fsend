@@ -251,6 +251,8 @@ mod tests {
 
     use super::*;
     use crate::build_offer;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
+
     use crate::transfer::test_support::{
         APP, sample_tree, snapshot, start_server, start_server_with,
     };
@@ -384,16 +386,11 @@ mod tests {
         let size = (snapshot(&tmp.path().join("album")).iter())
             .map(|(_, bytes)| bytes.len())
             .sum();
-        let db = rusqlite::Connection::open(&database).unwrap();
-        let mut rows = db
-            .prepare("SELECT platform, transport, route, bytes FROM transfers")
-            .unwrap();
-        let rows = rows
-            .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })
-            .unwrap()
-            .collect::<Result<_, _>>()
+        let options = SqliteConnectOptions::new().filename(&database);
+        let db = SqlitePool::connect_with(options).await.unwrap();
+        let rows = sqlx::query_as("SELECT platform, transport, route, bytes FROM transfers")
+            .fetch_all(&db)
+            .await
             .unwrap();
         (rows, size)
     }

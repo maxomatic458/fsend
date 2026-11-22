@@ -47,10 +47,10 @@ impl Default for Config {
 }
 
 pub async fn serve(listener: TcpListener, config: Config) -> io::Result<()> {
-    let stats = (config.database.as_deref())
-        .map(|path| Stats::open(path, config.stats_token_ttl))
-        .transpose()?
-        .map(Arc::new);
+    let stats = match &config.database {
+        Some(path) => Some(Arc::new(Stats::open(path, config.stats_token_ttl).await?)),
+        None => None,
+    };
     let mut router = relay::router(config, stats.clone()).route("/health", get(|| async { "ok" }));
     if let Some(stats) = stats {
         router = router.merge(stats::router(stats));

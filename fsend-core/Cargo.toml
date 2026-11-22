@@ -31,6 +31,6 @@ webrtc = "0.21.1"
 
 [dev-dependencies]
 fsend-server = { path = "../fsend-server" }
-rusqlite = { version = "0.43.0", default-features = false }
+sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "sqlite-bundled"] }
 tempfile = "3.27.0"
 tokio = { workspace = true, features = ["rt-multi-thread"] }
