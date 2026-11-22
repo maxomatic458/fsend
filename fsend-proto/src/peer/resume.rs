@@ -15,7 +15,7 @@ pub const SAMPLE_BYTES: u64 = 1024 * 1024;
 pub struct Fingerprint(pub u128);
 
 impl Fingerprint {
-    /// The `(start, end)` byte ranges of a file's first `len` bytes that are hashed, in order.
+    /// The `(start, end)` byte ranges that are hashed, in order.
     pub fn ranges(len: u64) -> Vec<(u64, u64)> {
         if len <= 2 * SAMPLE_BYTES {
             vec![(0, len)]
@@ -107,6 +107,8 @@ pub struct Conflict {
 pub struct Plan {
     /// Files to receive whatever the policy: new ones and resumed ones, in offer order.
     pub files: Vec<AcceptedFile>,
+    /// Files already complete, left out of the accept, in offer order.
+    pub complete: Vec<u32>,
     /// Directories to create, in offer order.
     pub dirs: Vec<u32>,
     pub conflicts: Vec<Conflict>,
@@ -132,9 +134,8 @@ impl Plan {
     }
 }
 
-/// Plans the receive of a valid offer. `verified` holds the ids of the checked files whose
-/// fingerprints matched: those resume, or are complete. Other existing files
-/// conflict, and so does anything in the way of an offered entry.
+/// `verified` holds the checked files whose fingerprints matched: those resume
+/// or are complete. Other existing files conflict.
 pub fn plan(entries: &[Entry], local: &[Local], verified: &[u32]) -> Plan {
     let mut plan = Plan::default();
     let verified: HashSet<u32> = verified.iter().copied().collect();
@@ -160,7 +161,7 @@ pub fn plan(entries: &[Entry], local: &[Local], verified: &[u32]) -> Plan {
             (Entry::File { size, .. }, Local::File { size: len }) => {
                 let prefix = len == 0 || (len <= *size && verified.contains(&id));
                 match prefix {
-                    true if len == *size => {}
+                    true if len == *size => plan.complete.push(id),
                     true => plan.files.push(AcceptedFile { id, offset: len }),
                     false => plan.conflicts.push(conflict(true)),
                 }
@@ -179,6 +180,7 @@ mod tests {
         Entry::File {
             path: path.iter().map(|s| s.to_string()).collect(),
             size,
+            checksum: None,
         }
     }
 

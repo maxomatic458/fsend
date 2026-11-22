@@ -1,20 +1,20 @@
 import { MAX_MESSAGE_BYTES } from "../../config";
 import {
     GOODBYE_TIMEOUT_MS,
-    HELLO_TIMEOUT_MS,
-    PEER_MIN_VERSION,
-    PEER_VERSION,
+    WINDOW,
     FrameDecoder,
     Role,
     encodeFrame,
-    negotiate,
+    type AcceptedFile,
+    type Entry,
     type ErrorReport,
+    type Offer,
     type PeerMessage,
     type ReceiverMessage,
     type SenderMessage,
     type Bytes,
-    type TopEntry,
 } from "../proto";
+import { nodeSize, presentBytes } from "../files/tree";
 import type { Link } from "../transport/session";
 import type { TransferEvent } from "./events";
 
@@ -37,23 +37,20 @@ export const protocolError = (detail: string): TransferFailure =>
         message: detail,
     });
 
-const VERSION_MISMATCH = "The other side runs an incompatible version of fsend. Update both sides.";
-
 /** What a message means where the flow expects another one. */
 export function unexpected(message: PeerMessage): TransferFailure {
     switch (message.type) {
         case "error":
-            return new TransferFailure(
-                message.code === "version"
-                    ? VERSION_MISMATCH
-                    : `The other side failed: ${message.message}`,
-            );
+            return new TransferFailure(`The other side failed: ${message.message}`);
         case "cancel":
             return new TransferFailure("The other side cancelled the transfer");
         default:
             return protocolError(`unexpected ${message.type} message`);
     }
 }
+
+/// Data stream bytes not read yet; the window keeps a well-behaved peer below it.
+const MAX_QUEUED_BYTES = 2 * WINDOW;
 
 /** What both sides send. */
 type Common = Extract<SenderMessage, ReceiverMessage>;
@@ -83,6 +80,12 @@ class Inbox<T> {
         this.error ??= error;
         this.waiting?.reject(this.error);
         this.waiting = undefined;
+    }
+
+    /** Fails at once, dropping what has arrived. */
+    abort(error: Error): void {
+        this.items = [];
+        this.fail(error);
     }
 
     /** The next item, if it has already arrived and `take` wants it. */
@@ -138,6 +141,7 @@ export class Peer<Out extends PeerMessage, In extends PeerMessage> {
     private inbox = new Inbox<Incoming<In>>();
     private decoder: FrameDecoder<In>;
     private gone = false;
+    private queued = 0;
 
     static sender(link: Link, abort: AbortSignal): SenderPeer {
         return new Peer<SenderMessage, ReceiverMessage>(link, abort, Role.Sender);
@@ -162,9 +166,11 @@ export class Peer<Out extends PeerMessage, In extends PeerMessage> {
         link.disconnected.catch(() => (this.gone = true));
         this.stopped.catch((error) => this.inbox.fail(error));
 
-        link.controlChannel.onmessage = (ev: MessageEvent<ArrayBuffer>) => {
-            this.decoder.push(new Uint8Array(ev.data));
+        // A text message, which `binaryType` leaves alone, is a protocol error.
+        link.controlChannel.onmessage = (ev: MessageEvent<unknown>) => {
             try {
+                if (!(ev.data instanceof ArrayBuffer)) throw new Error("a text message");
+                this.decoder.push(new Uint8Array(ev.data));
                 for (let m = this.decoder.next(); m; m = this.decoder.next()) {
                     this.inbox.push(m);
                 }
@@ -172,7 +178,14 @@ export class Peer<Out extends PeerMessage, In extends PeerMessage> {
                 this.inbox.fail(protocolError(messageOf(err)));
             }
         };
-        link.dataChannel.onmessage = (ev: MessageEvent<ArrayBuffer>) => {
+        link.dataChannel.onmessage = (ev: MessageEvent<unknown>) => {
+            if (!(ev.data instanceof ArrayBuffer)) {
+                return this.inbox.abort(protocolError("a text message"));
+            }
+            this.queued += ev.data.byteLength;
+            if (this.queued > MAX_QUEUED_BYTES) {
+                return this.inbox.abort(protocolError("the sender sent past the window"));
+            }
             if (ev.data.byteLength > 0) this.inbox.push(new Uint8Array(ev.data));
         };
     }
@@ -189,8 +202,8 @@ export class Peer<Out extends PeerMessage, In extends PeerMessage> {
     }
 
     /** The next message or data chunk. */
-    receive(timeoutMs?: number, what?: string): Promise<Incoming<In>> {
-        return this.inbox.next(timeoutMs, what);
+    async receive(timeoutMs?: number, what?: string): Promise<Incoming<In>> {
+        return this.taken(await this.inbox.next(timeoutMs, what));
     }
 
     /** The next message; data is not allowed here. */
@@ -200,33 +213,19 @@ export class Peer<Out extends PeerMessage, In extends PeerMessage> {
 
     /** A data chunk that has already arrived, if it is next. */
     pollData(): Uint8Array | undefined {
-        return this.inbox.pollIf((item) => item instanceof Uint8Array) as Uint8Array | undefined;
+        const item = this.inbox.pollIf((item) => item instanceof Uint8Array);
+        return item && (this.taken(item) as Uint8Array);
+    }
+
+    private taken<T extends Incoming<In>>(item: T): T {
+        if (item instanceof Uint8Array) this.queued -= item.length;
+        return item;
     }
 
     /** A message that has already arrived, if any. */
     poll(): In | undefined {
         const item = this.inbox.poll();
         return item === undefined ? undefined : message(item);
-    }
-
-    /** Sends our `hello` and checks the peer's; returns the peer's `recv_window`. */
-    async hello(what: string, recvWindow?: number): Promise<number | undefined> {
-        this.send({
-            type: "hello",
-            version: PEER_VERSION,
-            min_version: PEER_MIN_VERSION,
-            features: [],
-            recv_window: recvWindow,
-        });
-        const hello: PeerMessage = await this.next(HELLO_TIMEOUT_MS, what);
-        if (hello.type !== "hello") throw unexpected(hello);
-        if (negotiate(hello.version, hello.min_version) === undefined) {
-            throw new TransferFailure(VERSION_MISMATCH, {
-                code: "version",
-                message: `versions ${PEER_MIN_VERSION} to ${PEER_VERSION} are supported`,
-            });
-        }
-        return hello.recv_window;
     }
 
     /** Gives the peer a moment to read our last message, until it hangs up or says its last word. */
@@ -277,7 +276,7 @@ export class Peer<Out extends PeerMessage, In extends PeerMessage> {
 export type SenderPeer = Peer<SenderMessage, ReceiverMessage>;
 export type ReceiverPeer = Peer<ReceiverMessage, SenderMessage>;
 
-const FINAL = new Set(["done", "reject", "cancel", "error"]);
+const FINAL = new Set(["done", "cancel", "error"]);
 
 function message<In>(item: Incoming<In>): In {
     if (item instanceof Uint8Array) {
@@ -286,15 +285,16 @@ function message<In>(item: Incoming<In>): In {
     return item;
 }
 
-/** The `transferring` event for the top-level entries and the bytes of each already present. */
-export function transferring(tops: TopEntry[], present: number[]): TransferEvent {
+/** The `transferring` event for `offer`, once `files` are accepted. */
+export function transferring(offer: Offer, entries: Entry[], files: AcceptedFile[]): TransferEvent {
+    const present = presentBytes(offer, entries, files);
     return {
         type: "transferring",
-        entries: tops.map((top, i) => ({
-            name: top.name,
-            sizeBytes: top.size,
+        entries: offer.entries.map((node, i) => ({
+            name: node.name,
+            sizeBytes: nodeSize(node),
             skipBytes: present[i],
-            isDir: top.dir,
+            isDir: node.kind === "dir",
         })),
     };
 }

@@ -1,11 +1,9 @@
-import type { TopEntry } from "../proto";
+import type { Node } from "../proto";
 
 /**
- * Where received files go.
- *
- * fs  — a folder: the one the user picks (Chromium), or the browser's private
- *       storage (OPFS) elsewhere, saved to Downloads at the end. Resumable.
- * zip — buffered in memory, saved (zipped if more than one) at the end.
+ * Where received files go. `fs` is a folder, resumable: the one the user picks
+ * (Chromium), or else the browser's private storage (OPFS), saved to Downloads
+ * at the end. `zip` is held in memory and saved at the end, zipped if more than one.
  */
 export type StorageMode = "fs" | "zip";
 
@@ -112,7 +110,7 @@ export class BrowserStorage {
     }
 
     /** Drops everything that is not part of `tops`, which may resume. */
-    async keepOnly(tops: TopEntry[]): Promise<void> {
+    async keepOnly(tops: Node[]): Promise<void> {
         const keep = new Set(tops.map((top) => top.name));
         await emptyDir(this.incoming, (name) => !keep.has(name));
         await emptyDir(this.root, (name) => name !== INCOMING);

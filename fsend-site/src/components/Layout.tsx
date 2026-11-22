@@ -51,7 +51,7 @@ export function Layout(props: { children: JSX.Element }) {
                 <div class="flex flex-col sm:flex-row items-center justify-between gap-4 text-sm text-ink-faint">
                     <div class="flex items-center gap-2.5">
                         <Logo class="w-5" />
-                        <span>fsend — peer-to-peer file transfer in the browser</span>
+                        <span>fsend, peer-to-peer file transfer in the browser</span>
                     </div>
                     <div class="flex items-center gap-4">
                         <span class="font-mono text-[11.5px]">

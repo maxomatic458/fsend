@@ -1,9 +1,15 @@
 use serde::{Deserialize, Serialize};
 
 use crate::code::Nameplate;
+use crate::peer::limits;
 
-pub const VERSION: u32 = 1;
+/// The protocol version; the relay pairs only clients that speak it.
+pub const VERSION: u32 = 2;
 pub const PATH: &str = "/relay";
+/// Largest frame a client sends, text or binary.
+pub const MAX_FRAME_BYTES: usize = 32 * 1024;
+/// Binary bytes a client may send in a session: the largest sealed offer, and room to spare.
+pub const MAX_SIGNAL_BYTES: usize = limits::MAX_FRAME_BYTES + 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -41,116 +47,32 @@ pub enum ServerMessage {
     /// Sent to both sides once the receiver joined.
     Paired {
         transport: Transport,
+        /// The receiver's one-time token for its stats report, if the server keeps stats.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        stats_token: Option<String>,
     },
     Error {
-        code: ErrorCode,
-        message: String,
+        code: Error,
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(rename = "RelayError"))]
 #[serde(rename_all = "snake_case")]
-pub enum ErrorCode {
+pub enum Error {
+    #[error("the relay speaks another protocol version; update fsend")]
     Version,
+    #[error("no session with this code")]
     NotFound,
+    #[error("the code expired")]
     Expired,
+    #[error("the two sides have no connection type in common; update fsend on both sides")]
     NoCommonTransport,
+    #[error("the other side left")]
     PeerLeft,
+    #[error("the relay is busy; try again later")]
     Busy,
+    #[error("the relay refused a message")]
     Protocol,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::testing::pinned;
-
-    #[test]
-    fn client_messages_keep_their_wire_format() {
-        pinned(
-            ClientMessage::Create {
-                version: 1,
-                transports: vec![Transport::Iroh, Transport::Webrtc],
-            },
-            r#"{"type":"create","version":1,"transports":["iroh","webrtc"]}"#,
-        );
-        pinned(
-            ClientMessage::Join {
-                version: 1,
-                nameplate: "K7Q2".parse().unwrap(),
-                transports: vec![Transport::Webrtc],
-            },
-            r#"{"type":"join","version":1,"nameplate":"K7Q2","transports":["webrtc"]}"#,
-        );
-    }
-
-    #[test]
-    fn server_messages_keep_their_wire_format() {
-        pinned(
-            ServerMessage::Created {
-                nameplate: "K7Q2".parse().unwrap(),
-                expires_in: 300,
-            },
-            r#"{"type":"created","nameplate":"K7Q2","expires_in":300}"#,
-        );
-        pinned(
-            ServerMessage::Paired {
-                transport: Transport::Iroh,
-            },
-            r#"{"type":"paired","transport":"iroh"}"#,
-        );
-        pinned(
-            ServerMessage::Error {
-                code: ErrorCode::NoCommonTransport,
-                message: "m".into(),
-            },
-            r#"{"type":"error","code":"no_common_transport","message":"m"}"#,
-        );
-    }
-
-    #[test]
-    fn unknown_types_and_codes_fail_to_parse() {
-        for json in [
-            r#"{"type":"motd","text":"hi"}"#,
-            r#"{"type":"error","code":"teapot","message":""}"#,
-            r#"{"type":"create","version":1,"transports":[]}"#,
-        ] {
-            assert!(
-                serde_json::from_str::<ServerMessage>(json).is_err(),
-                "{json}"
-            );
-        }
-        assert!(serde_json::from_str::<ClientMessage>(r#"{"type":"created"}"#).is_err());
-    }
-
-    #[test]
-    fn unknown_fields_are_ignored() {
-        assert_eq!(
-            serde_json::from_str::<ServerMessage>(
-                r#"{"type":"paired","transport":"webrtc","extra":1}"#
-            )
-            .unwrap(),
-            ServerMessage::Paired {
-                transport: Transport::Webrtc
-            }
-        );
-    }
-
-    #[test]
-    fn unknown_transports_are_rejected() {
-        for json in [
-            r#"{"type":"create","version":1,"transports":["iroh","quic"]}"#,
-            r#"{"type":"join","version":1,"nameplate":"K7Q2","transports":["quic"]}"#,
-        ] {
-            assert!(
-                serde_json::from_str::<ClientMessage>(json).is_err(),
-                "{json}"
-            );
-        }
-        assert!(
-            serde_json::from_str::<ServerMessage>(r#"{"type":"paired","transport":"quic"}"#)
-                .is_err()
-        );
-    }
 }

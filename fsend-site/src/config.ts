@@ -1,5 +1,7 @@
-/// Base URL of the relay; the protocol path is appended.
-export const RELAY_URL = import.meta.env.VITE_RELAY_URL ?? "wss://relay.fsend.sh";
+/// The fsend server: it pairs the peers and counts the bytes receivers got.
+const API_URL = (import.meta.env.VITE_API_URL ?? "https://api.fsend.sh").replace(/\/+$/, "");
+export const RELAY_URL = `${API_URL.replace(/^http/, "ws")}/relay`;
+export const STATS_URL = `${API_URL}/stats`;
 
 export const STUN_SERVERS = ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"];
 

@@ -36,7 +36,7 @@ function slowFolder(name, fileCount, delayMs) {
     };
 }
 
-/** A plain File entry — `buildOffer` reads `.size` with no await at all. */
+/** A plain File entry, whose `.size` `buildOffer` reads without awaiting. */
 function fastFile(name, size) {
     return { kind: "file", name, file: { size } };
 }
@@ -50,7 +50,7 @@ describe("selection sizing", () => {
     test("a slow tree walk cannot mislabel a newer selection", async () => {
         await withSession(async (session) => {
             // A folder that takes many ticks to measure, then immediately a plain
-            // file that takes none — the second measurement resolves first.
+            // file that takes none, so the second measurement resolves first.
             session.add([slowFolder("big", 12, 4)]);
             session.add([fastFile("quick.txt", 500)]);
 

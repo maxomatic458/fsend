@@ -6,7 +6,7 @@ import {
     waitConnected,
     watchDisconnect,
 } from "./webrtc";
-import { loadProto, parseCode, type ConnectionInfo } from "../proto";
+import { loadProto, parseCode, type Bytes, type ConnectionInfo, type Offer } from "../proto";
 
 /// A live connection to the peer.
 export interface Link {
@@ -49,8 +49,10 @@ function assemble(
 
 export interface SenderSessionHooks {
     onCode(code: string, expiresInSecs: number): void;
-    onWaitingPeer(): void;
-    onHandshaking(): void;
+    /** The receiver joined and has the offer; its user decides next. */
+    onOffered(): void;
+    /** The receiver accepted; the peers connect next. */
+    onAccepted(): void;
 }
 
 /** Runs `connect`, closing `pc` if it fails or is cancelled; once connected, the transfer tells the peer instead. */
@@ -71,20 +73,37 @@ async function settingUp<T>(
     }
 }
 
+/** Offers `plaintext`, from `encodeOffer`, and connects once the receiver accepts. */
 export async function openSenderSession(
+    plaintext: Bytes,
     abort: AbortSignal,
     hooks: SenderSessionHooks,
 ): Promise<Link> {
     await loadProto();
     const relay = await Relay.connect(abort);
     try {
-        await relay.pairAsSender((code, expiresInSecs) => {
-            hooks.onCode(code, expiresInSecs);
-            hooks.onWaitingPeer();
-        });
-        hooks.onHandshaking();
+        await relay.pairAsSender(plaintext, hooks.onCode);
+        hooks.onOffered();
 
-        const { connection, offerSdp } = await createOfferer();
+        // Ready to connect once accepted; none of it reaches the receiver before.
+        const offerer = createOfferer();
+        let prepared;
+        try {
+            const answer = await relay.answer();
+            if (answer.type === "reject") {
+                throw new Error("The receiver rejected the files");
+            }
+            hooks.onAccepted();
+            prepared = await offerer;
+        } catch (err) {
+            offerer.then(
+                ({ connection }) => connection.pc.close(),
+                () => {},
+            );
+            throw err;
+        }
+
+        const { connection, offerSdp } = prepared;
         const { pc, controlChannel, dataChannel } = connection;
         return await settingUp(pc, abort, async () => {
             relay.sendConnection(webRtcInfo(offerSdp));
@@ -97,19 +116,28 @@ export async function openSenderSession(
     }
 }
 
-export async function openReceiverSession(
+/** Joins the session of `code`; returns the paired relay and the sender's offer. */
+export async function pairReceiver(
     code: string,
     abort: AbortSignal,
-    hooks: { onHandshaking(): void },
-): Promise<Link> {
+): Promise<{ relay: Relay; offer: Offer }> {
     await loadProto();
     const parsed = parseCode(code);
     if ("error" in parsed) throw new Error(`Invalid code: ${parsed.message}`);
 
     const relay = await Relay.connect(abort);
     try {
-        await relay.pairAsReceiver(parsed.code);
+        return { relay, offer: await relay.pairAsReceiver(parsed.code) };
+    } catch (err) {
+        relay.close();
+        throw err;
+    }
+}
 
+/** Accepts the offer over `relay`, which is closed afterwards, and connects to the sender. */
+export async function connectReceiver(relay: Relay, abort: AbortSignal): Promise<Link> {
+    try {
+        relay.accept();
         const answerer = await createAnswerer(sdpOf(await relay.connection()));
         const { pc } = answerer;
         return await settingUp(pc, abort, async () => {
@@ -122,7 +150,6 @@ export async function openReceiverSession(
                 abort,
             );
             const { controlChannel, dataChannel } = await channels;
-            hooks.onHandshaking();
             return assemble(pc, controlChannel, dataChannel);
         });
     } finally {

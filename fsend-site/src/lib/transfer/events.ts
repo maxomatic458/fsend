@@ -1,4 +1,4 @@
-import type { TopEntry } from "../proto";
+import type { Offer } from "../proto";
 
 export type ConnectionKind = "direct" | "relay" | "unknown";
 
@@ -11,20 +11,25 @@ export interface TransferEntry {
 }
 
 export type TransferEvent =
+    /// Sender only: reading the files for their checksums, before pairing.
+    | { type: "hashing"; done: number; total: number }
     /// Sender only
     | { type: "code"; code: string; expiresInSecs: number }
-    | { type: "waitingPeer" }
-    | { type: "connecting" }
-    | { type: "handshaking" }
-    /// Sender only: files offered.
+    /// Sender only: the receiver has the offer, and its user decides.
     | { type: "waitingAccept" }
-    /// Receiver only
+    /// Sender only: the receiver accepted, and the peers connect.
+    | { type: "handshaking" }
+    /// Receiver only: joining the sender's session.
+    | { type: "connecting" }
+    /// Receiver only: nothing about this side has reached the sender yet.
     | {
           type: "offered";
-          files: TopEntry[];
+          offer: Offer;
           accept: () => void;
           reject: () => void;
       }
+    /// Receiver only: checking what is already here against the checksums.
+    | { type: "verifying"; done: number; total: number }
     /// Receiver only: the browser asks the user to let fsend store more.
     | { type: "askingStorage" }
     /// Receiver only: there was no room where the files were going, so they are held in memory.

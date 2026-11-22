@@ -2,7 +2,9 @@ use fsend_proto::{
     code::{Code, CodeError, Nameplate},
     pairing::{self, PairingError, Signal},
     peer::{
-        self, ReceiverMessage, SenderMessage, block, frame, limits, offer, progress,
+        Offer, ReceiverMessage, SenderMessage, block,
+        checksum::{self, Algorithm},
+        frame, limits, offer, progress,
         resume::{self, Fingerprint},
     },
     relay::ServerMessage,
@@ -72,7 +74,8 @@ fn thrown(error: PairingError) -> JsError {
     JsError::new(&json(&error))
 }
 
-// `Pake` and `Channel` take and return whole binary relay frames.
+// `Pake` and `Channel` take and return whole binary relay frames; a sealed
+// message may take several.
 
 #[wasm_bindgen]
 pub struct Pake {
@@ -112,19 +115,32 @@ pub struct Channel(pairing::Channel);
 
 #[wasm_bindgen]
 impl Channel {
-    /// `message` is a JSON `Sealed`.
-    pub fn seal(&mut self, message: &str) -> Result<Vec<u8>, JsError> {
-        let sealed = self.0.seal(&serde_json::from_str(message)?);
-        Ok(Signal::Sealed(sealed).encode())
+    /// The frames of `message`, a JSON `Sealed`.
+    pub fn seal(&mut self, message: &str) -> Result<Vec<js_sys::Uint8Array>, JsError> {
+        let frames = self
+            .0
+            .seal(&serde_json::from_str(message)?)
+            .map_err(thrown)?;
+        Ok(frames
+            .iter()
+            .map(|frame| js_sys::Uint8Array::from(frame.as_slice()))
+            .collect())
     }
 
-    /// The JSON `Sealed` in the peer's next frame.
-    pub fn open(&mut self, frame: &[u8]) -> Result<String, JsError> {
-        let Some(Signal::Sealed(sealed)) = Signal::decode(frame) else {
-            return Err(thrown(PairingError::UnexpectedSignal));
-        };
-        let message = self.0.open(&sealed).map_err(thrown)?;
-        Ok(json(&message))
+    /// The frames of a plaintext from [`encode_offer`].
+    #[wasm_bindgen(js_name = sealPlaintext)]
+    pub fn seal_plaintext(&mut self, plaintext: &[u8]) -> Vec<js_sys::Uint8Array> {
+        let frames = self.0.seal_plaintext(plaintext);
+        frames
+            .iter()
+            .map(|frame| js_sys::Uint8Array::from(frame.as_slice()))
+            .collect()
+    }
+
+    /// The JSON `Sealed` once the peer's `frame` completes a message.
+    pub fn open(&mut self, frame: &[u8]) -> Result<Option<String>, JsError> {
+        let message = self.0.open(frame).map_err(thrown)?;
+        Ok(message.map(|message| json(&message)))
     }
 }
 
@@ -225,27 +241,26 @@ impl BlockDecoder {
     }
 }
 
-/// Turns counts of data stream bytes into progress per top-level entry, in stream order.
+/// Turns counts of data stream bytes into progress per accepted file.
 #[wasm_bindgen]
 pub struct Progress(progress::Progress);
 
 #[wasm_bindgen]
 impl Progress {
-    /// For the JSON `AcceptedFile[]` `files` of the JSON `Entry[]` `entries`, with `top_of` from `topEntries`.
+    /// For the JSON `AcceptedFile[]` `files` of the JSON `Entry[]` `entries`.
     #[wasm_bindgen(constructor)]
-    pub fn new(entries: &str, files: &str, top_of: &[u32]) -> Result<Progress, JsError> {
+    pub fn new(entries: &str, files: &str) -> Result<Progress, JsError> {
         let entries: Vec<_> = serde_json::from_str(entries)?;
         let files: Vec<_> = serde_json::from_str(files)?;
-        let top_of: Vec<usize> = top_of.iter().map(|&top| top as usize).collect();
-        Ok(Self(progress::Progress::new(&entries, &files, &top_of)))
+        Ok(Self(progress::Progress::new(&entries, &files)))
     }
 
-    /// `[top, bytes, top, bytes, ...]`: the bytes of each top-level entry among the next `n`.
+    /// `[id, bytes, id, bytes, ...]`: the bytes of each file among the next `n`.
     pub fn advance(&mut self, n: f64) -> Vec<f64> {
         self.0
             .advance(n as u64)
             .into_iter()
-            .flat_map(|(top, bytes)| [top as f64, bytes as f64])
+            .flat_map(|(id, bytes)| [id as f64, bytes as f64])
             .collect()
     }
 }
@@ -258,22 +273,45 @@ pub fn crc32(data: &[u8], previous: u32) -> u32 {
     hasher.finalize()
 }
 
-/// The highest protocol version both sides speak.
-#[wasm_bindgen]
-pub fn negotiate(version: u32, min_version: u32) -> Option<u32> {
-    peer::negotiate(version, min_version)
-}
-
-/// Checks `entries`, a JSON `Entry[]`, against the offer rules.
+/// Checks `offer`, a JSON `Offer`, against the offer rules.
 #[wasm_bindgen(js_name = validateOffer)]
-pub fn validate_offer(entries: &str) -> Result<(), JsError> {
-    Ok(offer::validate(&serde_json::from_str::<Vec<_>>(entries)?)?)
+pub fn validate_offer(offer: &str) -> Result<(), JsError> {
+    Ok(offer::validate(&serde_json::from_str(offer)?)?)
 }
 
-/// The control frame of an offer of `entries`, a JSON `Entry[]`, once they are valid.
+/// The sealed plaintext of `offer`, a JSON `Offer`; throws unless it follows the offer rules.
 #[wasm_bindgen(js_name = encodeOffer)]
-pub fn encode_offer(entries: &str) -> Result<Vec<u8>, JsError> {
-    Ok(offer::encode(&serde_json::from_str::<Vec<_>>(entries)?)?)
+pub fn encode_offer(offer: &str) -> Result<Vec<u8>, JsError> {
+    Ok(offer::encode(&serde_json::from_str(offer)?)?)
+}
+
+/// JSON `Entry[]` of `offer`, a JSON `Offer`; an entry's id is its index.
+#[wasm_bindgen(js_name = flattenOffer)]
+pub fn flatten_offer(offer: &str) -> Result<String, JsError> {
+    Ok(json(&serde_json::from_str::<Offer>(offer)?.flatten()))
+}
+
+/// Hashes a file's bytes as they come.
+#[wasm_bindgen]
+pub struct Hasher(checksum::Hasher);
+
+#[wasm_bindgen]
+impl Hasher {
+    /// For a JSON `Algorithm`, such as `sha256`.
+    #[wasm_bindgen(constructor)]
+    pub fn new(algorithm: &str) -> Result<Hasher, JsError> {
+        let algorithm: Algorithm = serde_json::from_value(algorithm.into())?;
+        Ok(Self(algorithm.hasher()))
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        self.0.update(data);
+    }
+
+    /// The digest as lowercase hex.
+    pub fn finish(self) -> String {
+        self.0.finish().to_string()
+    }
 }
 
 /// Checks `files`, a JSON `AcceptedFile[]`, against the offered `entries`.
@@ -296,7 +334,7 @@ pub fn check_lengths(entries: &str, files: &str) -> Result<(), JsError> {
     )?)
 }
 
-/// JSON `[number, number][]`: the byte ranges of a file's first `len` bytes that are fingerprinted.
+/// JSON `[number, number][]`: the byte ranges that are fingerprinted.
 #[wasm_bindgen(js_name = fingerprintRanges)]
 pub fn fingerprint_ranges(len: f64) -> String {
     json(&Fingerprint::ranges(len as u64))
@@ -336,24 +374,6 @@ pub fn accept_plan(plan: &str, policy: &str) -> Result<String, JsError> {
     Ok(json(&plan.accept(serde_json::from_str(policy)?)))
 }
 
-/// JSON `[TopEntry[], number[]]`: the top-level entries of a valid offer, and the one each entry lies in.
-#[wasm_bindgen(js_name = topEntries)]
-pub fn top_entries(entries: &str) -> Result<String, JsError> {
-    Ok(json(&progress::top_entries(
-        &serde_json::from_str::<Vec<_>>(entries)?,
-    )))
-}
-
-/// JSON `number[]`: bytes of each top-level entry already present once `files` are accepted.
-#[wasm_bindgen(js_name = presentBytes)]
-pub fn present_bytes(entries: &str, files: &str) -> Result<String, JsError> {
-    let entries: Vec<_> = serde_json::from_str(entries)?;
-    Ok(json(&progress::present(
-        &entries,
-        &serde_json::from_str::<Vec<_>>(files)?,
-    )))
-}
-
 #[cfg(test)]
 mod bindings {
     use std::{env, fs, path::Path};
@@ -362,11 +382,12 @@ mod bindings {
         code::NAMEPLATE_LEN,
         pairing::{ConnectionInfo, Sealed},
         peer::{
-            AcceptedFile, Cancel, CheckedFile, Entry, ErrorReport, Hello,
-            progress::TopEntry,
+            self, AcceptedFile, Cancel, CheckedFile, Entry, ErrorReport, Node, Offer,
+            checksum::{Algorithm, Digest},
             resume::{Conflict, ConflictPolicy, Local, Plan},
         },
-        relay::{ClientMessage, ErrorCode, Transport, VERSION},
+        relay::{self, ClientMessage, Transport, VERSION},
+        stats::{Platform, Report, Route},
     };
     use ts_rs::{Config, TS};
 
@@ -381,7 +402,7 @@ mod bindings {
             Nameplate::decl(&cfg),
             ClientMessage::decl(&cfg),
             ServerMessage::decl(&cfg),
-            ErrorCode::decl(&cfg),
+            relay::Error::decl(&cfg),
             Transport::decl(&cfg),
             Sealed::decl(&cfg),
             ConnectionInfo::decl(&cfg),
@@ -390,43 +411,42 @@ mod bindings {
             CodeError::decl(&cfg),
             SenderMessage::decl(&cfg),
             ReceiverMessage::decl(&cfg),
-            Hello::decl(&cfg),
             Cancel::decl(&cfg),
             ErrorReport::decl(&cfg),
+            Offer::decl(&cfg),
+            Node::decl(&cfg),
+            Algorithm::decl(&cfg),
             Entry::decl(&cfg),
+            Digest::decl(&cfg),
             AcceptedFile::decl(&cfg),
             CheckedFile::decl(&cfg),
             Fingerprint::decl(&cfg),
             peer::ErrorCode::decl(&cfg),
-            TopEntry::decl(&cfg),
             Local::decl(&cfg),
             ConflictPolicy::decl(&cfg),
             Conflict::decl(&cfg),
             Plan::decl(&cfg),
+            Report::decl(&cfg),
+            Platform::decl(&cfg),
+            Route::decl(&cfg),
         ];
         let header = format!(
             "// Generated by `cargo test -p fsend-proto-wasm`. Do not edit.\n\n\
              export const RELAY_VERSION = {VERSION};\n\
              export const CODE_LENGTH = {};\n\
              export const NAMEPLATE_LENGTH = {NAMEPLATE_LEN};\n\
-             export const PEER_VERSION = {};\n\
-             export const PEER_MIN_VERSION = {};\n\
-             export const RECV_WINDOW = {};\n\
-             export const MIN_RECV_WINDOW = {};\n\
+             export const WINDOW = {};\n\
+             export const MIN_WINDOW = {};\n\
              export const ACK_STEP = {};\n\
              export const ACK_INTERVAL_MS = {};\n\
-             export const HELLO_TIMEOUT_MS = {};\n\
              export const IDLE_TIMEOUT_MS = {};\n\
              export const GOODBYE_TIMEOUT_MS = {};\n\
              export const MAX_BLOCK_BYTES = {};\n",
             fsend_proto::code::CODE_LEN,
-            peer::VERSION,
-            peer::MIN_VERSION,
-            limits::RECV_WINDOW,
-            limits::MIN_RECV_WINDOW,
+            limits::WINDOW,
+            limits::MIN_WINDOW,
             limits::ACK_STEP,
             limits::ACK_INTERVAL.as_millis(),
-            limits::HELLO_TIMEOUT.as_millis(),
             limits::IDLE_TIMEOUT.as_millis(),
             limits::GOODBYE_TIMEOUT.as_millis(),
             limits::MAX_BLOCK_BYTES,

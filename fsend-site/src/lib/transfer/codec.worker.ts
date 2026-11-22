@@ -1,11 +1,11 @@
-import { BlockDecoder, loadProto } from "../proto";
-import { serve, type CodecRequest } from "./codec";
+import { loadProto } from "../proto";
+import { codecState, serve, type CodecRequest } from "./codec";
 
 await loadProto();
-const decoder = new BlockDecoder();
+const state = codecState();
 
 self.onmessage = (event: MessageEvent<CodecRequest>) => {
-    const response = serve(event.data, decoder);
+    const response = serve(event.data, state);
     const transfer =
         "frame" in response
             ? [response.frame.buffer]

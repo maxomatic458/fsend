@@ -1,11 +1,13 @@
 import init, * as wasm from "./pkg/fsend_proto_wasm";
 import type {
     AcceptedFile,
+    Algorithm,
     CheckedFile,
     ConflictPolicy,
     Entry,
     Fingerprint,
     Local,
+    Offer,
     PairingError,
     ParsedCode,
     Plan,
@@ -13,7 +15,6 @@ import type {
     Sealed,
     SenderMessage,
     ServerMessage,
-    TopEntry,
 } from "./generated/protocol";
 
 export * from "./generated/protocol";
@@ -49,6 +50,7 @@ const PAIRING_ERRORS: Record<PairingError, string> = {
     invalid_pake: "Pairing failed: the other side sent an invalid key exchange.",
     tampered: "Pairing failed: a message from the other side did not open.",
     malformed: "Pairing failed: the other side sent a malformed message.",
+    too_large: "Pairing failed: a message from the other side was too large.",
     unexpected_signal: "Pairing failed: unexpected message from the other side.",
 };
 
@@ -80,16 +82,23 @@ export class Pake {
     }
 }
 
-/** Seals messages for the peer and opens theirs, in order. */
+/** Seals messages for the peer and opens theirs, in order; a large one takes several frames. */
 export class Channel {
     constructor(private inner: wasm.Channel) {}
 
-    seal(message: Sealed): Bytes {
-        return this.inner.seal(JSON.stringify(message)) as Bytes;
+    seal(message: Sealed): Bytes[] {
+        return this.inner.seal(JSON.stringify(message)) as Bytes[];
     }
 
-    open(frame: Uint8Array): Sealed {
-        return JSON.parse(pairing(() => this.inner.open(frame)));
+    /** The frames of a plaintext from {@link encodeOffer}. */
+    sealPlaintext(plaintext: Uint8Array): Bytes[] {
+        return this.inner.sealPlaintext(plaintext) as Bytes[];
+    }
+
+    /** The message once `frame` completes one. */
+    open(frame: Uint8Array): Sealed | undefined {
+        const message = pairing(() => this.inner.open(frame));
+        return message === undefined ? undefined : JSON.parse(message);
     }
 }
 
@@ -151,19 +160,15 @@ export class BlockDecoder {
     }
 }
 
-/** Turns counts of data stream bytes into progress per top-level entry, in stream order. */
+/** Turns counts of data stream bytes into progress per accepted file, in stream order. */
 export class Progress {
     private inner: wasm.Progress;
 
-    constructor(entries: Entry[], files: AcceptedFile[], topOf: number[]) {
-        this.inner = new wasm.Progress(
-            JSON.stringify(entries),
-            JSON.stringify(files),
-            Uint32Array.from(topOf),
-        );
+    constructor(entries: Entry[], files: AcceptedFile[]) {
+        this.inner = new wasm.Progress(JSON.stringify(entries), JSON.stringify(files));
     }
 
-    /** The bytes of each top-level entry among the next `n`, as `[entry, bytes]`. */
+    /** The bytes of each file among the next `n`, as `[id, bytes]`. */
     advance(n: number): [number, number][] {
         const flat = this.inner.advance(n);
         const steps: [number, number][] = [];
@@ -172,17 +177,37 @@ export class Progress {
     }
 }
 
-/** The highest protocol version both sides speak. */
-export const negotiate = (version: number, minVersion: number): number | undefined =>
-    wasm.negotiate(version, minVersion);
+/** How each checksum algorithm is named to the user. */
+export const ALGORITHM_NAMES: Record<Algorithm, string> = { sha256: "SHA-256" };
 
-/** Throws unless `entries` follows the offer rules. */
-export const validateOffer = (entries: Entry[]): void =>
-    wasm.validateOffer(JSON.stringify(entries));
+/** Hashes a file's bytes as they come. */
+export class Hasher {
+    private inner: wasm.Hasher;
 
-/** The control frame of an offer of `entries`; throws unless they follow the offer rules. */
-export const encodeOffer = (entries: Entry[]): Bytes =>
-    wasm.encodeOffer(JSON.stringify(entries)) as Bytes;
+    constructor(algorithm: Algorithm) {
+        this.inner = new wasm.Hasher(algorithm);
+    }
+
+    update(data: Uint8Array): void {
+        this.inner.update(data);
+    }
+
+    /** The digest as lowercase hex; the hasher is spent. */
+    finish(): string {
+        return this.inner.finish();
+    }
+}
+
+/** Throws unless `offer` follows the offer rules. */
+export const validateOffer = (offer: Offer): void => wasm.validateOffer(JSON.stringify(offer));
+
+/** The sealed plaintext of `offer`; throws unless it follows the offer rules. */
+export const encodeOffer = (offer: Offer): Bytes =>
+    wasm.encodeOffer(JSON.stringify(offer)) as Bytes;
+
+/** Every entry of `offer` with its path, each folder before what it holds; an entry's id is its index. */
+export const flattenOffer = (offer: Offer): Entry[] =>
+    JSON.parse(wasm.flattenOffer(JSON.stringify(offer)));
 
 /** Throws unless `files` names files of `entries`, in order, with offsets within them. */
 export const checkAccept = (entries: Entry[], files: AcceptedFile[]): void =>
@@ -217,11 +242,3 @@ export const planReceive = (entries: Entry[], local: Local[], verified: number[]
 /** The files to accept under `policy`. */
 export const acceptPlan = (plan: Plan, policy: ConflictPolicy): AcceptedFile[] =>
     JSON.parse(wasm.acceptPlan(JSON.stringify(plan), JSON.stringify(policy)));
-
-/** The top-level entries of a valid offer, and the index of the one each entry lies in. */
-export const topEntries = (entries: Entry[]): [TopEntry[], number[]] =>
-    JSON.parse(wasm.topEntries(JSON.stringify(entries)));
-
-/** Bytes of each top-level entry already present once `files` are accepted. */
-export const presentBytes = (entries: Entry[], files: AcceptedFile[]): number[] =>
-    JSON.parse(wasm.presentBytes(JSON.stringify(entries), JSON.stringify(files)));

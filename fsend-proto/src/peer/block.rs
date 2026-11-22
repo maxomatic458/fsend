@@ -6,9 +6,8 @@ use super::limits::MAX_BLOCK_BYTES;
 /// Ahead of a compressed payload: the `u32 BE` count of file bytes in it.
 const RAW_LEN_BYTES: usize = 4;
 
-/// A data stream block of `data`, 1 to [`MAX_BLOCK_BYTES`] file bytes, framed
-/// like a control message. If `compress` and that helps, its payload is the
-/// count of file bytes and their zstd compression.
+/// 1 to [`MAX_BLOCK_BYTES`] file bytes, framed like a control message;
+/// compressed if `compress` and that helps.
 pub fn encode(data: &[u8], compress: bool) -> Vec<u8> {
     assert!(
         (1..=MAX_BLOCK_BYTES).contains(&data.len()),

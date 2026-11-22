@@ -7,7 +7,7 @@ use std::{
 use thiserror::Error;
 use zstd::bulk::Compressor;
 
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 
 use super::{
     Message,
@@ -55,7 +55,19 @@ pub fn encode(message: &impl Serialize) -> Result<Vec<u8>, FrameError> {
     Ok(frame)
 }
 
-/// The frame of `head` and the compressed `payload` if it is smaller than the raw frame of `payload`, else that one.
+/// A frame of `message` without its length, as sealed pairing messages carry it.
+pub fn encode_body(message: &impl Serialize) -> Result<Vec<u8>, FrameError> {
+    let mut frame = encode(message)?;
+    frame.drain(..HEADER_BYTES);
+    Ok(frame)
+}
+
+pub fn decode_body<M: DeserializeOwned>(body: &[u8]) -> Result<M, FrameError> {
+    let (&flags, payload) = body.split_first().ok_or(FrameError::Empty)?;
+    decode(flags, payload)
+}
+
+/// The frame of `head` and the compressed `payload`, or the raw frame of `payload` if that is smaller.
 pub(super) fn compact(head: &[u8], payload: &[u8]) -> Vec<u8> {
     // The compressed frame must beat the raw one; zstd needs a few bytes more room than it writes.
     let raw_len = HEADER_BYTES + 1 + payload.len();
@@ -73,7 +85,7 @@ pub(super) fn compact(head: &[u8], payload: &[u8]) -> Vec<u8> {
     frame
 }
 
-/// Appends `payload` compressed to `out`, within its spare room; false, leaving `out` as it was, if it does not fit.
+/// Appends `payload` compressed to `out` within its spare room; false if it does not fit.
 fn compress_into(payload: &[u8], out: &mut Vec<u8>) -> bool {
     let start = out.len();
     COMPRESSOR.with_borrow_mut(|compressor| {
@@ -93,7 +105,6 @@ fn compress_into(payload: &[u8], out: &mut Vec<u8>) -> bool {
     })
 }
 
-/// A frame of `flags` and the `payload` parts, joined.
 pub(super) fn frame(flags: u8, payload: &[&[u8]]) -> Vec<u8> {
     let len = payload.iter().map(|part| part.len()).sum::<usize>();
     let mut frame = Vec::with_capacity(HEADER_BYTES + 1 + len);
@@ -114,6 +125,8 @@ fn push_frame(out: &mut Vec<u8>, flags: u8, payload: &[&[u8]]) {
 #[derive(Debug)]
 pub(super) struct Deframer {
     buffer: Vec<u8>,
+    /// Where the bytes not taken yet start; taken ones go on the next push.
+    start: usize,
     max_len: usize,
 }
 
@@ -121,30 +134,38 @@ impl Deframer {
     pub(super) fn new(max_len: usize) -> Self {
         Self {
             buffer: Vec::new(),
+            start: 0,
             max_len,
         }
     }
 
     pub(super) fn push(&mut self, data: &[u8]) {
+        self.buffer.drain(..self.start);
+        self.start = 0;
         self.buffer.extend_from_slice(data);
+    }
+
+    fn rest(&self) -> &[u8] {
+        &self.buffer[self.start..]
     }
 
     /// Whether no partial frame is buffered.
     pub(super) fn is_empty(&self) -> bool {
-        self.buffer.is_empty()
+        self.rest().is_empty()
     }
 
     /// The length of the first buffered frame, once its header is in, and its bytes so far.
     pub(super) fn first(&self) -> Option<(usize, &[u8])> {
-        let header = self.buffer.first_chunk::<HEADER_BYTES>()?;
+        let rest = self.rest();
+        let header = rest.first_chunk::<HEADER_BYTES>()?;
         let len = u32::from_be_bytes(*header) as usize;
-        let end = self.buffer.len().min(HEADER_BYTES + len);
-        Some((len, &self.buffer[HEADER_BYTES..end]))
+        let end = rest.len().min(HEADER_BYTES + len);
+        Some((len, &rest[HEADER_BYTES..end]))
     }
 
-    /// The flags and payload of the next complete frame.
     pub(super) fn next(&mut self) -> Result<Option<(u8, Vec<u8>)>, FrameError> {
-        let Some(header) = self.buffer.first_chunk::<HEADER_BYTES>() else {
+        let rest = self.rest();
+        let Some(header) = rest.first_chunk::<HEADER_BYTES>() else {
             return Ok(None);
         };
         let len = u32::from_be_bytes(*header) as usize;
@@ -154,11 +175,11 @@ impl Deframer {
         if len > self.max_len {
             return Err(FrameError::TooLarge(len));
         }
-        let Some(frame) = self.buffer.get(HEADER_BYTES + 1..HEADER_BYTES + len) else {
+        let Some(frame) = rest.get(HEADER_BYTES + 1..HEADER_BYTES + len) else {
             return Ok(None);
         };
-        let next = (self.buffer[HEADER_BYTES], frame.to_vec());
-        self.buffer.drain(..HEADER_BYTES + len);
+        let next = (rest[HEADER_BYTES], frame.to_vec());
+        self.start += HEADER_BYTES + len;
         Ok(Some(next))
     }
 }
@@ -187,7 +208,7 @@ impl FrameDecoder {
     }
 }
 
-fn decode<M: Message>(flags: u8, payload: &[u8]) -> Result<M, FrameError> {
+fn decode<M: DeserializeOwned>(flags: u8, payload: &[u8]) -> Result<M, FrameError> {
     let json = match flags {
         0 => Cow::Borrowed(payload),
         ZSTD => Cow::Owned(decompress(payload)?),
@@ -214,9 +235,7 @@ fn decompress(payload: &[u8]) -> Result<Vec<u8>, FrameError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::peer::{
-        AcceptedFile, Entry, ErrorCode, ErrorReport, ReceiverMessage, SenderMessage,
-    };
+    use crate::peer::{AcceptedFile, ErrorCode, ErrorReport, ReceiverMessage, SenderMessage};
 
     fn decode_all<M: Message>(bytes: &[u8]) -> Result<Vec<M>, FrameError> {
         let mut decoder = FrameDecoder::default();
@@ -228,19 +247,19 @@ mod tests {
         Ok(out)
     }
 
-    /// Frames from the receiver.
     fn from_receiver(bytes: &[u8]) -> Result<Vec<ReceiverMessage>, FrameError> {
         decode_all(bytes)
     }
 
-    fn big_offer(files: usize) -> SenderMessage {
-        SenderMessage::Offer {
-            entries: (0..files)
-                .map(|i| Entry::File {
-                    path: vec![format!("file-{i}.bin")],
-                    size: i as u64,
+    fn big_accept(files: u32) -> ReceiverMessage {
+        ReceiverMessage::Accept {
+            files: (0..files)
+                .map(|id| AcceptedFile {
+                    id,
+                    offset: id as u64 * 7,
                 })
                 .collect(),
+            window: 1 << 20,
         }
     }
 
@@ -259,11 +278,26 @@ mod tests {
 
     #[test]
     fn large_messages_are_compressed_and_round_trip() {
-        let offer = big_offer(5000);
-        let frame = encode(&offer).unwrap();
+        let accept = big_accept(5000);
+        let frame = encode(&accept).unwrap();
         assert_eq!(frame[4], ZSTD);
-        assert!(frame.len() < serde_json::to_vec(&offer).unwrap().len() / 2);
-        assert_eq!(decode_all(&frame), Ok(vec![offer]));
+        assert!(frame.len() < serde_json::to_vec(&accept).unwrap().len() / 2);
+        assert_eq!(decode_all(&frame), Ok(vec![accept]));
+    }
+
+    #[test]
+    fn bodies_are_frames_without_the_length() {
+        for message in [ReceiverMessage::Done, big_accept(5000)] {
+            let frame = encode(&message).unwrap();
+            let body = encode_body(&message).unwrap();
+            assert_eq!(body, frame[HEADER_BYTES..]);
+            assert_eq!(decode_body(&body), Ok(message));
+        }
+        assert_eq!(decode_body::<ReceiverMessage>(&[]), Err(FrameError::Empty));
+        assert_eq!(
+            decode_body::<ReceiverMessage>(&[2, b'{', b'}']),
+            Err(FrameError::Flags(2))
+        );
     }
 
     #[test]
@@ -272,6 +306,7 @@ mod tests {
             ReceiverMessage::Done,
             ReceiverMessage::Accept {
                 files: (0..300).map(|id| AcceptedFile { id, offset: 0 }).collect(),
+                window: 1 << 20,
             },
             ReceiverMessage::Ack { bytes: 7 },
         ];
@@ -309,7 +344,7 @@ mod tests {
             br#"{"type":"ack"}"#,
             // An unknown type, and one only the sender sends.
             br#"{"type":"later","x":[1]}"#,
-            br#"{"type":"offer","entries":[]}"#,
+            br#"{"type":"hashes","hashes":[]}"#,
             // Flags without a payload.
             b"",
         ] {

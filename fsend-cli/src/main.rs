@@ -1,8 +1,8 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
 
 use clap::Parser;
+use color_eyre::eyre::eyre;
 use colored::Colorize;
 use dialoguer::theme::ColorfulTheme;
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -11,20 +11,22 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use cli::{Args, Mode, OnConflict};
-use fsend_core::connect::{connect_as_receiver, connect_as_sender};
-use fsend_core::relay::{pair_as_receiver, pair_as_sender};
-use fsend_core::transfer::{
-    self, Answer, ConnectionKind, Event, TransferError, build_offer, missing_paths,
+use config::{Config, ConfigError};
+use fsend_core::{
+    CancellationToken, Client, ConnectionKind, Error, Event, Outgoing, ReceiveHandler, async_trait,
+    build_offer,
 };
-use fsend_core::{CancellationToken, Error};
 use fsend_proto::code::Code;
+use fsend_proto::peer::checksum::{self, Algorithm};
 use fsend_proto::peer::resume::{Conflict, ConflictPolicy};
-use fsend_proto::peer::{self, Entry, progress::TopEntry};
+use fsend_proto::peer::{AcceptedFile, Entry, Node, Offer};
+use fsend_proto::relay;
+use fsend_proto::stats::Platform;
 use url::Url;
 
 mod cli;
+mod config;
 
-/// How this client introduces itself to the peer.
 const APP: &str = concat!("fsend-cli ", env!("CARGO_PKG_VERSION"));
 
 #[tokio::main]
@@ -33,9 +35,12 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     };
 
-    match report.downcast_ref::<Error>().and_then(user_error) {
-        Some(msg) => eprintln!("{msg}"),
-        None => eprintln!("{report:?}"),
+    if let Some(error) = report.downcast_ref::<Error>() {
+        eprintln!("{} {}", "error:".red(), printable(&error.to_string()));
+    } else if let Some(error) = report.downcast_ref::<ConfigError>() {
+        eprintln!("{} {error}", "error:".red());
+    } else {
+        eprintln!("{report:?}");
     }
 
     ExitCode::FAILURE
@@ -44,48 +49,69 @@ async fn main() -> ExitCode {
 async fn run() -> color_eyre::Result<()> {
     let args = Args::parse();
     color_eyre::install()?;
+    let config_path = args.config.clone().or_else(config::default_path);
+    let config = Config::load(args.config.as_deref())?.with_args(&args);
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
-        .with(log_filter(args.log_level))
+        .with(log_filter(config.log_level))
         .init();
 
+    let client = Client {
+        server_url: config.server_url,
+        app: APP.into(),
+        platform: Platform::Cli,
+        telemetry: config.telemetry,
+    };
     match args.mode {
         Mode::Send {
             files,
             no_compression,
-        } => run_send(&args.relay_url, &args.download_url, files, !no_compression).await?,
+            ..
+        } => {
+            run_send(
+                &client,
+                &config.download_url,
+                files,
+                !no_compression,
+                config.checksums,
+            )
+            .await?
+        }
         Mode::Receive {
             on_conflict,
             output_dir,
             code,
             auto_accept,
         } => {
-            let on_conflict = on_conflict.unwrap_or(match auto_accept {
-                true => OnConflict::Skip,
-                false => OnConflict::Ask,
-            });
-            run_receive(&args.relay_url, code, output_dir, on_conflict, auto_accept).await?
+            let receiver = Receiver {
+                auto_accept,
+                on_conflict: on_conflict.unwrap_or(match auto_accept {
+                    true => OnConflict::Skip,
+                    false => OnConflict::Ask,
+                }),
+                progress: None,
+                checksums: false,
+            };
+            run_receive(&client, code, output_dir, receiver).await?
         }
-        Mode::Version => print_version(),
+        Mode::Version => print_version(config_path.as_deref()),
+        Mode::Config => match config_path {
+            Some(path) => println!("{}", path.display()),
+            None => return Err(eyre!("this system has no config directory")),
+        },
     }
 
     Ok(())
 }
 
-/// What to tell the user about `error`, if they can act on it.
-fn user_error(error: &Error) -> Option<String> {
-    let message = match error {
-        Error::Transfer(TransferError::Declined) => return Some("Transfer declined.".into()),
-        Error::Transfer(TransferError::PathsNotFound(paths)) => {
-            let list: String = paths
-                .iter()
-                .map(|p| format!("\n - {}", p.display().to_string().blue()))
-                .collect();
-            format!("{}:{list}", missing_paths(paths.len()))
-        }
-        error => error.user_message()?,
-    };
-    Some(format!("{} {message}", "error:".red()))
+/// `text` with control characters escaped: the peer may have written part of it.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| match c.is_control() {
+            true => c.escape_unicode().to_string(),
+            false => c.to_string(),
+        })
+        .collect()
 }
 
 /// At error level, libraries are silenced: webrtc logs errors that are not.
@@ -101,177 +127,304 @@ fn log_filter(level: tracing::Level) -> Targets {
         .with_target("fsend", own)
 }
 
-fn print_version() {
+/// The versions, and which config file is read.
+fn print_version(config: Option<&Path>) {
+    let config = match config {
+        Some(path) if path.exists() => path.display().to_string(),
+        Some(path) => format!("{} (not found)", path.display()),
+        None => "none".into(),
+    };
     let rows = [
         ("fsend-cli", env!("CARGO_PKG_VERSION").to_owned()),
-        ("protocol", peer::VERSION.to_string()),
+        ("protocol", relay::VERSION.to_string()),
+        ("config", config),
     ];
-
     for (label, value) in rows {
         println!("{:<10} {}", label, value.bright_white());
     }
 }
 
 async fn run_send(
-    relay_url: &Url,
+    client: &Client,
     download_url: &Url,
     files: Vec<PathBuf>,
     compress: bool,
+    checksums: Option<Algorithm>,
 ) -> Result<(), Error> {
-    let outgoing = build_offer(&files)?;
+    let mut outgoing = build_offer(&files)?;
+    if let Some(algorithm) = checksums {
+        add_checksums(&mut outgoing, algorithm).await?;
+    }
 
-    let mut relay = pair_as_sender(relay_url, APP, |code| {
-        let link = code.link(download_url.as_str());
-        let code = code.to_string();
-        println!("Code: {}\n", code.bright_white());
-        println!("On the other peer, run:\n");
-        println!("  {} {}\n", "fsend receive".yellow(), code.yellow());
-        println!("or open in a browser:\n");
-        println!("  {}\n", link.blue());
-    })
-    .await?;
-
-    let mut transport = connect_as_sender(&mut relay).await?;
-    drop(relay);
-    announce_connection(transport.as_ref()).await;
-
-    let mut progress = Progress::default();
-    transfer::send_files(
-        transport.as_mut(),
-        &outgoing,
-        compress,
-        &mut |event| progress.on_event(event),
-        CancellationToken::new(),
-    )
-    .await?;
+    let mut progress = Progress::new(outgoing.offer());
+    let mut on_event = |event: Event<'_>| match event {
+        Event::Code(code) => show_code(code, download_url),
+        Event::Paired => println!("Waiting for peer to accept files..."),
+        event => progress.on_event(event),
+    };
+    let cancel = CancellationToken::new();
+    client
+        .send(&outgoing, compress, &mut on_event, cancel)
+        .await?;
 
     println!("\nTransfer complete.");
     Ok(())
+}
+
+fn show_code(code: &Code, download_url: &Url) {
+    let link = code.link(download_url.as_str());
+    let code = code.to_string();
+    println!("Code: {}\n", code.bright_white());
+    println!("On the other peer, run:\n");
+    println!("  {} {}\n", "fsend receive".yellow(), code.yellow());
+    println!("or open in a browser:\n");
+    println!("  {}\n", link.blue());
 }
 
 async fn run_receive(
-    relay_url: &Url,
+    client: &Client,
     code: Code,
     output_dir: PathBuf,
-    on_conflict: OnConflict,
-    auto_accept: bool,
+    mut receiver: Receiver,
 ) -> Result<(), Error> {
-    let mut relay = pair_as_receiver(relay_url, APP, &code).await?;
-    let mut transport = connect_as_receiver(&mut relay).await?;
-    drop(relay);
-    announce_connection(transport.as_ref()).await;
+    let cancel = CancellationToken::new();
+    client
+        .receive(&code, &output_dir, &mut receiver, cancel)
+        .await?;
 
-    let mut progress = Progress::default();
-    // The prompts block, so they leave the async workers to the transfer.
-    let mut decide = Answer {
-        accept: |offered: &[TopEntry]| {
-            if auto_accept {
-                println!("Auto-accepting files.");
-                Some(output_dir.clone())
-            } else if tokio::task::block_in_place(|| accept_files(offered)) {
-                Some(output_dir.clone())
-            } else {
-                None
-            }
-        },
-        resolve: |entries: &[Entry], conflicts: &[Conflict]| {
-            tokio::task::block_in_place(|| resolve_conflicts(entries, conflicts, on_conflict))
-        },
-    };
-    transfer::receive_files(
-        transport.as_mut(),
-        &mut decide,
-        &mut |event| progress.on_event(event),
-        CancellationToken::new(),
-    )
-    .await?;
-
+    if receiver.checksums {
+        println!("\nChecksums verified for every received file.");
+    }
     println!("\nTransfer complete.");
     Ok(())
 }
 
-async fn announce_connection(transport: &dyn transfer::Transport) {
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    println!(
-        "Connection type: {}",
-        colorize_conn_type(transport.connection_kind())
-    );
+struct Receiver {
+    auto_accept: bool,
+    on_conflict: OnConflict,
+    progress: Option<Progress>,
+    checksums: bool,
 }
 
-#[derive(Default)]
-struct Progress(Option<CliProgressBars>);
+// The prompts block, so they run off the async workers.
+#[async_trait]
+impl ReceiveHandler for Receiver {
+    async fn accept(&mut self, offer: &Offer) -> bool {
+        self.progress = Some(Progress::new(offer));
+        self.checksums = offer.checksums.is_some();
+        if self.auto_accept {
+            println!("Auto-accepting files.");
+            return true;
+        }
+        tokio::task::block_in_place(|| accept_files(offer))
+    }
+
+    async fn resolve(&mut self, entries: &[Entry], conflicts: &[Conflict]) -> ConflictPolicy {
+        tokio::task::block_in_place(|| resolve_conflicts(entries, conflicts, self.on_conflict))
+    }
+
+    fn event(&mut self, event: Event<'_>) {
+        if let Some(progress) = &mut self.progress {
+            progress.on_event(event);
+        }
+    }
+}
+
+async fn add_checksums(outgoing: &mut Outgoing, algorithm: Algorithm) -> Result<(), Error> {
+    let bar = byte_bar(outgoing.size(), "Computing checksums", "green");
+    outgoing
+        .add_checksums(algorithm, &mut |done| bar.set_position(done))
+        .await?;
+    bar.finish_and_clear();
+    Ok(())
+}
+
+fn byte_bar(total: u64, prefix: &'static str, color: &str) -> ProgressBar {
+    let template = format!(
+        "{{spinner:.green}} {{prefix}} [{{bar:40.{color}/blue}}] {{bytes}}/{{total_bytes}} ({{eta}})"
+    );
+    let bar = ProgressBar::new(total);
+    bar.set_style(
+        ProgressStyle::default_bar()
+            .template(&template)
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+    bar.set_prefix(prefix);
+    bar
+}
+
+/// A bar per offered entry.
+struct Progress {
+    tops: Vec<(String, u64)>,
+    /// By file id: its size and the offered entry it is under.
+    files: Vec<(u64, usize)>,
+    verifying: Option<ProgressBar>,
+    bars: Option<CliProgressBars>,
+}
 
 impl Progress {
+    fn new(offer: &Offer) -> Self {
+        let tops = (offer.entries.iter())
+            .map(|node| (node.name().to_owned(), node.size()))
+            .collect();
+        // Ids count every entry in offer order, each folder before what it holds.
+        fn walk(nodes: &[Node], top: usize, files: &mut Vec<(u64, usize)>) {
+            for node in nodes {
+                match node {
+                    Node::File { size, .. } => files.push((*size, top)),
+                    Node::Dir { entries, .. } => {
+                        files.push((0, top));
+                        walk(entries, top, files);
+                    }
+                }
+            }
+        }
+        let mut files = Vec::new();
+        for (top, node) in offer.entries.iter().enumerate() {
+            walk(std::slice::from_ref(node), top, &mut files);
+        }
+        Self {
+            tops,
+            files,
+            verifying: None,
+            bars: None,
+        }
+    }
+
+    /// Bytes already there of each offered entry.
+    fn present(&self, accepted: &[AcceptedFile]) -> Vec<u64> {
+        let mut present: Vec<_> = self.tops.iter().map(|(_, size)| *size).collect();
+        for file in accepted {
+            let (size, top) = self.files[file.id as usize];
+            present[top] -= size - file.offset;
+        }
+        present
+    }
+
     fn on_event(&mut self, event: Event) {
         match event {
-            Event::Offered => println!("Waiting for peer to accept files..."),
-            Event::Started { entries, present } => {
-                let (here, total) = (
-                    present.iter().sum::<u64>(),
-                    entries.iter().map(|e| e.size).sum(),
-                );
+            Event::Connected(kind) => println!("Connection type: {}", colorize_conn_type(kind)),
+            Event::Verifying { done, total } => self
+                .verifying
+                .get_or_insert_with(|| byte_bar(total, "Verifying existing files", "cyan"))
+                .set_position(done),
+            Event::Started(accepted) => {
+                if let Some(bar) = self.verifying.take() {
+                    bar.finish_and_clear();
+                }
+                let present = self.present(accepted);
+                let here: u64 = present.iter().sum();
                 if here > 0 {
+                    let total = self.tops.iter().map(|(_, size)| size).sum();
                     println!(
                         "Already there: {} of {}",
                         HumanBytes(here),
                         HumanBytes(total)
                     );
                 }
-                let initial: Vec<_> = entries
-                    .iter()
-                    .zip(present)
-                    .map(|(entry, present)| (entry.name.clone(), *present, entry.size))
+                let initial: Vec<_> = (self.tops.iter().zip(present))
+                    .map(|((name, size), present)| (name.clone(), present, *size))
                     .collect();
-                self.0 = Some(CliProgressBars::new(&initial));
+                self.bars = Some(CliProgressBars::new(&initial));
             }
-            Event::Progress { entry, bytes } => {
-                if let Some(bars) = &mut self.0 {
-                    bars.update(entry, bytes);
+            Event::Progress { id, bytes } => {
+                if let Some(bars) = &mut self.bars {
+                    bars.update(self.files[id as usize].1, bytes);
                 }
             }
+            Event::Code(_) | Event::Paired => {}
         }
     }
 }
 
-fn accept_files(files: &[TopEntry]) -> bool {
+fn accept_files(offer: &Offer) -> bool {
     println!("The following files will be received:\n");
 
-    let longest = files
-        .iter()
-        .map(|f| f.name.chars().count())
+    let longest = (offer.entries.iter())
+        .map(|node| node.name().chars().count())
         .max()
         .unwrap_or(0)
         + 1;
-    let total_size: u64 = files.iter().map(|f| f.size).sum();
+    let total_size: u64 = offer.entries.iter().map(Node::size).sum();
 
-    for file in files {
-        let size_str = HumanBytes(file.size).to_string();
-        let name = &file.name;
-        let display = if file.dir {
+    for node in &offer.entries {
+        let size_str = HumanBytes(node.size()).to_string();
+        let name = node.name();
+        let display = if node.is_dir() {
             format!("{}/", name).blue()
         } else {
             format!("{} ", name).blue()
         };
-        println!(
+        let line = format!(
             " - {:<width$} {:>10}",
             display,
             size_str.red(),
             width = longest
         );
+        match (node, offer.checksums) {
+            (Node::Dir { .. }, _) => println!("{line}  {}", files_in(node.files()).dimmed()),
+            (
+                Node::File {
+                    checksum: Some(digest),
+                    ..
+                },
+                Some(algorithm),
+            ) => {
+                println!("{line}\n     {} {digest}", algorithm.to_string().dimmed())
+            }
+            (Node::File { .. }, _) => println!("{line}"),
+        }
     }
 
-    println!(
-        "\nTotal size: {}\n",
-        HumanBytes(total_size).to_string().red()
-    );
+    println!("\nTotal size: {}", HumanBytes(total_size).to_string().red());
+    if let Some(algorithm) = offer.checksums {
+        println!("Checksums: {algorithm} for every file, checked as the files arrive.");
+    }
+    println!();
 
-    dialoguer::Confirm::with_theme(&ColorfulTheme::default())
-        .with_prompt("Accept these files?")
-        .interact()
-        .unwrap_or(false)
+    // Top-level files show everything there is already.
+    let mut choices = vec!["Accept", "Decline"];
+    if offer.entries.iter().any(Node::is_dir) {
+        choices.push("List All Files");
+    }
+    loop {
+        let choice = dialoguer::Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Accept these files?")
+            .items(&choices)
+            .default(0)
+            .interact()
+            .unwrap_or(1);
+        match choice {
+            0 => return true,
+            2 => list_files(offer),
+            _ => return false,
+        }
+    }
 }
 
-/// Lists the conflicts and picks what to do with them.
+fn files_in(count: u64) -> String {
+    match count {
+        1 => "1 file".into(),
+        n => format!("{n} files"),
+    }
+}
+
+/// In `sha256sum` format if it has checksums.
+fn list_files(offer: &Offer) {
+    println!();
+    match checksum::listing(offer) {
+        Some(listing) => print!("{listing}"),
+        None => {
+            for entry in offer.flatten().iter().filter(|entry| !entry.is_dir()) {
+                let size = HumanBytes(entry.size()).to_string();
+                println!("{size:>10}  {}", entry.path().join("/"));
+            }
+        }
+    }
+    println!();
+}
+
 fn resolve_conflicts(
     entries: &[Entry],
     conflicts: &[Conflict],
@@ -394,7 +547,7 @@ impl CliProgressBars {
 fn colorize_conn_type(kind: ConnectionKind) -> String {
     let name = kind.to_string();
     match kind {
-        ConnectionKind::Direct | ConnectionKind::WebRtc => name.green().to_string(),
+        ConnectionKind::Direct => name.green().to_string(),
         ConnectionKind::Relay => name.yellow().to_string(),
         ConnectionKind::Unknown => name.red().to_string(),
     }
@@ -444,12 +597,83 @@ mod tests {
     }
 
     #[test]
+    fn files_count_toward_their_offered_entry() {
+        let file = |name: &str, size| Node::File {
+            name: name.into(),
+            size,
+            checksum: None,
+        };
+        let offer = Offer {
+            checksums: None,
+            entries: vec![
+                Node::Dir {
+                    name: "d".into(),
+                    entries: vec![file("a", 10), file("b", 20)],
+                },
+                file("c", 5),
+            ],
+        };
+        let mut progress = Progress::new(&offer);
+        assert_eq!(progress.files, [(0, 0), (10, 0), (20, 0), (5, 1)]);
+
+        // a is complete, b half there, c new.
+        let at = |id, offset| AcceptedFile { id, offset };
+        assert_eq!(progress.present(&[at(2, 10), at(3, 0)]), [20, 0]);
+
+        progress.on_event(Event::Started(&[at(2, 10), at(3, 0)]));
+        progress.on_event(Event::Progress { id: 2, bytes: 4 });
+        progress.on_event(Event::Progress { id: 3, bytes: 5 });
+        let bars = &progress.bars.unwrap().bars;
+        assert_eq!(bars[0].position(), 24);
+        assert_eq!(bars[1].position(), 5);
+    }
+
+    #[test]
+    fn peer_text_cannot_steer_the_terminal() {
+        assert_eq!(
+            printable("left\u{1b}[2J\u{7}\nüber"),
+            "left\\u{1b}[2J\\u{7}\\u{a}über"
+        );
+    }
+
+    #[test]
+    fn checksums_take_an_optional_algorithm() {
+        let parse = |args: &[&str]| {
+            let args = ["fsend", "send"].iter().chain(args);
+            match Args::try_parse_from(args).map(|args| args.mode) {
+                Ok(Mode::Send {
+                    files, checksums, ..
+                }) => Ok((files.len(), checksums)),
+                Ok(_) => unreachable!("a send"),
+                Err(e) => Err(e.kind()),
+            }
+        };
+        let sha256 = Some(Algorithm::Sha256);
+        assert_eq!(parse(&["a"]), Ok((1, None)));
+        // A path after the bare flag is not its value.
+        assert_eq!(parse(&["--checksums", "a"]), Ok((1, sha256)));
+        assert_eq!(parse(&["a", "--checksums=sha256"]), Ok((1, sha256)));
+        assert_eq!(parse(&["--checksums=none", "a"]), Ok((1, None)));
+        assert_eq!(
+            parse(&["--checksums=md5", "a"]),
+            Err(clap::error::ErrorKind::ValueValidation)
+        );
+    }
+
+    #[test]
+    fn the_config_command_takes_the_named_file() {
+        let parse = |args: &[&str]| Args::try_parse_from(args).unwrap();
+        assert!(matches!(parse(&["fsend", "config"]).mode, Mode::Config));
+        let named = parse(&["fsend", "config", "--config", "my.toml"]);
+        assert_eq!(named.config, Some(PathBuf::from("my.toml")));
+    }
+
+    #[test]
     fn connection_types_keep_their_names() {
         colored::control::set_override(false);
         for (kind, name) in [
             (ConnectionKind::Direct, "Direct"),
             (ConnectionKind::Relay, "Relay"),
-            (ConnectionKind::WebRtc, "WebRTC"),
             (ConnectionKind::Unknown, "Unknown"),
         ] {
             assert_eq!(colorize_conn_type(kind), name);

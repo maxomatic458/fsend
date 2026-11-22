@@ -1,67 +1,127 @@
-import { fingerprint, fingerprintRanges, type Entry, type Fingerprint } from "../proto";
+import {
+    fingerprint,
+    fingerprintRanges,
+    type AcceptedFile,
+    type Entry,
+    type Fingerprint,
+    type Node,
+    type Offer,
+} from "../proto";
 import type { SelectedEntry } from "../types";
 
 /** What a file entry reads from; only its size and slices are used. */
 export type Source = Pick<Blob, "size" | "slice">;
 
-/** The offer for a selection, parents first, and the source of each file by id. */
+/** The offer for a selection, and the source of each entry by id; `null` for a folder. */
 export interface Outgoing {
-    entries: Entry[];
+    offer: Offer;
     files: (Source | null)[];
 }
 
-export async function buildOffer(selected: SelectedEntry[]): Promise<Outgoing> {
-    const out: Outgoing = { entries: [], files: [] };
-    const addFile = (path: string[], file: Source) => {
-        out.entries.push({ kind: "file", path, size: file.size });
-        out.files.push(file);
-    };
-    const addDir = (path: string[]) => {
-        out.entries.push({ kind: "dir", path });
-        out.files.push(null);
-    };
+/** A file or folder of the selection, before it is sorted into the offer. */
+interface Item {
+    name: string;
+    file?: Source;
+    children?: Map<string, Item>;
+}
 
-    const walk = async (dir: FileSystemDirectoryHandle, path: string[]) => {
-        addDir(path);
-        for await (const [, child] of dir.entries()) {
-            const childPath = [...path, child.name];
-            if (child.kind === "file") {
-                addFile(childPath, await (child as FileSystemFileHandle).getFile());
-            } else {
-                await walk(child as FileSystemDirectoryHandle, childPath);
-            }
-        }
-    };
-
-    for (const entry of selected) {
-        if (entry.kind === "file") {
-            const file = "file" in entry ? entry.file : await entry.handle.getFile();
-            addFile([entry.name], file);
-        } else if ("handle" in entry) {
-            await walk(entry.handle, [entry.name]);
-        } else {
-            addDir([entry.name]);
-            const dirs = new Set<string>();
-            for (const { relativePath, file } of entry.files) {
-                const parts = relativePath.split("/");
-                for (let depth = 1; depth < parts.length; depth++) {
-                    const dir = parts.slice(0, depth);
-                    if (dirs.has(dir.join("/"))) continue;
-                    dirs.add(dir.join("/"));
-                    addDir([entry.name, ...dir]);
-                }
-                addFile([entry.name, ...parts], file);
-            }
-        }
+/** Orders names by code point, as the CLI does, so every sender lists a tree alike. */
+export function byName(a: string, b: string): number {
+    let i = 0;
+    let j = 0;
+    while (i < a.length && j < b.length) {
+        const x = a.codePointAt(i)!;
+        const y = b.codePointAt(j)!;
+        if (x !== y) return x - y;
+        i += x > 0xffff ? 2 : 1;
+        j += y > 0xffff ? 2 : 1;
     }
+    return Number(i < a.length) - Number(j < b.length);
+}
+
+/** The offer of `selected`, sorted by name at every level. */
+export async function buildOffer(selected: SelectedEntry[]): Promise<Outgoing> {
+    const items = await Promise.all(selected.map(itemOf));
+    items.sort((a, b) => byName(a.name, b.name));
+    const out: Outgoing = { offer: { entries: [] }, files: [] };
+    for (const item of items) out.offer.entries.push(nodeOf(item, out.files));
     return out;
+}
+
+async function itemOf(entry: SelectedEntry): Promise<Item> {
+    if (entry.kind === "file") {
+        return {
+            name: entry.name,
+            file: "file" in entry ? entry.file : await entry.handle.getFile(),
+        };
+    }
+    if ("handle" in entry) return walk(entry.name, entry.handle);
+    const root: Item = { name: entry.name, children: new Map() };
+    for (const { relativePath, file } of entry.files) {
+        const parts = relativePath.split("/");
+        let dir = root;
+        for (const part of parts.slice(0, -1)) {
+            let next = dir.children!.get(part);
+            if (!next) {
+                next = { name: part, children: new Map() };
+                dir.children!.set(part, next);
+            }
+            dir = next;
+        }
+        const name = parts[parts.length - 1];
+        dir.children!.set(name, { name, file });
+    }
+    return root;
+}
+
+async function walk(name: string, dir: FileSystemDirectoryHandle): Promise<Item> {
+    const children = new Map<string, Item>();
+    for await (const [, child] of dir.entries()) {
+        children.set(
+            child.name,
+            child.kind === "file"
+                ? { name: child.name, file: await (child as FileSystemFileHandle).getFile() }
+                : await walk(child.name, child as FileSystemDirectoryHandle),
+        );
+    }
+    return { name, children };
+}
+
+/** The node of `item`; its sources follow in offer order. */
+function nodeOf(item: Item, files: (Source | null)[]): Node {
+    files.push(item.file ?? null);
+    if (item.file) return { kind: "file", name: item.name, size: item.file.size };
+    const children = [...item.children!.values()].sort((a, b) => byName(a.name, b.name));
+    return { kind: "dir", name: item.name, entries: children.map((child) => nodeOf(child, files)) };
 }
 
 /** Zero for a directory. */
 export const entrySize = (entry: Entry): number => (entry.kind === "file" ? entry.size : 0);
 
-export const offerSizeBytes = (entries: Entry[]): number =>
-    entries.reduce((total, entry) => total + entrySize(entry), 0);
+/** Bytes of the files a node is or holds. */
+export const nodeSize = (node: Node): number =>
+    node.kind === "file" ? node.size : node.entries.reduce((n, child) => n + nodeSize(child), 0);
+
+export const offerSize = (offer: Offer): number =>
+    offer.entries.reduce((n, node) => n + nodeSize(node), 0);
+
+/** The files a node is or holds. */
+export const nodeFiles = (node: Node): number =>
+    node.kind === "file" ? 1 : node.entries.reduce((n, child) => n + nodeFiles(child), 0);
+
+/** The top-level entry each entry lies in, by id. */
+export function topIndices(entries: Entry[]): number[] {
+    let top = -1;
+    return entries.map((entry) => (entry.path.length === 1 ? ++top : top));
+}
+
+/** Bytes of each top-level entry already there once `files` are accepted. */
+export function presentBytes(offer: Offer, entries: Entry[], files: AcceptedFile[]): number[] {
+    const present = offer.entries.map(nodeSize);
+    const topOf = topIndices(entries);
+    for (const { id, offset } of files) present[topOf[id]] -= entrySize(entries[id]) - offset;
+    return present;
+}
 
 /** The fingerprint of the first `len` bytes of `source`. */
 export async function fingerprintOf(source: Source, len: number): Promise<Fingerprint> {

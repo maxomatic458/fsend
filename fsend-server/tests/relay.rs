@@ -1,111 +1,15 @@
 use std::time::Duration;
 
-use fsend_relay::{Config, MAX_MESSAGE_BYTES, MAX_SIGNALS};
+use axum::http::HeaderName;
+use fsend_proto::relay::{MAX_FRAME_BYTES, MAX_SIGNAL_BYTES, VERSION};
+use fsend_server::Config;
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
-use tokio::{net::TcpListener, time::timeout};
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{Error, Message},
-};
+use serde_json::json;
+use tokio::time::timeout;
+use tokio_tungstenite::tungstenite::{Error, Message};
 
-async fn start(config: Config) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}/relay", listener.local_addr().unwrap());
-    tokio::spawn(fsend_relay::serve(listener, config));
-    url
-}
-
-struct Client(WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>);
-
-impl Client {
-    async fn connect(url: &str) -> Self {
-        Self(connect_async(url).await.unwrap().0)
-    }
-
-    async fn send(&mut self, message: Value) {
-        self.0
-            .send(Message::text(message.to_string()))
-            .await
-            .unwrap();
-    }
-
-    async fn send_binary(&mut self, data: &[u8]) {
-        self.0.send(Message::binary(data.to_vec())).await.unwrap();
-    }
-
-    /// The next text or binary frame, or `None` once the relay closed.
-    async fn frame(&mut self) -> Option<Message> {
-        loop {
-            let frame = timeout(Duration::from_secs(5), self.0.next())
-                .await
-                .expect("the relay should answer");
-            match frame {
-                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return None,
-                Some(Ok(other)) => return Some(other),
-            }
-        }
-    }
-
-    /// The next JSON frame, or `None` once the relay closed.
-    async fn next(&mut self) -> Option<Value> {
-        match self.frame().await? {
-            Message::Text(text) => Some(serde_json::from_str(&text).unwrap()),
-            other => panic!("expected a text frame, got {other:?}"),
-        }
-    }
-
-    async fn recv(&mut self) -> Value {
-        self.next().await.expect("a frame, not a close")
-    }
-
-    async fn recv_binary(&mut self) -> Vec<u8> {
-        match self.frame().await {
-            Some(Message::Binary(data)) => data.to_vec(),
-            other => panic!("expected a binary frame, got {other:?}"),
-        }
-    }
-
-    /// Asserts the relay answers with `code` and closes.
-    async fn expect_error(&mut self, code: &str) {
-        let frame = self.recv().await;
-        assert_eq!(
-            (frame["type"].as_str(), frame["code"].as_str()),
-            (Some("error"), Some(code)),
-            "{frame}"
-        );
-        assert_eq!(self.next().await, None, "the relay closes after an error");
-    }
-
-    async fn create(url: &str, transports: &[&str]) -> (Self, String) {
-        let mut client = Self::connect(url).await;
-        client
-            .send(json!({"type": "create", "version": 1, "transports": transports}))
-            .await;
-        let created = client.recv().await;
-        assert_eq!(created["type"], "created", "{created}");
-        let nameplate = created["nameplate"].as_str().unwrap().to_owned();
-        (client, nameplate)
-    }
-
-    async fn join(url: &str, nameplate: &str, transports: &[&str]) -> Self {
-        let mut client = Self::connect(url).await;
-        client
-            .send(json!({"type": "join", "version": 1, "nameplate": nameplate, "transports": transports}))
-            .await;
-        client
-    }
-}
-
-async fn paired(url: &str) -> (Client, Client) {
-    let (mut sender, nameplate) = Client::create(url, &["iroh", "webrtc"]).await;
-    let mut receiver = Client::join(url, &nameplate, &["webrtc", "iroh"]).await;
-    let expected = json!({"type": "paired", "transport": "iroh"});
-    assert_eq!(sender.recv().await, expected);
-    assert_eq!(receiver.recv().await, expected);
-    (sender, receiver)
-}
+mod support;
+use support::{Client, paired, start};
 
 #[tokio::test]
 async fn pairs_and_forwards_signals_both_ways() {
@@ -130,7 +34,7 @@ async fn sessions_report_their_lifetime() {
     let url = start(Config::default()).await;
     let mut client = Client::connect(&url).await;
     client
-        .send(json!({"type": "create", "version": 1, "transports": ["webrtc"]}))
+        .send(json!({"type": "create", "version": VERSION, "transports": ["webrtc"]}))
         .await;
     let created = client.recv().await;
     assert_eq!(created["expires_in"], 300);
@@ -169,8 +73,10 @@ async fn the_version_is_checked_first() {
     let url = start(Config::default()).await;
     let frames = [
         json!({"type": "create", "transports": ["webrtc"]}),
-        json!({"type": "create", "version": 2, "transports": ["webrtc"]}),
-        json!({"type": "join", "version": "1", "nameplate": "ZZZZ", "transports": []}),
+        // The previous version is not served either.
+        json!({"type": "create", "version": VERSION - 1, "transports": ["webrtc"]}),
+        json!({"type": "create", "version": VERSION + 1, "transports": ["webrtc"]}),
+        json!({"type": "join", "version": VERSION.to_string(), "nameplate": "ZZZZ", "transports": []}),
         json!({"type": "signal", "data": ""}),
         json!({"type": "hello"}),
     ];
@@ -185,8 +91,8 @@ async fn the_version_is_checked_first() {
 async fn malformed_first_messages_are_protocol_errors() {
     let url = start(Config::default()).await;
     for frame in [
-        json!({"type": "signal", "version": 1, "data": ""}),
-        json!({"type": "create", "version": 1}),
+        json!({"type": "signal", "version": VERSION, "data": ""}),
+        json!({"type": "create", "version": VERSION}),
     ] {
         let mut client = Client::connect(&url).await;
         client.send(frame).await;
@@ -202,7 +108,7 @@ async fn unknown_transports_are_protocol_errors() {
     let url = start(Config::default()).await;
     let mut client = Client::connect(&url).await;
     client
-        .send(json!({"type": "create", "version": 1, "transports": ["webrtc", "quic"]}))
+        .send(json!({"type": "create", "version": VERSION, "transports": ["webrtc", "quic"]}))
         .await;
     client.expect_error("protocol").await;
 
@@ -300,7 +206,7 @@ async fn the_session_cap_answers_busy() {
     let (sender, _) = Client::create(&url, &["webrtc"]).await;
     let mut second = Client::connect(&url).await;
     second
-        .send(json!({"type": "create", "version": 1, "transports": ["webrtc"]}))
+        .send(json!({"type": "create", "version": VERSION, "transports": ["webrtc"]}))
         .await;
     second.expect_error("busy").await;
 
@@ -311,22 +217,98 @@ async fn the_session_cap_answers_busy() {
 }
 
 #[tokio::test]
-async fn signals_are_bounded_in_count_and_size() {
+async fn one_address_has_a_limit_of_connections() {
+    let url = start(Config {
+        connections_per_ip: 2,
+        ..Config::default()
+    })
+    .await;
+    let (first, _) = Client::create(&url, &["webrtc"]).await;
+    let _second = Client::create(&url, &["webrtc"]).await;
+    Client::connect(&url).await.expect_error("busy").await;
+
+    // Room returns once one closes.
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    Client::create(&url, &["webrtc"]).await;
+}
+
+#[tokio::test]
+async fn one_address_has_a_budget_of_sessions_per_minute() {
+    let url = start(Config {
+        sessions_per_minute: 3,
+        ..Config::default()
+    })
+    .await;
+    let (_sender, nameplate) = Client::create(&url, &["webrtc"]).await;
+    // Joins count too.
+    let mut joined = Client::join(&url, &nameplate, &["webrtc"]).await;
+    assert_eq!(joined.recv().await["type"], "paired");
+    Client::create(&url, &["webrtc"]).await;
+
+    let mut fourth = Client::connect(&url).await;
+    assert_eq!(
+        fourth.try_create().await,
+        json!({"type": "error", "code": "busy"})
+    );
+}
+
+#[tokio::test]
+async fn the_proxy_names_the_address_and_ipv6_counts_by_its_64() {
+    let url = start(Config {
+        connections_per_ip: 1,
+        ip_header: Some(HeaderName::from_static("cf-connecting-ip")),
+        ..Config::default()
+    })
+    .await;
+    let busy = json!({"type": "error", "code": "busy"});
+    let mut held = Vec::new();
+    for (ip, answer) in [
+        ("203.0.113.7", "created"),
+        ("203.0.113.7", "error"),
+        ("203.0.113.8", "created"),
+        ("2001:db8::1:1", "created"),
+        ("2001:db8::2:2", "error"),
+        ("2001:db8:0:1::1", "created"),
+    ] {
+        let mut client = Client::connect_as(&url, ip).await;
+        let got = client.try_create().await;
+        match answer {
+            "created" => assert_eq!(got["type"], "created", "{ip}: {got}"),
+            _ => assert_eq!(got, busy, "{ip}"),
+        }
+        held.push(client);
+    }
+}
+
+#[tokio::test]
+async fn signals_are_bounded_in_size_per_frame_and_session() {
     let url = start(Config::default()).await;
     let (mut sender, mut receiver) = paired(&url).await;
-    for _ in 0..=MAX_SIGNALS {
-        sender.send_binary(&[1, 0]).await;
-    }
-    sender.expect_error("protocol").await;
-    for _ in 0..MAX_SIGNALS {
-        assert_eq!(receiver.recv_binary().await, [1, 0]);
-    }
-    receiver.expect_error("peer_left").await;
+    // The budget in whole frames, then one byte too many.
+    let sizes: Vec<usize> = (0..MAX_SIGNAL_BYTES / MAX_FRAME_BYTES)
+        .map(|_| MAX_FRAME_BYTES)
+        .chain(Some(MAX_SIGNAL_BYTES % MAX_FRAME_BYTES).filter(|rest| *rest > 0))
+        .collect();
+    let forwarding = async {
+        for &size in &sizes {
+            sender.send_binary(&vec![1; size]).await;
+        }
+        sender.send_binary(&[3]).await;
+        sender.expect_error("protocol").await;
+    };
+    let receiving = async {
+        for &size in &sizes {
+            assert_eq!(receiver.recv_binary().await.len(), size);
+        }
+        receiver.expect_error("peer_left").await;
+    };
+    tokio::join!(forwarding, receiving);
 
     let (mut sender, _receiver) = paired(&url).await;
     let sent = sender
         .0
-        .send(Message::binary(vec![1; MAX_MESSAGE_BYTES + 1]))
+        .send(Message::binary(vec![1; MAX_FRAME_BYTES + 1]))
         .await;
     // The relay drops the connection; the write itself may or may not notice.
     assert!(matches!(
@@ -334,6 +316,34 @@ async fn signals_are_bounded_in_count_and_size() {
         Ok(()) | Err(Error::Io(_) | Error::ConnectionClosed | Error::Protocol(_))
     ));
     assert_eq!(sender.next().await, None);
+}
+
+#[tokio::test]
+async fn a_slow_peer_holds_the_sender_back() {
+    let url = start(Config::default()).await;
+    let (mut sender, mut receiver) = paired(&url).await;
+    // Nearly the whole budget: more than the socket buffers hold, so the
+    // relay stops reading the sender until the receiver catches up.
+    let frames = MAX_SIGNAL_BYTES / MAX_FRAME_BYTES - 1;
+    let sending = async {
+        for i in 0..frames {
+            sender.send_binary(&vec![i as u8; MAX_FRAME_BYTES]).await;
+        }
+        // Then reads, answering pings, as a client waiting for its peer does.
+        sender.frame().await
+    };
+    let receiving = async {
+        for i in 0..frames {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            assert_eq!(receiver.recv_binary().await, vec![i as u8; MAX_FRAME_BYTES]);
+        }
+    };
+    tokio::select! {
+        () = receiving => {}
+        frame = sending => panic!("the relay told the sender {frame:?}"),
+    }
+    sender.send_binary(&[9]).await;
+    assert_eq!(receiver.recv_binary().await, [9]);
 }
 
 #[tokio::test]

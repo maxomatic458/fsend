@@ -15,6 +15,7 @@ crate-type = ["cdylib"]
 [dependencies]
 crc32fast = "1.5.5"
 fsend-proto.workspace = true
+js-sys = "0.3.107"
 serde.workspace = true
 serde_json.workspace = true
 # Must match the wasm-bindgen CLI that build-wasm.mjs runs.

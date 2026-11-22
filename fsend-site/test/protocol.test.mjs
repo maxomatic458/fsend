@@ -11,30 +11,30 @@ const {
     acceptPlan,
     checkAccept,
     checkLengths,
+    byName,
+    encodeOffer,
     filesToCheck,
     fingerprint,
     fingerprintRanges,
-    parseServerMessage,
+    flattenOffer,
+    Hasher,
     planReceive,
     presentBytes,
-    topEntries,
+    Progress,
     validateOffer,
 } = await import("./.build/app.mjs");
 
-const offer = {
-    type: "offer",
-    entries: Array.from({ length: 500 }, (_, i) => ({
-        kind: "file",
-        path: [`file-${i}.bin`],
-        size: i,
-    })),
+/** A sender's message big enough to be compressed. */
+const hashes = {
+    type: "hashes",
+    hashes: Array.from({ length: 500 }, (_, i) => i.toString(16).padStart(32, "0")),
 };
 
 describe("control frames", () => {
     test("messages round-trip through frames split anywhere", () => {
         const frames = [
             encodeFrame({ type: "cancel" }, Role.Sender),
-            encodeFrame(offer, Role.Sender),
+            encodeFrame(hashes, Role.Sender),
         ];
         // Big payloads are compressed (flags bit 0), small ones are not.
         assert.equal(frames[0][4], 0);
@@ -48,17 +48,17 @@ describe("control frames", () => {
                 for (let m = decoder.next(); m; m = decoder.next()) got.push(m);
             }
         }
-        assert.deepEqual(got, [{ type: "cancel" }, offer]);
+        assert.deepEqual(got, [{ type: "cancel" }, hashes]);
     });
 
     test("each side sends only its own messages", () => {
-        assert.throws(() => encodeFrame(offer, Role.Receiver), /unknown variant/);
+        assert.throws(() => encodeFrame(hashes, Role.Receiver), /unknown variant/);
         assert.throws(() => encodeFrame({ type: "done" }, Role.Sender), /unknown variant/);
         assert.ok(encodeFrame({ type: "done" }, Role.Receiver));
     });
 
     for (const [name, frame] of [
-        ["a message the other side sends", encodeFrame(offer, Role.Sender)],
+        ["a message the other side sends", encodeFrame(hashes, Role.Sender)],
         ["an unknown message", jsonFrame('{"type":"resume"}')],
         ["a malformed message", jsonFrame('{"type":"ack"}')],
         ["a malformed frame", new Uint8Array([0, 0, 0, 0])],
@@ -109,28 +109,20 @@ describe("data blocks", () => {
     });
 });
 
-describe("relay messages", () => {
-    test("a valid message parses", () => {
-        assert.deepEqual(parseServerMessage('{"type":"paired","transport":"webrtc","extra":1}'), {
-            type: "paired",
-            transport: "webrtc",
-        });
-    });
-
-    for (const [name, text] of [
-        ["an unknown message", '{"type":"motd","text":"hi"}'],
-        ["an unknown error code", '{"type":"error","code":"teapot","message":""}'],
-        ["an unknown transport", '{"type":"paired","transport":"quic"}'],
-        ["a client message", '{"type":"join","version":1,"nameplate":"K7Q2","transports":[]}'],
-        ["malformed JSON", "{"],
-    ]) {
-        test(`${name} is an error`, () => {
-            assert.throws(() => parseServerMessage(text));
-        });
-    }
-});
-
 describe("offer helpers", () => {
+    const offer = {
+        entries: [
+            { kind: "file", name: "a.txt", size: 10 },
+            {
+                kind: "dir",
+                name: "d",
+                entries: [
+                    { kind: "file", name: "b", size: 5 },
+                    { kind: "file", name: "c", size: 7 },
+                ],
+            },
+        ],
+    };
     const entries = [
         { kind: "file", path: ["a.txt"], size: 10 },
         { kind: "dir", path: ["d"] },
@@ -138,13 +130,26 @@ describe("offer helpers", () => {
         { kind: "file", path: ["d", "c"], size: 7 },
     ];
 
+    test("an entry's id is its place in the tree, each folder before what it holds", () => {
+        assert.deepEqual(flattenOffer(offer), entries);
+    });
+
     test("offers are checked against the rules", () => {
-        validateOffer(entries);
-        assert.throws(
-            () => validateOffer([{ kind: "file", path: [".."], size: 1 }]),
-            /not a valid name/,
-        );
-        assert.throws(() => validateOffer([{ kind: "file", path: ["d", "a"], size: 1 }]), /parent/);
+        validateOffer(offer);
+        encodeOffer(offer);
+        const named = (name) => ({ entries: [{ kind: "file", name, size: 1 }] });
+        for (const check of [validateOffer, encodeOffer]) {
+            assert.throws(() => check(named("..")), /not a valid name/);
+            assert.throws(
+                () => check({ entries: [named("x").entries[0], named("x").entries[0]] }),
+                /taken in its directory/,
+            );
+        }
+    });
+
+    test("names sort by code point, as the CLI sorts them", () => {
+        const names = ["b", "B", "a", "\u{1F600}", "\uFF5E", "ä", ""];
+        assert.deepEqual(names.sort(byName), ["", "B", "a", "b", "ä", "\uFF5E", "\u{1F600}"]);
     });
 
     test("verified prefixes resume and the rest conflict, like the CLI", () => {
@@ -167,6 +172,7 @@ describe("offer helpers", () => {
         const plan = planReceive(entries, local, [0, 2]);
         assert.deepEqual(plan, {
             files: [{ id: 0, offset: 4 }],
+            complete: [2],
             dirs: [1],
             conflicts: [{ id: 3, replaceable: true }],
         });
@@ -193,19 +199,26 @@ describe("offer helpers", () => {
         );
     });
 
-    test("progress is counted per top-level entry", () => {
-        const [tops, topOf] = topEntries(entries);
-        assert.deepEqual(tops, [
-            { name: "a.txt", dir: false, size: 10 },
-            { name: "d", dir: true, size: 12 },
+    test("checksums are SHA-256, fed in any pieces", () => {
+        const abc = new TextEncoder().encode("abc");
+        const whole = new Hasher("sha256");
+        whole.update(abc);
+        const pieces = new Hasher("sha256");
+        for (const byte of abc) pieces.update(Uint8Array.of(byte));
+        const digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert.equal(whole.finish(), digest);
+        assert.equal(pieces.finish(), digest);
+    });
+
+    test("progress is counted per file, and what is there per top-level entry", () => {
+        const files = [
+            { id: 0, offset: 4 },
+            { id: 3, offset: 0 },
+        ];
+        assert.deepEqual(new Progress(entries, files).advance(10), [
+            [0, 6],
+            [3, 4],
         ]);
-        assert.deepEqual(topOf, [0, 1, 1, 1]);
-        assert.deepEqual(
-            presentBytes(entries, [
-                { id: 0, offset: 4 },
-                { id: 3, offset: 0 },
-            ]),
-            [4, 5],
-        );
+        assert.deepEqual(presentBytes(offer, entries, files), [4, 5]);
     });
 });

@@ -1,10 +1,12 @@
 import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 
 import {
     installBrowserEnv,
     resetBrowserEnv,
     MemoryDirectoryHandle,
+    getBeacons,
     getDownloads,
     makeEntries,
     expectedSnapshot,
@@ -24,6 +26,7 @@ const {
     runReceive,
     createFolderSink,
     createZipSink,
+    encodeBlock,
     encodeFrame,
     Role,
     MAX_DATA_MESSAGE_BYTES,
@@ -62,10 +65,11 @@ async function start(
         sendSignal = new AbortController().signal,
         recvSignal = new AbortController().signal,
         recv = makeRecorder(),
+        sendOptions,
     } = {},
 ) {
     const send = makeRecorder();
-    const senderDone = runSend(makeEntries(spec, mode), send.emit, sendSignal);
+    const senderDone = runSend(makeEntries(spec, mode), send.emit, sendSignal, sendOptions);
     const code = await waitFor(() => send.record.code, { label: "share code" });
     const receiverDone = runReceive(code, sink, policy, recv.emit, recvSignal, options);
     return { send, recv, senderDone, receiverDone };
@@ -206,8 +210,59 @@ describe("complete transfers (File System Access API)", () => {
             send.emit,
             new AbortController().signal,
         );
-        assert.match(send.record.error ?? "", /offered twice/);
+        assert.match(send.record.error ?? "", /taken in its directory/);
         assert.equal(send.record.code, null, "no code is handed out");
+    });
+});
+
+describe("the offer", () => {
+    test("arrives before the peers connect, sorted by name at every level", async () => {
+        const spec = { "b.txt": bytes(3, 1), a: { "z.bin": bytes(2, 2), "m.bin": bytes(1, 3) } };
+        let connections;
+        const recv = makeRecorder({
+            onOffered: (e) => {
+                connections = peerConnections.length;
+                e.accept();
+            },
+        });
+        const { senderDone, receiverDone } = await start(spec, { recv });
+        await Promise.all([senderDone, receiverDone]);
+
+        assert.ok(connections <= 1, "at most the sender has prepared its connection");
+        assert.deepEqual(recv.record.offered, {
+            entries: [
+                {
+                    kind: "dir",
+                    name: "a",
+                    entries: [
+                        { kind: "file", name: "m.bin", size: 1 },
+                        { kind: "file", name: "z.bin", size: 2 },
+                    ],
+                },
+                { kind: "file", name: "b.txt", size: 3 },
+            ],
+        });
+        assert.equal(recv.record.complete, true);
+    });
+
+    test("declining it connects nothing", async () => {
+        const recv = makeRecorder({ onOffered: (e) => e.reject() });
+        const { send, senderDone, receiverDone } = await start({ "a.bin": bytes(10, 4) }, { recv });
+        await Promise.all([senderDone, receiverDone]);
+
+        assert.ok(peerConnections.length <= 1, "only the sender prepared a connection");
+        assert.match(send.record.error ?? "", /rejected/);
+    });
+
+    test("one larger than a relay frame arrives whole", async () => {
+        // Names that hardly compress, so the sealed offer spans many frames.
+        const names = Array.from({ length: 3000 }, (_, i) =>
+            Array.from(bytes(12, i + 1), (b) => b.toString(16).padStart(2, "0")).join(""),
+        );
+        const spec = { d: Object.fromEntries(names.map((name, i) => [name, bytes(1, i)])) };
+        const { dirHandle, recv } = await transfer(spec);
+        assert.equal(recv.complete, true);
+        assertFiles(dirHandle.snapshot(), expectedSnapshot(spec));
     });
 });
 
@@ -635,6 +690,52 @@ describe("interrupted transfers", () => {
     });
 });
 
+describe("stats", () => {
+    test("a receiver reports the bytes it got and how, and nothing else", async () => {
+        const spec = { "a.bin": bytes(300_000, 201), d: { "b.bin": bytes(1000, 202) } };
+        const { recv } = await transfer(spec);
+
+        assert.equal(recv.error, null);
+        const [beacon, ...more] = getBeacons();
+        assert.deepEqual(more, []);
+        assert.equal(beacon.url, "https://api.fsend.sh/stats");
+        assert.match(beacon.body.token, /^token-/);
+        assert.deepEqual(beacon.body, {
+            token: beacon.body.token,
+            platform: "web",
+            transport: "webrtc",
+            route: "direct",
+            bytes: 301_000,
+        });
+    });
+
+    test("a cancelled receive reports what had arrived", async () => {
+        const controller = new AbortController();
+        const { recv, senderDone, receiverDone } = await start(
+            { "big.bin": bytes(3_000_000, 203) },
+            { recvSignal: controller.signal },
+        );
+        await waitFor(() => recv.record.progress > 100_000, { label: "transfer under way" });
+        controller.abort();
+        await Promise.all([senderDone, receiverDone]);
+
+        const [beacon, ...more] = getBeacons();
+        assert.deepEqual(more, []);
+        assert.equal(beacon.body.bytes, recv.record.progress);
+        assert.ok(beacon.body.bytes < 3_000_000);
+    });
+
+    test("nothing is reported when nothing arrived", async () => {
+        const { senderDone, receiverDone } = await start(
+            { "unwanted.bin": bytes(500, 204) },
+            { recv: makeRecorder({ onOffered: (e) => e.reject() }) },
+        );
+        await Promise.all([senderDone, receiverDone]);
+
+        assert.deepEqual(getBeacons(), []);
+    });
+});
+
 describe("compression", () => {
     /** Runs a transfer of `spec`, counting the bytes on the sender's data channel. */
     async function counted(spec, tamper) {
@@ -718,30 +819,32 @@ describe("compression", () => {
 });
 
 describe("protocol errors", () => {
-    const offer = {
-        type: "offer",
-        entries: [{ kind: "file", path: ["a"], size: 1 }],
-    };
     for (const [name, frame] of [
-        ["a message only the sender sends", () => encodeFrame(offer, Role.Sender)],
+        [
+            "a message only the sender sends",
+            () => encodeFrame({ type: "hashes", hashes: [] }, Role.Sender),
+        ],
         ["an unknown message", () => jsonFrame('{"type":"resume"}')],
         ["a malformed message", () => jsonFrame('{"type":"accept"}')],
+        // A text message would otherwise be read as the length of a byte array.
+        ["a text message", () => "1000000000"],
         [
             "a check of an unknown file",
             () => encodeFrame({ type: "check", files: [{ id: 7, len: 1 }] }, Role.Receiver),
         ],
     ]) {
         test(`${name} from the receiver fails the sender`, async () => {
-            const recv = makeRecorder({
-                onOffered: (e) => {
-                    // Ahead of the receiver's accept.
-                    peerConnections[1]._channels.get("control").send(frame());
-                    e.accept();
-                },
-            });
+            const sink = createFolderSink(new MemoryDirectoryHandle());
+            // Connected by then, and ahead of the receiver's accept.
+            const prepare = sink.prepare;
+            sink.prepare = (tops) => {
+                peerConnections[1]._channels.get("control").send(frame());
+                return prepare(tops);
+            };
+            const recv = makeRecorder();
             const { send, senderDone, receiverDone } = await start(
                 { "a.bin": bytes(500, 5) },
-                { recv },
+                { recv, sink },
             );
             await Promise.all([senderDone, receiverDone]);
 
@@ -751,6 +854,163 @@ describe("protocol errors", () => {
             assert.match(recv.record.error ?? "", /^The other side failed/);
         });
     }
+});
+
+describe("checksums", () => {
+    const sha256 = (data) => createHash("sha256").update(data).digest("hex");
+    const withChecksums = { sendOptions: { checksums: "sha256" } };
+    const MIB = 1024 * 1024;
+
+    test("come with every file and are checked as it arrives", async () => {
+        const spec = {
+            "a.bin": bytes(300_000, 1),
+            d: { "b.bin": bytes(10, 2), "empty.bin": new Uint8Array(0) },
+        };
+        const { dirHandle, send, recv } = await transfer(spec, withChecksums);
+
+        assert.equal(recv.error, null);
+        assertFiles(dirHandle.snapshot(), expectedSnapshot(spec));
+        const [a, d] = recv.offered.entries;
+        assert.equal(recv.offered.checksums, "sha256");
+        assert.equal(a.checksum, sha256(spec["a.bin"]));
+        assert.deepEqual(
+            d.entries.map((file) => file.checksum),
+            [sha256(spec.d["b.bin"]), sha256(spec.d["empty.bin"])],
+        );
+        assert.deepEqual(send.hashing, { done: 300_010, total: 300_010 });
+        assert.ok(!recv.states.includes("verifying"), "nothing was here to check");
+    });
+
+    test("a file changed on the way fails the receiver, which the sender only sees leave", async () => {
+        const spec = { "a.bin": bytes(200_000, 3) };
+        const dir = new MemoryDirectoryHandle();
+        const { send, recv, senderDone, receiverDone } = await start(spec, {
+            sink: createFolderSink(dir),
+            ...withChecksums,
+        });
+        const channel = await waitFor(() => peerConnections[0]?._channels.get("data"), {
+            label: "sender data channel",
+        });
+        // The block goes raw, so its last byte here is a file byte.
+        const realSend = channel.send.bind(channel);
+        let tampered = false;
+        channel.send = (data) => {
+            if (!tampered) {
+                data = new Uint8Array(data);
+                data[data.length - 1] ^= 1;
+                tampered = true;
+            }
+            realSend(data);
+        };
+        await Promise.all([senderDone, receiverDone]);
+
+        assert.equal(
+            recv.record.error,
+            "a.bin does not match its checksum. Delete it to receive it again.",
+        );
+        assert.ok(send.record.error, "the sender fails too");
+        assert.doesNotMatch(send.record.error, /checksum/, "but is not told why");
+        assert.equal(dir.snapshot()["a.bin"].length, 200_000, "kept for the user to look at");
+    });
+
+    test("what is already here is checked before resuming", async () => {
+        const spec = { "done.bin": bytes(5000, 4), "part.bin": bytes(300_000, 5) };
+        const dir = new MemoryDirectoryHandle();
+        (await dir.getFileHandle("done.bin", { create: true })).bytes = spec["done.bin"];
+        (await dir.getFileHandle("part.bin", { create: true })).bytes = spec["part.bin"].slice(
+            0,
+            100_000,
+        );
+
+        const { send, recv } = await transfer(spec, { dir, ...withChecksums });
+
+        assert.equal(recv.error, null);
+        assertFiles(dir.snapshot(), expectedSnapshot(spec));
+        assert.deepEqual(recv.verifying, { done: 105_000, total: 105_000 });
+        assert.equal(send.progress, 200_000, "only the missing part crosses the wire");
+    });
+
+    test("and the rest of the codec work the same without a worker", async () => {
+        const worker = globalThis.Worker;
+        delete globalThis.Worker;
+        try {
+            const spec = { "a.bin": bytes(2 * MIB, 7), "b.bin": bytes(300_000, 8) };
+            const dir = new MemoryDirectoryHandle();
+            (await dir.getFileHandle("b.bin", { create: true })).bytes = spec["b.bin"].slice(
+                0,
+                100_000,
+            );
+
+            const { send, recv } = await transfer(spec, { dir, ...withChecksums });
+
+            assert.equal(recv.error, null);
+            assertFiles(dir.snapshot(), expectedSnapshot(spec));
+            const total = 2 * MIB + 300_000;
+            assert.deepEqual(send.hashing, { done: total, total });
+            assert.deepEqual(recv.verifying, { done: 100_000, total: 100_000 });
+            assert.equal(send.progress, total - 100_000);
+            assert.equal(recv.progress, total - 100_000);
+        } finally {
+            globalThis.Worker = worker;
+        }
+    });
+
+    test("a complete file that differs fails before anything is accepted", async () => {
+        // Past 2 MiB, the fingerprint samples only the ends.
+        const offered = bytes(3 * MIB, 6);
+        const local = offered.slice();
+        local[1.5 * MIB] ^= 1;
+        const dir = new MemoryDirectoryHandle();
+        (await dir.getFileHandle("f.bin", { create: true })).bytes = local;
+
+        const { send, recv } = await transfer({ "f.bin": offered }, { dir, ...withChecksums });
+
+        assert.match(recv.error ?? "", /^f\.bin does not match its checksum/);
+        assert.ok(send.error, "the sender sees the receiver leave");
+        assert.ok(!send.states.includes("transferring"), "nothing was accepted");
+        assert.deepEqual(dir.snapshot()["f.bin"], local);
+    });
+});
+
+describe("a sender past the window", () => {
+    /**
+     * A receiver that gets `flood` on its data channel ahead of the sender's
+     * data; `busy`, it reads none of it until all has arrived.
+     */
+    async function flooded(flood, { busy = false } = {}) {
+        const sink = createFolderSink(new MemoryDirectoryHandle());
+        const { prepare, reserve } = sink;
+        sink.prepare = (tops) => {
+            const data = peerConnections[0]._channels.get("data");
+            for (const chunk of flood) data.send(chunk);
+            return prepare(tops);
+        };
+        // As when the browser asks the user for more storage.
+        if (busy) sink.reserve = (...args) => sleep(300).then(() => reserve(...args));
+        const { recv, senderDone, receiverDone } = await start(
+            { "a.bin": bytes(500, 8) },
+            { sink },
+        );
+        await Promise.all([senderDone, receiverDone]);
+        return recv.record;
+    }
+
+    test("fails the receiver once too much is queued", async () => {
+        const flood = Array.from({ length: 40 }, () => new Uint8Array(1024 * 1024));
+        const recv = await flooded(flood, { busy: true });
+        assert.match(recv.error ?? "", /sent past the window/);
+    });
+
+    test("fails the receiver before it decompresses too much", async () => {
+        // Each block is a few dozen bytes of zstd for a MiB of zeros.
+        const zeros = encodeBlock(new Uint8Array(1024 * 1024));
+        assert.ok(zeros.length < 1000, `${zeros.length} bytes`);
+        const recv = await flooded(
+            Array.from({ length: 40 }, () => zeros),
+            { busy: true },
+        );
+        assert.match(recv.error ?? "", /sent past the window/);
+    });
 });
 
 describe("resuming an interrupted download", () => {

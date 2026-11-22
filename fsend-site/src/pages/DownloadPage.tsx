@@ -144,7 +144,7 @@ export function DownloadPage() {
 
     return (
         <div class="flex-1 flex flex-col items-center gap-[26px] px-5 sm:px-10 pt-[26px] pb-16">
-            <Title>Download fsend — CLI for Peer-to-Peer File Transfer</Title>
+            <Title>Download fsend - CLI for Peer-to-Peer File Transfer</Title>
             <Meta
                 name="description"
                 content="Install the fsend command-line tool on Linux, macOS or Windows with one command. Also available from an APT repository, with cargo, or as prebuilt binaries."

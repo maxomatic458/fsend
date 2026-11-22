@@ -7,7 +7,7 @@ import { EntryName } from "./EntryName";
 
 interface TransferProgressProps {
     progress: ProgressStore;
-    /// "received" / "sent" — used in the byte counter beneath the bar
+    /// "received" or "sent", for the byte counter beneath the bar
     verb: string;
     connection?: ConnectionKind;
     /// Sits opposite the actions, as a fact about the transfer

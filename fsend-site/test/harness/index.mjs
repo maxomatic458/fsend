@@ -1,11 +1,12 @@
 import { readFileSync } from "node:fs";
 import { installWebRtc, resetWebRtc } from "./webrtc.mjs";
 import { installRelay, resetRelay } from "./relay.mjs";
-import { installDom, resetDom, getDownloads } from "./dom.mjs";
+import { installDom, resetDom, getBeacons, getDownloads } from "./dom.mjs";
+import { installWorker } from "./worker.mjs";
 import { MemoryDirectoryHandle } from "./fs-access.mjs";
 import { unzip } from "./zip.mjs";
 
-export { MemoryDirectoryHandle, getDownloads, unzip };
+export { MemoryDirectoryHandle, getBeacons, getDownloads, unzip };
 
 // The app loads its wasm with fetch(); hand it the bytes up front instead.
 const { initSync } = await import("../.build/app.mjs");
@@ -20,6 +21,7 @@ let peerConnections = [];
 export function installBrowserEnv({ latencyMs = 0, instantDrain = false } = {}) {
     installDom(globalThis);
     installRelay(globalThis);
+    installWorker(globalThis);
     peerConnections = installWebRtc(globalThis, { latencyMs, instantDrain });
     return peerConnections;
 }
@@ -154,6 +156,9 @@ export function makeRecorder({ onOffered } = {}) {
         present: null,
         connectionType: null,
         conflicts: null,
+        /// The last { done, total } of checksumming before sending, and of checking before accepting.
+        hashing: null,
+        verifying: null,
     };
 
     const emit = (event) => {
@@ -164,7 +169,7 @@ export function makeRecorder({ onOffered } = {}) {
                 record.code = event.code;
                 break;
             case "offered":
-                record.offered = event.files;
+                record.offered = event.offer;
                 if (onOffered) onOffered(event);
                 else event.accept();
                 break;
@@ -176,6 +181,10 @@ export function makeRecorder({ onOffered } = {}) {
                 record.progress += event.bytes;
                 record.largestStep = Math.max(record.largestStep, event.bytes);
                 record.present[event.entry] += event.bytes;
+                break;
+            case "hashing":
+            case "verifying":
+                record[event.type] = { done: event.done, total: event.total };
                 break;
             case "connectionType":
                 record.connectionType = event.kind;

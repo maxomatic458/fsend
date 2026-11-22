@@ -1,4 +1,3 @@
-use std::future::Future;
 use std::pin::Pin;
 
 use super::*;
@@ -33,8 +32,7 @@ async fn connected_pair() -> (WebRtcTransfer, WebRtcTransfer) {
 fn pair() -> Pin<Box<dyn Future<Output = Peers> + Send>> {
     Box::pin(async {
         let (sender, receiver) = connected_pair().await;
-        // Pulling the plug: the peer connection goes away and, since
-        // a local close produces no events, the link is marked as gone.
+        // A local close produces no events, so the link is marked gone.
         let abort = |pc: Arc<dyn PeerConnection>,
                      link_tx: Arc<watch::Sender<LinkState>>|
          -> Box<dyn Fn() + Send + Sync> {
@@ -55,10 +53,25 @@ fn pair() -> Pin<Box<dyn Future<Output = Peers> + Send>> {
     })
 }
 
-// The behaviour every transport must have.
-transport_suite!();
+// The transfer suite runs in full over memory; these depend on the transport.
+transport_suite!(
+    sends_a_file_larger_than_the_buffers,
+    sends_a_directory_tree,
+    interrupted_by_the_receiver_then_resumed,
+    interrupted_by_the_sender_then_resumed,
+    cancelled_by_the_receiver_then_resumed,
+    cancelled_by_the_sender_then_resumed,
+    a_file_changed_after_hashing_fails_verification,
+    a_file_that_vanishes_fails_both_sides,
+    messages_survive_the_wire,
+    a_closed_peer_fails_the_control_stream,
+);
 
-// WebRTC specifics.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "timing: cargo test --release -p fsend-core -- --ignored --nocapture"]
+async fn throughput() {
+    crate::transfer::test_support::suite::throughput(pair).await
+}
 
 #[test]
 fn default_config_uses_the_public_stun_servers() {
@@ -75,7 +88,7 @@ async fn a_lost_link_fails_the_streams_instead_of_hanging() {
 
     let (mut sender, mut receiver) = connected_pair().await;
     assert_eq!(*sender.link.borrow(), LinkState::Connected);
-    assert_eq!(sender.connection_kind(), ConnectionKind::WebRtc);
+    assert_eq!(sender.connection_kind().await, ConnectionKind::Direct);
     let mut data = sender.data().await.unwrap();
 
     // The receiver hanging up reaches the sender as a lost connection.

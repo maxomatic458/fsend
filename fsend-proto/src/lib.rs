@@ -2,6 +2,7 @@ pub mod code;
 pub mod pairing;
 pub mod peer;
 pub mod relay;
+pub mod stats;
 
 #[cfg(test)]
 mod testing {

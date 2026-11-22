@@ -1,5 +1,5 @@
 {
-    "name": "fsend — P2P File Transfer",
+    "name": "fsend - P2P File Transfer",
     "short_name": "fsend",
     "description": "Peer-to-peer file transfer in your browser using WebRTC. End-to-end encrypted, no uploads, no size limits.",
     "start_url": "/",

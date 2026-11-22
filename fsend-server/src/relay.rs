@@ -1,8 +1,8 @@
 use std::{
     collections::HashMap,
-    io,
+    net::SocketAddr,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -12,80 +12,67 @@ use axum::{
     Router,
     body::Bytes,
     extract::{
-        State, WebSocketUpgrade,
+        ConnectInfo, State, WebSocketUpgrade,
         ws::{Message, Utf8Bytes, WebSocket},
     },
+    http::HeaderMap,
     response::Response,
     routing::get,
 };
 use fsend_proto::{
     code::Nameplate,
-    relay::{ClientMessage, ErrorCode, PATH, ServerMessage, Transport, VERSION},
+    relay::{
+        ClientMessage, Error, MAX_FRAME_BYTES, MAX_SIGNAL_BYTES, PATH, ServerMessage, Transport,
+        VERSION,
+    },
 };
 use serde::Deserialize;
 use tokio::{
-    net::TcpListener,
     sync::{mpsc, oneshot},
     time::{Instant, Interval, MissedTickBehavior, sleep_until, timeout},
 };
 use tracing::info;
 
-/// Largest frame a client may send.
-pub const MAX_MESSAGE_BYTES: usize = 32 * 1024;
-/// Signals one client may send per session.
-pub const MAX_SIGNALS: usize = 4;
+use crate::Config;
+use crate::limits::{Connected, Limits, client_ip};
+use crate::stats::Stats;
+
+/// Signals queued for a peer that is still reading earlier ones.
+const QUEUED_SIGNALS: usize = 4;
 /// Nameplates tried before a nearly full relay reports itself busy.
 const NAMEPLATE_TRIES: usize = 64;
 /// Time for any single write to a client.
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// Time for a client to say `create` or `join` after connecting.
-const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+const FIRST_MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Debug, Clone)]
-pub struct Config {
-    /// How long a session waits for its receiver.
-    pub session_ttl: Duration,
-    /// How long the two sides may signal after the join.
-    pub pair_timeout: Duration,
-    /// Sessions open at once, waiting or pairing.
-    pub max_sessions: usize,
-    pub ping_interval: Duration,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            session_ttl: Duration::from_secs(5 * 60),
-            pair_timeout: Duration::from_secs(60),
-            max_sessions: 10_000,
-            ping_interval: Duration::from_secs(20),
-        }
-    }
-}
-
-pub fn router(config: Config) -> Router {
+pub(crate) fn router(config: Config, stats: Option<Arc<Stats>>) -> Router {
+    let limits = Arc::new(Limits::new(
+        config.connections_per_ip,
+        config.sessions_per_minute,
+    ));
     let relay = Arc::new(Relay {
         config,
         slots: Mutex::default(),
         active: AtomicUsize::new(0),
+        limits,
+        stats,
     });
     Router::new().route(PATH, get(upgrade)).with_state(relay)
-}
-
-pub async fn serve(listener: TcpListener, config: Config) -> io::Result<()> {
-    axum::serve(listener, router(config)).await
 }
 
 struct Relay {
     config: Config,
     slots: Mutex<HashMap<Nameplate, Slot>>,
     active: AtomicUsize,
+    limits: Arc<Limits>,
+    stats: Option<Arc<Stats>>,
 }
 
 enum Slot {
     Open {
         transports: Vec<Transport>,
-        join: oneshot::Sender<Result<Peer, ErrorCode>>,
+        join: oneshot::Sender<Result<Peer, Error>>,
         expires_at: Instant,
     },
     /// Kept for a while so a late receiver hears `expired`, not `not_found`.
@@ -93,7 +80,7 @@ enum Slot {
 }
 
 /// The receiver's answer to the waiting sender.
-type Joined = oneshot::Receiver<Result<Peer, ErrorCode>>;
+type Joined = oneshot::Receiver<Result<Peer, Error>>;
 
 struct Peer {
     transport: Transport,
@@ -110,9 +97,8 @@ struct Link {
 
 impl Link {
     fn pair() -> (Self, Self) {
-        // Each side sends at most MAX_SIGNALS, so these never fill up.
-        let (a_tx, a_rx) = mpsc::channel(MAX_SIGNALS);
-        let (b_tx, b_rx) = mpsc::channel(MAX_SIGNALS);
+        let (a_tx, a_rx) = mpsc::channel(QUEUED_SIGNALS);
+        let (b_tx, b_rx) = mpsc::channel(QUEUED_SIGNALS);
         (
             Self {
                 to_peer: a_tx,
@@ -136,7 +122,7 @@ impl Drop for Active {
 }
 
 impl Relay {
-    fn slots(&self) -> std::sync::MutexGuard<'_, HashMap<Nameplate, Slot>> {
+    fn slots(&self) -> MutexGuard<'_, HashMap<Nameplate, Slot>> {
         self.slots.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -181,29 +167,46 @@ impl Relay {
     }
 }
 
-async fn upgrade(ws: WebSocketUpgrade, State(relay): State<Arc<Relay>>) -> Response {
-    ws.max_message_size(MAX_MESSAGE_BYTES)
-        .max_frame_size(MAX_MESSAGE_BYTES)
-        .on_upgrade(move |ws| connection(Socket::new(ws), relay))
+async fn upgrade(
+    ws: WebSocketUpgrade,
+    State(relay): State<Arc<Relay>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let ip = client_ip(relay.config.ip_header.as_ref(), &headers, addr);
+    let connected = relay.limits.connect(ip);
+    ws.max_message_size(MAX_FRAME_BYTES)
+        .max_frame_size(MAX_FRAME_BYTES)
+        .on_upgrade(move |ws| async move {
+            let ws = Socket::new(ws);
+            match connected {
+                Some(connected) => connection(ws, relay, connected).await,
+                None => ws.fail(Error::Busy).await,
+            }
+        })
 }
 
-async fn connection(mut ws: Socket, relay: Arc<Relay>) {
-    let text = match timeout(HELLO_TIMEOUT, ws.recv()).await {
+async fn connection(mut ws: Socket, relay: Arc<Relay>, connected: Connected) {
+    let text = match timeout(FIRST_MESSAGE_TIMEOUT, ws.recv()).await {
         Ok(Some(Frame::Text(text))) => text,
-        Ok(Some(Frame::Binary(_))) => return ws.fail(ErrorCode::Protocol).await,
+        Ok(Some(Frame::Binary(_))) => return ws.fail(Error::Protocol).await,
         Ok(None) | Err(_) => return,
     };
     if !has_supported_version(&text) {
-        return ws.fail(ErrorCode::Version).await;
+        return ws.fail(Error::Version).await;
     }
-    match serde_json::from_str::<ClientMessage>(&text) {
+    let message = serde_json::from_str::<ClientMessage>(&text);
+    if message.is_ok() && !relay.limits.attempt(&connected) {
+        return ws.fail(Error::Busy).await;
+    }
+    match message {
         Ok(ClientMessage::Create { transports, .. }) => create(ws, relay, transports).await,
         Ok(ClientMessage::Join {
             nameplate,
             transports,
             ..
         }) => join(ws, relay, nameplate, transports).await,
-        Err(_) => ws.fail(ErrorCode::Protocol).await,
+        Err(_) => ws.fail(Error::Protocol).await,
     }
 }
 
@@ -217,7 +220,7 @@ fn has_supported_version(text: &str) -> bool {
 
 async fn create(mut ws: Socket, relay: Arc<Relay>, transports: Vec<Transport>) {
     let Some((nameplate, mut joined, _active)) = relay.open(transports) else {
-        return ws.fail(ErrorCode::Busy).await;
+        return ws.fail(Error::Busy).await;
     };
     info!(%nameplate, "session created");
     let ttl = relay.config.session_ttl;
@@ -239,7 +242,7 @@ async fn create(mut ws: Socket, relay: Arc<Relay>, transports: Vec<Transport>) {
             outcome = &mut joined => break outcome,
             _ = &mut expiry => {
                 if relay.close(&nameplate, true) {
-                    return ws.fail(ErrorCode::Expired).await;
+                    return ws.fail(Error::Expired).await;
                 }
                 // Joined just now; the peer is on its way.
                 break joined.await;
@@ -253,14 +256,14 @@ async fn create(mut ws: Socket, relay: Arc<Relay>, transports: Vec<Transport>) {
             incoming = ws.recv() => {
                 relay.close(&nameplate, false);
                 if incoming.is_some() {
-                    ws.fail(ErrorCode::Protocol).await;
+                    ws.fail(Error::Protocol).await;
                 }
                 return;
             }
         }
     };
     match outcome {
-        Ok(Ok(peer)) => forward(ws, &relay.config, peer).await,
+        Ok(Ok(peer)) => forward(ws, &relay.config, peer, None).await,
         Ok(Err(code)) => ws.fail(code).await,
         // `join` always answers before dropping the slot.
         Err(_) => {}
@@ -277,15 +280,15 @@ async fn join(ws: Socket, relay: Arc<Relay>, nameplate: Nameplate, transports: V
             expires_at,
         }) if expires_at > Instant::now() => (transports, join),
         Some(Slot::Open { join, .. }) => {
-            let _ = join.send(Err(ErrorCode::Expired));
-            return ws.fail(ErrorCode::Expired).await;
+            let _ = join.send(Err(Error::Expired));
+            return ws.fail(Error::Expired).await;
         }
-        Some(Slot::Expired { .. }) => return ws.fail(ErrorCode::Expired).await,
-        None => return ws.fail(ErrorCode::NotFound).await,
+        Some(Slot::Expired { .. }) => return ws.fail(Error::Expired).await,
+        None => return ws.fail(Error::NotFound).await,
     };
     let Some(transport) = offered.into_iter().find(|t| transports.contains(t)) else {
-        let _ = join.send(Err(ErrorCode::NoCommonTransport));
-        return ws.fail(ErrorCode::NoCommonTransport).await;
+        let _ = join.send(Err(Error::NoCommonTransport));
+        return ws.fail(Error::NoCommonTransport).await;
     };
     info!(%nameplate, ?transport, "session joined");
 
@@ -297,77 +300,81 @@ async fn join(ws: Socket, relay: Arc<Relay>, nameplate: Nameplate, transports: V
         deadline,
     };
     if join.send(Ok(peer)).is_err() {
-        return ws.fail(ErrorCode::PeerLeft).await;
+        return ws.fail(Error::PeerLeft).await;
     }
     let peer = Peer {
         transport,
         link: ours,
         deadline,
     };
-    forward(ws, &relay.config, peer).await;
+    let stats_token = relay.stats.as_ref().and_then(|stats| stats.issue());
+    forward(ws, &relay.config, peer, stats_token).await;
 }
 
-/// Announces the pairing, then relays binary signal frames both ways until
-/// either side leaves or the deadline passes.
-async fn forward(mut ws: Socket, config: &Config, peer: Peer) {
+/// Relays signal frames both ways until a side leaves or the deadline passes;
+/// a slow peer holds back a fast one.
+async fn forward(mut ws: Socket, config: &Config, peer: Peer, stats_token: Option<String>) {
     let Peer {
         transport,
         mut link,
         deadline,
     } = peer;
-    if !ws.send_json(&ServerMessage::Paired { transport }).await {
+    let paired = ServerMessage::Paired {
+        transport,
+        stats_token,
+    };
+    if !ws.send_json(&paired).await {
         return;
     }
     let deadline = sleep_until(deadline);
     tokio::pin!(deadline);
     let mut ping = pinger(config.ping_interval);
-    let mut signals = 0;
+    let mut signal_bytes = 0;
     loop {
+        let room = link.to_peer.capacity() > 0;
+        if !room {
+            // Unread frames hold the client's pong back while the peer catches up.
+            ws.excuse();
+            ping.reset();
+        }
         tokio::select! {
             // Report `expired`, not `peer_left`, when both fire.
             biased;
             _ = &mut deadline => {
-                return ws.fail(ErrorCode::Expired).await;
+                return ws.fail(Error::Expired).await;
             }
-            _ = ping.tick() => {
+            _ = ping.tick(), if room => {
                 if !ws.ping().await {
                     return;
                 }
+                // A ping can wait behind frames; the client gets a full period to answer.
+                ping.reset();
             }
             forwarded = link.from_peer.recv() => match forwarded {
                 Some(data) => {
                     if !ws.send(Message::Binary(data)).await {
                         return;
                     }
+                    // Its pong queues behind the frames; that they go out shows it is there.
+                    ws.excuse();
                 }
                 None => {
-                    return ws.fail(ErrorCode::PeerLeft).await;
+                    return ws.fail(Error::PeerLeft).await;
                 }
             },
-            incoming = ws.recv() => {
+            // Wakes once the peer has taken a signal, to read the next.
+            _ = link.to_peer.reserve(), if !room => {}
+            incoming = ws.recv(), if room => {
                 let Some(frame) = incoming else { return };
-                signals += 1;
                 let data = match frame {
-                    Frame::Binary(data) if signals <= MAX_SIGNALS => data,
-                    _ => return ws.fail(ErrorCode::Protocol).await,
+                    Frame::Binary(data) if signal_bytes + data.len() <= MAX_SIGNAL_BYTES => data,
+                    _ => return ws.fail(Error::Protocol).await,
                 };
-                // Forwarded verbatim. Only fails once the peer is gone, which
-                // `from_peer` reports next.
+                signal_bytes += data.len();
+                // There is room; fails only once the peer is gone, which `from_peer` reports.
                 let _ = link.to_peer.try_send(data);
             }
         }
-    }
-}
-
-fn describe(code: ErrorCode) -> &'static str {
-    match code {
-        ErrorCode::Version => "unsupported relay protocol version",
-        ErrorCode::NotFound => "no session with this nameplate",
-        ErrorCode::Expired => "the session expired",
-        ErrorCode::NoCommonTransport => "the two sides share no transport",
-        ErrorCode::PeerLeft => "the peer left",
-        ErrorCode::Busy => "the relay is busy",
-        ErrorCode::Protocol => "unexpected message",
     }
 }
 
@@ -379,13 +386,17 @@ fn pinger(period: Duration) -> Interval {
 
 struct Socket {
     ws: WebSocket,
-    /// Whether the last ping was answered.
     answered: bool,
 }
 
 impl Socket {
     fn new(ws: WebSocket) -> Self {
         Self { ws, answered: true }
+    }
+
+    /// Counts the last ping as answered, for a client whose pong is held up.
+    fn excuse(&mut self) {
+        self.answered = true;
     }
 
     /// Pings, unless the last ping went unanswered: the client is gone.
@@ -408,25 +419,21 @@ impl Socket {
         self.send(Message::text(text)).await
     }
 
-    /// Sends an error and closes.
-    async fn fail(mut self, code: ErrorCode) {
-        let error = ServerMessage::Error {
-            code,
-            message: describe(code).to_owned(),
-        };
-        if self.send_json(&error).await {
+    async fn fail(mut self, code: Error) {
+        if self.send_json(&ServerMessage::Error { code }).await {
             self.send(Message::Close(None)).await;
         }
     }
 
-    /// The next data frame, `None` once closed.
+    /// Anything the client sends counts as a pong.
     async fn recv(&mut self) -> Option<Frame> {
         loop {
-            match self.ws.recv().await? {
+            let message = self.ws.recv().await?;
+            self.answered = true;
+            match message {
                 Ok(Message::Text(text)) => return Some(Frame::Text(text)),
                 Ok(Message::Binary(data)) => return Some(Frame::Binary(data)),
-                Ok(Message::Pong(_)) => self.answered = true,
-                Ok(Message::Ping(_)) => {}
+                Ok(Message::Pong(_) | Message::Ping(_)) => {}
                 Ok(Message::Close(_)) | Err(_) => return None,
             }
         }

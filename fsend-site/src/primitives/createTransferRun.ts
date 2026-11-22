@@ -4,7 +4,7 @@ import type { ConnectionKind } from "../lib/transfer/events";
 
 /**
  * Shared parts of a transfer attempt: progress tracker, connection kind, error
- * and abort controller. Holds no state signal — each side owns its own.
+ * and abort controller. Each side owns its own state signal.
  */
 export function createTransferRun() {
     const tracker = createProgressTracker();
