@@ -35,6 +35,8 @@ pub struct Relay {
     ws: WsStream,
     channel: Channel,
     pub transport: Transport,
+    /// Receiver: the token for reporting stats to the server.
+    pub stats_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,12 +46,12 @@ pub enum Answer {
 }
 
 pub async fn pair_as_sender(
-    base_url: &Url,
+    server_url: &Url,
     app: &str,
     outgoing: &Outgoing,
     show_code: impl FnOnce(&Code),
 ) -> Result<Relay, Error> {
-    let mut ws = connect(base_url).await?;
+    let mut ws = connect(server_url).await?;
     send(
         &mut ws,
         &ClientMessage::Create {
@@ -69,7 +71,7 @@ pub async fn pair_as_sender(
     show_code(&code);
 
     let wait = Duration::from_secs(expires_in.into()) + CONNECT_TIMEOUT;
-    let transport = recv_paired(&mut ws, wait).await?;
+    let (transport, _) = recv_paired(&mut ws, wait).await?;
     let mut relay = handshake(ws, &code, Role::Sender, transport, app).await?;
     let frames = relay.channel.seal_plaintext(&outgoing.encoded);
     relay.send_frames(frames).await?;
@@ -78,11 +80,11 @@ pub async fn pair_as_sender(
 
 /// Returns the sender's offer, validated.
 pub async fn pair_as_receiver(
-    base_url: &Url,
+    server_url: &Url,
     app: &str,
     code: &Code,
 ) -> Result<(Relay, Offer), Error> {
-    let mut ws = connect(base_url).await?;
+    let mut ws = connect(server_url).await?;
     send(
         &mut ws,
         &ClientMessage::Join {
@@ -92,8 +94,9 @@ pub async fn pair_as_receiver(
         },
     )
     .await?;
-    let transport = recv_paired(&mut ws, CONNECT_TIMEOUT).await?;
+    let (transport, stats_token) = recv_paired(&mut ws, CONNECT_TIMEOUT).await?;
     let mut relay = handshake(ws, code, Role::Receiver, transport, app).await?;
+    relay.stats_token = stats_token;
     let Sealed::Offer(offer) = relay.recv_sealed(PEER_TIMEOUT).await? else {
         return Err(protocol("expected an offer"));
     };
@@ -120,6 +123,7 @@ async fn handshake(
         ws,
         channel,
         transport,
+        stats_token: None,
     };
 
     relay
@@ -185,10 +189,19 @@ impl Relay {
     }
 }
 
-/// `/relay` is appended to `base_url`.
-async fn connect(base_url: &Url) -> Result<WsStream, Error> {
-    let mut url = base_url.clone();
-    url.set_path(&format!("{}{PATH}", url.path().trim_end_matches('/')));
+/// `path` on the server at `server_url`, which may have a path of its own.
+pub(crate) fn endpoint(server_url: &Url, path: &str) -> Url {
+    let mut url = server_url.clone();
+    url.set_path(&format!("{}{path}", url.path().trim_end_matches('/')));
+    url
+}
+
+/// The relay on the server at `server_url`, over `wss` for `https`.
+async fn connect(server_url: &Url) -> Result<WsStream, Error> {
+    let mut url = endpoint(server_url, PATH);
+    let secure = matches!(url.scheme(), "https" | "wss");
+    url.set_scheme(if secure { "wss" } else { "ws" })
+        .map_err(|()| Error::RelayUnreachable(format!("not an http or ws URL: {server_url}")))?;
     let (ws, _) = timeout(CONNECT_TIMEOUT, connect_async(url.as_str()))
         .await
         .map_err(|_| Error::RelayUnreachable("timed out".into()))?
@@ -241,9 +254,16 @@ async fn recv_message(ws: &mut WsStream, wait: Duration) -> Result<ServerMessage
     }
 }
 
-async fn recv_paired(ws: &mut WsStream, wait: Duration) -> Result<Transport, Error> {
+/// The transport, and the receiver's stats token.
+async fn recv_paired(
+    ws: &mut WsStream,
+    wait: Duration,
+) -> Result<(Transport, Option<String>), Error> {
     match recv_message(ws, wait).await? {
-        ServerMessage::Paired { transport } => Ok(transport),
+        ServerMessage::Paired {
+            transport,
+            stats_token,
+        } => Ok((transport, stats_token)),
         _ => Err(protocol("expected paired")),
     }
 }
@@ -266,7 +286,7 @@ mod tests {
     use fsend_proto::peer::{Node, frame};
     use tokio::{net::TcpListener, sync::oneshot};
 
-    use crate::transfer::test_support::{APP, start_relay, ws_url};
+    use crate::transfer::test_support::{APP, server_url, start_server};
 
     fn file(name: &str, checksum: Option<&[u8]>) -> Node {
         Node::File {
@@ -322,7 +342,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_offer_comes_first_and_connection_info_once_accepted() {
-        let url = start_relay().await;
+        let url = start_server().await;
         let outgoing = offer_of(Some(Algorithm::Sha256), vec![file("a", Some(&[1; 32]))]);
         let (sender, receiver) = pair_with(&url, &outgoing, |code| code).await;
         let (mut sender, (mut receiver, offered)) = (sender.unwrap(), receiver.unwrap());
@@ -352,7 +372,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_rejected_offer_ends_the_session() {
-        let url = start_relay().await;
+        let url = start_server().await;
         let (sender, receiver) = pair(&url, |code| code).await;
         let (mut sender, receiver) = (sender.unwrap(), receiver.unwrap());
 
@@ -371,7 +391,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_large_offer_spans_many_frames() {
-        let url = start_relay().await;
+        let url = start_server().await;
         // Checksums do not compress.
         let mut state = 0x9E37_79B9_7F4A_7C15u64;
         let entries: Vec<_> = (0..50_000)
@@ -400,7 +420,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_invalid_offer_fails_the_receiver() {
-        let url = start_relay().await;
+        let url = start_server().await;
         let outgoing = offer_of(None, vec![file("..", None)]);
         let (_sender, receiver) = pair_with(&url, &outgoing, |code| code).await;
         let err = receiver.err().unwrap();
@@ -409,7 +429,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_wrong_code_fails_on_both_sides() {
-        let url = start_relay().await;
+        let url = start_server().await;
         let (sender, receiver) =
             pair(&url, |code| Code::new(&code.nameplate(), "000000").unwrap()).await;
         for result in [sender, receiver] {
@@ -423,7 +443,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_code_is_reported() {
-        let url = start_relay().await;
+        let url = start_server().await;
         let code = "ZZZZ000000".parse().unwrap();
         let err = pair_as_receiver(&url, APP, &code).await.err().unwrap();
         assert!(
@@ -435,7 +455,7 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_relay_message_is_a_protocol_error() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = ws_url(&listener);
+        let url = server_url(&listener);
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
@@ -456,7 +476,7 @@ mod tests {
     #[tokio::test]
     async fn a_relay_that_hangs_up_is_a_closed_connection() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = ws_url(&listener);
+        let url = server_url(&listener);
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
@@ -473,7 +493,7 @@ mod tests {
     #[tokio::test]
     async fn an_unreachable_relay_is_reported() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = ws_url(&listener);
+        let url = server_url(&listener);
         drop(listener);
         let result =
             pair_as_sender(&url, APP, &offer_of(None, vec![file("a", None)]), |_| {}).await;

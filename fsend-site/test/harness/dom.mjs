@@ -1,4 +1,5 @@
 const downloads = [];
+const beacons = [];
 const blobsByUrl = new Map();
 let urlCounter = 0;
 
@@ -40,13 +41,24 @@ export function installDom(globals) {
 
     // hasFileSystemAccess() looks on window; without the pickers the fallback runs.
     globals.window = globals;
+
+    globals.navigator.sendBeacon = (url, body) => {
+        beacons.push({ url, body: JSON.parse(body) });
+        return true;
+    };
 }
 
 export function getDownloads() {
     return downloads;
 }
 
+/** What went out with `navigator.sendBeacon`, its body parsed. */
+export function getBeacons() {
+    return beacons;
+}
+
 export function resetDom() {
     downloads.length = 0;
+    beacons.length = 0;
     blobsByUrl.clear();
 }

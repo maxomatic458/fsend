@@ -9,23 +9,31 @@ use fsend_proto::peer::Entry;
 use fsend_proto::peer::Offer;
 use fsend_proto::peer::resume::{Conflict, ConflictPolicy};
 use fsend_proto::relay::Transport as Kind;
+use fsend_proto::stats::{self, Platform, Report, Route};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::Error;
 use crate::iroh::IrohTransfer;
-use crate::relay::{self, Answer, Relay};
-use crate::transfer::{self, Event, Outgoing, Transport, cancellable};
+use crate::relay::{self, Answer, Relay, endpoint};
+use crate::transfer::{self, ConnectionKind, Event, Outgoing, Transport, cancellable};
 use crate::webrtc::WebRtcTransfer;
 
 /// For iroh to find a direct path before the connection kind is reported.
 const SETTLE: Duration = Duration::from_secs(2);
+/// For the stats report, which must not hold up the end of a transfer for long.
+const REPORT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct Client {
-    pub relay_url: Url,
+    /// The fsend server, which pairs the peers and counts the bytes they move.
+    pub server_url: Url,
     /// Shown to the peer, e.g. `fsend-cli 0.4.0`.
     pub app: String,
+    /// Reported with the bytes received.
+    pub platform: Platform,
+    /// Whether a receiver tells the server how many bytes arrived.
+    pub telemetry: bool,
 }
 
 #[async_trait]
@@ -45,7 +53,7 @@ impl Client {
         cancel: CancellationToken,
     ) -> Result<(), Error> {
         let connecting = async {
-            let mut relay = relay::pair_as_sender(&self.relay_url, &self.app, outgoing, |code| {
+            let mut relay = relay::pair_as_sender(&self.server_url, &self.app, outgoing, |code| {
                 on_event(Event::Code(code))
             })
             .await?;
@@ -67,22 +75,93 @@ impl Client {
     ) -> Result<(), Error> {
         let connecting = async {
             let (mut relay, offer) =
-                relay::pair_as_receiver(&self.relay_url, &self.app, code).await?;
+                relay::pair_as_receiver(&self.server_url, &self.app, code).await?;
             if !handler.accept(&offer).await {
                 relay.reject(None).await?;
                 return Err(Error::Declined);
             }
-            Ok((connect_as_receiver(&mut relay).await?, offer))
+            let transport = connect_as_receiver(&mut relay).await?;
+            Ok((transport, offer, relay.transport, relay.stats_token))
         };
-        let (mut transport, offer) = cancellable(&cancel, Box::pin(connecting)).await?;
-        settle(transport.as_mut(), &mut |event| handler.event(event)).await;
-        transfer::receive_files(transport.as_mut(), &offer, out, handler, cancel).await
+        let (mut transport, offer, kind, stats_token) =
+            cancellable(&cancel, Box::pin(connecting)).await?;
+        let route = settle(transport.as_mut(), &mut |event| handler.event(event)).await;
+        let mut counting = Counting { handler, bytes: 0 };
+        let result =
+            transfer::receive_files(transport.as_mut(), &offer, out, &mut counting, cancel).await;
+        if let Some(token) = stats_token
+            && self.telemetry
+            && counting.bytes > 0
+        {
+            self.report(Report {
+                token,
+                platform: self.platform,
+                transport: kind,
+                route: route.into(),
+                bytes: counting.bytes,
+            })
+            .await;
+        }
+        result
+    }
+
+    /// Tells the server how many bytes arrived and how, and nothing else; failures are ignored.
+    async fn report(&self, report: Report) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let sent = reqwest::Client::new()
+            .post(endpoint(&self.server_url, stats::PATH))
+            .json(&report)
+            .timeout(REPORT_TIMEOUT)
+            .send()
+            .await;
+        if let Err(error) = sent {
+            tracing::debug!("the stats report failed: {error}");
+        }
     }
 }
 
-async fn settle(transport: &mut dyn Transport, on_event: &mut (dyn FnMut(Event<'_>) + Send)) {
+/// Counts the file bytes received on their way to `handler`.
+struct Counting<'a> {
+    handler: &'a mut dyn ReceiveHandler,
+    bytes: u64,
+}
+
+#[async_trait]
+impl ReceiveHandler for Counting<'_> {
+    async fn accept(&mut self, offer: &Offer) -> bool {
+        self.handler.accept(offer).await
+    }
+
+    async fn resolve(&mut self, entries: &[Entry], conflicts: &[Conflict]) -> ConflictPolicy {
+        self.handler.resolve(entries, conflicts).await
+    }
+
+    fn event(&mut self, event: Event<'_>) {
+        if let Event::Progress { bytes, .. } = event {
+            self.bytes += bytes;
+        }
+        self.handler.event(event);
+    }
+}
+
+async fn settle(
+    transport: &mut dyn Transport,
+    on_event: &mut (dyn FnMut(Event<'_>) + Send),
+) -> ConnectionKind {
     tokio::time::sleep(SETTLE).await;
-    on_event(Event::Connected(transport.connection_kind()));
+    let kind = transport.connection_kind().await;
+    on_event(Event::Connected(kind));
+    kind
+}
+
+impl From<ConnectionKind> for Route {
+    fn from(kind: ConnectionKind) -> Self {
+        match kind {
+            ConnectionKind::Direct => Self::Direct,
+            ConnectionKind::Relay => Self::Relay,
+            ConnectionKind::Unknown => Self::Unknown,
+        }
+    }
 }
 
 async fn connect_as_sender(relay: &mut Relay) -> Result<Box<dyn Transport>, Error> {
@@ -172,12 +251,16 @@ mod tests {
 
     use super::*;
     use crate::build_offer;
-    use crate::transfer::test_support::{APP, sample_tree, snapshot, start_relay};
+    use crate::transfer::test_support::{
+        APP, sample_tree, snapshot, start_server, start_server_with,
+    };
 
-    fn client(relay_url: Url) -> Client {
+    fn client(server_url: Url) -> Client {
         Client {
-            relay_url,
+            server_url,
             app: APP.into(),
+            platform: Platform::Cli,
+            telemetry: true,
         }
     }
 
@@ -218,19 +301,20 @@ mod tests {
         }
     }
 
-    /// Sends `outgoing` to a receiver that answers with `accept`; returns
-    /// both results, the sender's events and the receiver's handler.
-    async fn run(
-        outgoing: &Outgoing,
-        out: &Path,
-        accept: bool,
-    ) -> (
+    type Run = (
         Result<(), Error>,
         Result<(), Error>,
         Vec<&'static str>,
         Handler,
-    ) {
-        let client = client(start_relay().await);
+    );
+
+    async fn run(outgoing: &Outgoing, out: &Path, accept: bool) -> Run {
+        run_on(client(start_server().await), outgoing, out, accept).await
+    }
+
+    /// Sends `outgoing` with `client` to a receiver that answers with
+    /// `accept`; returns both results, the sender's events and the receiver's handler.
+    async fn run_on(client: Client, outgoing: &Outgoing, out: &Path, accept: bool) -> Run {
         let (code_tx, code_rx) = oneshot::channel();
         let mut code_tx = Some(code_tx);
         let mut sent = Vec::new();
@@ -277,6 +361,57 @@ mod tests {
         assert_eq!(handler.events, ["connected", "started", "progress"]);
     }
 
+    /// The `(platform, transport, route, bytes)` rows a transfer with
+    /// `telemetry` leaves, and the size sent.
+    async fn reported(telemetry: bool) -> (Vec<(String, String, String, i64)>, usize) {
+        let tmp = tempfile::tempdir().unwrap();
+        let database = tmp.path().join("stats.db");
+        let server = start_server_with(fsend_server::Config {
+            database: Some(database.clone()),
+            ..fsend_server::Config::default()
+        })
+        .await;
+        let client = Client {
+            telemetry,
+            ..client(server)
+        };
+        let outgoing = build_offer(&[sample_tree(tmp.path())]).unwrap();
+
+        let (send, receive, _, _) = run_on(client, &outgoing, &tmp.path().join("out"), true).await;
+
+        send.unwrap();
+        receive.unwrap();
+        let size = (snapshot(&tmp.path().join("album")).iter())
+            .map(|(_, bytes)| bytes.len())
+            .sum();
+        let db = rusqlite::Connection::open(&database).unwrap();
+        let mut rows = db
+            .prepare("SELECT platform, transport, route, bytes FROM transfers")
+            .unwrap();
+        let rows = rows
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        (rows, size)
+    }
+
+    #[tokio::test]
+    async fn the_receiver_reports_the_bytes_it_received() {
+        let (rows, size) = reported(true).await;
+        // Two local endpoints find each other directly.
+        let row = ("cli".into(), "iroh".into(), "direct".into(), size as i64);
+        assert_eq!(rows, [row]);
+    }
+
+    #[tokio::test]
+    async fn without_telemetry_the_receiver_reports_nothing() {
+        let (rows, _) = reported(false).await;
+        assert_eq!(rows, []);
+    }
+
     #[tokio::test]
     async fn a_declined_offer_ends_both_sides_before_they_connect() {
         let tmp = tempfile::tempdir().unwrap();
@@ -297,7 +432,7 @@ mod tests {
     async fn a_cancelled_sender_stops_waiting_for_the_receiver() {
         let tmp = tempfile::tempdir().unwrap();
         let outgoing = build_offer(&[sample_tree(tmp.path())]).unwrap();
-        let client = client(start_relay().await);
+        let client = client(start_server().await);
         let cancel = CancellationToken::new();
         let mut on_event = |event: Event<'_>| {
             if let Event::Code(_) = event {
@@ -314,7 +449,7 @@ mod tests {
     /// Small enough to hold many, or to await on a small stack.
     #[test]
     fn transfers_are_small_futures() {
-        let client = client("ws://localhost".parse().unwrap());
+        let client = client("http://localhost".parse().unwrap());
         let outgoing = Outgoing::default();
         let mut on_event = |_: Event<'_>| {};
         let send = client.send(&outgoing, true, &mut on_event, CancellationToken::new());

@@ -19,7 +19,11 @@ export type ServerMessage = { "type": "created", nameplate: Nameplate,
 /**
  * Seconds until an unjoined session expires.
  */
-expires_in: number, } | { "type": "paired", transport: Transport, } | { "type": "error", code: RelayError, };
+expires_in: number, } | { "type": "paired", transport: Transport, 
+/**
+ * The receiver's one-time token for its stats report, if the server keeps stats.
+ */
+stats_token?: string, } | { "type": "error", code: RelayError, };
 
 export type RelayError = "version" | "not_found" | "expired" | "no_common_transport" | "peer_left" | "busy" | "protocol";
 
@@ -100,3 +104,13 @@ complete: Array<number>,
  * Directories to create, in offer order.
  */
 dirs: Array<number>, conflicts: Array<Conflict>, };
+
+export type StatsReport = { token: string, platform: Platform, transport: Transport, route: Route, 
+/**
+ * File bytes received, whether the transfer finished or not.
+ */
+bytes: number, };
+
+export type Platform = "web" | "cli";
+
+export type Route = "direct" | "relay" | "unknown";

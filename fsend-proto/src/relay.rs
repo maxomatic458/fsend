@@ -47,6 +47,10 @@ pub enum ServerMessage {
     /// Sent to both sides once the receiver joined.
     Paired {
         transport: Transport,
+        /// The receiver's one-time token for its stats report, if the server keeps stats.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        stats_token: Option<String>,
     },
     Error {
         code: Error,
@@ -109,8 +113,16 @@ mod tests {
         pinned(
             ServerMessage::Paired {
                 transport: Transport::Iroh,
+                stats_token: None,
             },
             r#"{"type":"paired","transport":"iroh"}"#,
+        );
+        pinned(
+            ServerMessage::Paired {
+                transport: Transport::Webrtc,
+                stats_token: Some("0f3a".into()),
+            },
+            r#"{"type":"paired","transport":"webrtc","stats_token":"0f3a"}"#,
         );
         pinned(
             ServerMessage::Error {
@@ -143,7 +155,8 @@ mod tests {
             )
             .unwrap(),
             ServerMessage::Paired {
-                transport: Transport::Webrtc
+                transport: Transport::Webrtc,
+                stats_token: None,
             }
         );
     }

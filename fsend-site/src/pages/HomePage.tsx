@@ -58,9 +58,8 @@ const FAQ_ITEMS = [
         q: "Can fsend see my files?",
         a: () => (
             <>
-                No. Files go straight between the two devices over end-to-end encrypted{" "}
-                <Ext href={MDN_WEBRTC}>WebRTC</Ext> data channels, and the list of offered files
-                passes our relay end-to-end encrypted too.
+                No. Files and metadata go straight between the two devices over end-to-end encrypted{" "}
+                <Ext href={MDN_WEBRTC}>WebRTC</Ext> data channels.
             </>
         ),
     },

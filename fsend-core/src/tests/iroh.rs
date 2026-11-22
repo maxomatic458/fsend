@@ -78,9 +78,9 @@ async fn throughput() {
 
 #[tokio::test]
 async fn connection_over_loopback_is_direct() {
-    let (sender, receiver) = connected_pair().await;
-    assert_eq!(sender.connection_kind(), ConnectionKind::Direct);
-    assert_eq!(receiver.connection_kind(), ConnectionKind::Direct);
+    let (mut sender, mut receiver) = connected_pair().await;
+    assert_eq!(sender.connection_kind().await, ConnectionKind::Direct);
+    assert_eq!(receiver.connection_kind().await, ConnectionKind::Direct);
 }
 
 #[tokio::test]

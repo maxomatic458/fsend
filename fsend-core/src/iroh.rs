@@ -187,7 +187,7 @@ impl IrohTransfer {
 
 #[async_trait]
 impl Transport for IrohTransfer {
-    fn connection_kind(&self) -> ConnectionKind {
+    async fn connection_kind(&mut self) -> ConnectionKind {
         let paths = self.conn.paths();
         match paths.iter().find(|p| p.is_selected()) {
             Some(p) if p.is_ip() => ConnectionKind::Direct,

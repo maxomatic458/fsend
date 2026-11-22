@@ -61,7 +61,6 @@ pub enum Event<'a> {
 pub enum ConnectionKind {
     Direct,
     Relay,
-    WebRtc,
     Unknown,
 }
 
@@ -70,7 +69,6 @@ impl std::fmt::Display for ConnectionKind {
         f.write_str(match self {
             Self::Direct => "Direct",
             Self::Relay => "Relay",
-            Self::WebRtc => "WebRTC",
             Self::Unknown => "Unknown",
         })
     }
@@ -81,7 +79,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + ?Sized> ByteStream for T {}
 
 #[async_trait]
 pub trait Transport: Send {
-    fn connection_kind(&self) -> ConnectionKind;
+    async fn connection_kind(&mut self) -> ConnectionKind;
     /// The receiver writes to it first.
     async fn control(&mut self) -> Result<Box<dyn ByteStream>, Error>;
     /// The sender writes to it first.

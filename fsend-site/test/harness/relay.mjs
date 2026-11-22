@@ -84,9 +84,9 @@ class FakeWebSocket {
             }
             this._peer = session.sender;
             session.sender._peer = this;
-            for (const side of [this, session.sender]) {
-                side._json({ type: "paired", transport });
-            }
+            // Only the receiver reports stats.
+            this._json({ type: "paired", transport, stats_token: `token-${msg.nameplate}` });
+            session.sender._json({ type: "paired", transport });
             return;
         }
 

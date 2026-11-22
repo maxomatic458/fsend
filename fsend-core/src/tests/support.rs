@@ -89,15 +89,19 @@ pub fn json_frame(json: &str) -> Vec<u8> {
 
 pub const APP: &str = "fsend-core tests";
 
-pub fn ws_url(listener: &tokio::net::TcpListener) -> url::Url {
-    url::Url::parse(&format!("ws://{}", listener.local_addr().unwrap())).unwrap()
+pub fn server_url(listener: &tokio::net::TcpListener) -> url::Url {
+    url::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap()
 }
 
-pub async fn start_relay() -> url::Url {
+pub async fn start_server_with(config: fsend_server::Config) -> url::Url {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = ws_url(&listener);
-    tokio::spawn(fsend_relay::serve(listener, fsend_relay::Config::default()));
+    let url = server_url(&listener);
+    tokio::spawn(fsend_server::serve(listener, config));
     url
+}
+
+pub async fn start_server() -> url::Url {
+    start_server_with(fsend_server::Config::default()).await
 }
 
 /// Kills the connection from the outside.

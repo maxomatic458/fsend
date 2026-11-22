@@ -1,15 +1,16 @@
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use axum::http::HeaderName;
 use clap::Parser;
-use fsend_relay::Config;
+use fsend_server::Config;
 use tokio::net::TcpListener;
 use tracing::info;
 
 #[derive(Parser)]
-#[command(name = "fsend-relay")]
-#[command(about = "The relay server that pairs fsend peers")]
+#[command(name = "fsend-server")]
+#[command(about = "The fsend server: pairs peers and counts the bytes they transfer")]
 struct Args {
     #[arg(default_value = "0.0.0.0:3001")]
     bind: SocketAddr,
@@ -27,9 +28,13 @@ struct Args {
     sessions_per_minute: u32,
 
     /// Header with the client's address, as Cloudflare sets it; empty to use
-    /// the connection's own when the relay is reached directly.
+    /// the connection's own when the server is reached directly.
     #[arg(long, default_value = "cf-connecting-ip")]
     ip_header: String,
+
+    /// SQLite database for transfer stats, created if missing; none are kept without one.
+    #[arg(long)]
+    database: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -48,7 +53,8 @@ async fn main() -> io::Result<()> {
         connections_per_ip: args.connections_per_ip,
         sessions_per_minute: args.sessions_per_minute,
         ip_header,
+        database: args.database,
         ..Config::default()
     };
-    fsend_relay::serve(listener, config).await
+    fsend_server::serve(listener, config).await
 }

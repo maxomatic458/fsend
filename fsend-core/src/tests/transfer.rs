@@ -74,7 +74,7 @@ impl AsyncWrite for Aborting {
 
 #[async_trait]
 impl Transport for Memory {
-    fn connection_kind(&self) -> ConnectionKind {
+    async fn connection_kind(&mut self) -> ConnectionKind {
         ConnectionKind::Unknown
     }
 

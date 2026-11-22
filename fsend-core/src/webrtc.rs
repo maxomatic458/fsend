@@ -17,8 +17,8 @@ use tokio_util::io::StreamReader;
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelState};
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder,
-    RTCIceGatheringState, RTCIceServer, RTCPeerConnectionState, RTCSessionDescription,
-    SettingEngineBuilder,
+    RTCIceCandidateType, RTCIceGatheringState, RTCIceServer, RTCPeerConnectionState,
+    RTCSessionDescription, SettingEngineBuilder,
 };
 use webrtc::runtime::TokioRuntime;
 
@@ -465,8 +465,22 @@ impl WebRtcTransfer {
 
 #[async_trait]
 impl Transport for WebRtcTransfer {
-    fn connection_kind(&self) -> ConnectionKind {
-        ConnectionKind::WebRtc
+    async fn connection_kind(&mut self) -> ConnectionKind {
+        let Some(sctp) = self.pc.sctp().await else {
+            return ConnectionKind::Unknown;
+        };
+        let ice = sctp.transport().ice_transport();
+        match ice.get_selected_candidate_pair().await {
+            Ok(Some(pair))
+                if [pair.local(), pair.remote()]
+                    .iter()
+                    .any(|candidate| candidate.typ == RTCIceCandidateType::Relay) =>
+            {
+                ConnectionKind::Relay
+            }
+            Ok(Some(_)) => ConnectionKind::Direct,
+            _ => ConnectionKind::Unknown,
+        }
     }
 
     async fn control(&mut self) -> Result<Box<dyn ByteStream>, Error> {

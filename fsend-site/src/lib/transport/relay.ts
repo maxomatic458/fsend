@@ -32,6 +32,8 @@ export class Relay {
     private closed = false;
     private wake: (() => void) | null = null;
     private channel: Channel | null = null;
+    /** Receiver: the token for its stats report, if the server keeps stats. */
+    statsToken: string | undefined;
     private onClose: () => void = () => {};
     private whenClosed = new Promise<void>((resolve) => (this.onClose = resolve));
 
@@ -51,7 +53,7 @@ export class Relay {
     /** Connects; aborting closes the connection, failing whatever waits on it. */
     static connect(abort: AbortSignal): Promise<Relay> {
         abort.throwIfAborted();
-        const ws = new WebSocket(`${RELAY_URL.replace(/\/+$/, "")}/relay`);
+        const ws = new WebSocket(RELAY_URL);
         ws.binaryType = "arraybuffer";
         abort.addEventListener("abort", () => ws.close());
         return new Promise((resolve, reject) => {
@@ -87,7 +89,7 @@ export class Relay {
             nameplate: code.slice(0, NAMEPLATE_LENGTH),
             transports: TRANSPORTS,
         });
-        await this.expect("paired");
+        this.statsToken = (await this.expect("paired")).stats_token;
         await this.handshake(code, Role.Receiver);
         const message = await this.sealed();
         if (message.type !== "offer") throw pairingError("expected an offer");

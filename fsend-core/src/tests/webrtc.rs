@@ -88,7 +88,7 @@ async fn a_lost_link_fails_the_streams_instead_of_hanging() {
 
     let (mut sender, mut receiver) = connected_pair().await;
     assert_eq!(*sender.link.borrow(), LinkState::Connected);
-    assert_eq!(sender.connection_kind(), ConnectionKind::WebRtc);
+    assert_eq!(sender.connection_kind().await, ConnectionKind::Direct);
     let mut data = sender.data().await.unwrap();
 
     // The receiver hanging up reaches the sender as a lost connection.

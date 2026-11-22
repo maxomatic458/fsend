@@ -6,6 +6,7 @@ import {
     installBrowserEnv,
     resetBrowserEnv,
     MemoryDirectoryHandle,
+    getBeacons,
     getDownloads,
     makeEntries,
     expectedSnapshot,
@@ -686,6 +687,52 @@ describe("interrupted transfers", () => {
 
         assert.equal(send.record.error, null, "a deliberate abort is not an error worth showing");
         assert.equal(send.record.complete, false);
+    });
+});
+
+describe("stats", () => {
+    test("a receiver reports the bytes it got and how, and nothing else", async () => {
+        const spec = { "a.bin": bytes(300_000, 201), d: { "b.bin": bytes(1000, 202) } };
+        const { recv } = await transfer(spec);
+
+        assert.equal(recv.error, null);
+        const [beacon, ...more] = getBeacons();
+        assert.deepEqual(more, []);
+        assert.equal(beacon.url, "https://api.fsend.sh/stats");
+        assert.match(beacon.body.token, /^token-/);
+        assert.deepEqual(beacon.body, {
+            token: beacon.body.token,
+            platform: "web",
+            transport: "webrtc",
+            route: "direct",
+            bytes: 301_000,
+        });
+    });
+
+    test("a cancelled receive reports what had arrived", async () => {
+        const controller = new AbortController();
+        const { recv, senderDone, receiverDone } = await start(
+            { "big.bin": bytes(3_000_000, 203) },
+            { recvSignal: controller.signal },
+        );
+        await waitFor(() => recv.record.progress > 100_000, { label: "transfer under way" });
+        controller.abort();
+        await Promise.all([senderDone, receiverDone]);
+
+        const [beacon, ...more] = getBeacons();
+        assert.deepEqual(more, []);
+        assert.equal(beacon.body.bytes, recv.record.progress);
+        assert.ok(beacon.body.bytes < 3_000_000);
+    });
+
+    test("nothing is reported when nothing arrived", async () => {
+        const { senderDone, receiverDone } = await start(
+            { "unwanted.bin": bytes(500, 204) },
+            { recv: makeRecorder({ onOffered: (e) => e.reject() }) },
+        );
+        await Promise.all([senderDone, receiverDone]);
+
+        assert.deepEqual(getBeacons(), []);
     });
 });
 

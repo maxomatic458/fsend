@@ -16,7 +16,9 @@ async-trait = "0.1.92"
 bytes = "1.12.1"
 futures-util = "0.3.34"
 iroh = "1.4.1"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
 rtc = "0.21.1"
+rustls = { version = "0.23.46", default-features = false, features = ["ring"] }
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "time", "macros", "net", "fs", "sync", "io-util"] }
@@ -24,10 +26,11 @@ tokio-stream = "0.1.19"
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7.20", features = ["io"] }
 tracing.workspace = true
-url = "2.5.8"
+url = "2.5.9"
 webrtc = "0.21.1"
 
 [dev-dependencies]
-fsend-relay = { path = "../fsend-relay" }
+fsend-server = { path = "../fsend-server" }
+rusqlite = { version = "0.43.0", default-features = false }
 tempfile = "3.27.0"
 tokio = { workspace = true, features = ["rt-multi-thread"] }

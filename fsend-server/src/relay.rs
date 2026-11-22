@@ -1,9 +1,8 @@
 use std::{
     collections::HashMap,
-    io,
-    net::{IpAddr, Ipv6Addr, SocketAddr},
+    net::SocketAddr,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -16,7 +15,7 @@ use axum::{
         ConnectInfo, State, WebSocketUpgrade,
         ws::{Message, Utf8Bytes, WebSocket},
     },
-    http::{HeaderMap, HeaderName},
+    http::HeaderMap,
     response::Response,
     routing::get,
 };
@@ -29,11 +28,14 @@ use fsend_proto::{
 };
 use serde::Deserialize;
 use tokio::{
-    net::TcpListener,
     sync::{mpsc, oneshot},
     time::{Instant, Interval, MissedTickBehavior, sleep_until, timeout},
 };
 use tracing::info;
+
+use crate::Config;
+use crate::limits::{Connected, Limits, client_ip};
+use crate::stats::Stats;
 
 /// Signals queued for a peer that is still reading earlier ones.
 const QUEUED_SIGNALS: usize = 4;
@@ -43,101 +45,28 @@ const NAMEPLATE_TRIES: usize = 64;
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// Time for a client to say `create` or `join` after connecting.
 const FIRST_MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Addresses tracked before those without a connection are forgotten.
-const MAX_TRACKED: usize = 100_000;
 
-#[derive(Debug, Clone)]
-pub struct Config {
-    /// How long a session waits for its receiver.
-    pub session_ttl: Duration,
-    /// How long the two sides may signal after the join, the receiver's decision included.
-    pub pair_timeout: Duration,
-    /// Sessions open at once, waiting or pairing.
-    pub max_sessions: usize,
-    pub ping_interval: Duration,
-    /// Connections open at once from one address.
-    pub connections_per_ip: usize,
-    /// Sessions one address may create or join per minute, all at once if it likes.
-    pub sessions_per_minute: u32,
-    /// The header a proxy in front sets to the client's address, which
-    /// otherwise is the connection's own. Anyone reaching the relay directly can
-    /// set it too.
-    pub ip_header: Option<HeaderName>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            session_ttl: Duration::from_secs(5 * 60),
-            pair_timeout: Duration::from_secs(10 * 60),
-            max_sessions: 10_000,
-            ping_interval: Duration::from_secs(20),
-            connections_per_ip: 32,
-            sessions_per_minute: 30,
-            ip_header: None,
-        }
-    }
-}
-
-pub async fn serve(listener: TcpListener, config: Config) -> io::Result<()> {
+pub(crate) fn router(config: Config, stats: Option<Arc<Stats>>) -> Router {
+    let limits = Arc::new(Limits::new(
+        config.connections_per_ip,
+        config.sessions_per_minute,
+    ));
     let relay = Arc::new(Relay {
         config,
         slots: Mutex::default(),
         active: AtomicUsize::new(0),
-        clients: Mutex::default(),
+        limits,
+        stats,
     });
-    let router = Router::new().route(PATH, get(upgrade)).with_state(relay);
-    axum::serve(
-        listener,
-        router.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
+    Router::new().route(PATH, get(upgrade)).with_state(relay)
 }
 
 struct Relay {
     config: Config,
     slots: Mutex<HashMap<Nameplate, Slot>>,
     active: AtomicUsize,
-    clients: Mutex<HashMap<IpAddr, Client>>,
-}
-
-/// What one address uses of the relay.
-struct Client {
-    connections: usize,
-    /// Sessions it may still create or join; refills over a minute.
-    allowance: f64,
-    refilled: Instant,
-}
-
-impl Client {
-    fn refill(&mut self, per_minute: u32) {
-        let now = Instant::now();
-        let refilled =
-            now.duration_since(self.refilled).as_secs_f64() * f64::from(per_minute) / 60.0;
-        self.allowance = (self.allowance + refilled).min(f64::from(per_minute));
-        self.refilled = now;
-    }
-}
-
-/// Counts a connection of its address while it lives.
-struct Connected {
-    relay: Arc<Relay>,
-    ip: IpAddr,
-}
-
-impl Drop for Connected {
-    fn drop(&mut self) {
-        let per_minute = self.relay.config.sessions_per_minute;
-        let mut clients = self.relay.clients();
-        let Some(client) = clients.get_mut(&self.ip) else {
-            return;
-        };
-        client.connections -= 1;
-        client.refill(per_minute);
-        if client.connections == 0 && client.allowance >= f64::from(per_minute) {
-            clients.remove(&self.ip);
-        }
-    }
+    limits: Arc<Limits>,
+    stats: Option<Arc<Stats>>,
 }
 
 enum Slot {
@@ -193,47 +122,8 @@ impl Drop for Active {
 }
 
 impl Relay {
-    fn slots(&self) -> std::sync::MutexGuard<'_, HashMap<Nameplate, Slot>> {
+    fn slots(&self) -> MutexGuard<'_, HashMap<Nameplate, Slot>> {
         self.slots.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn clients(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, Client>> {
-        self.clients.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// A connection from `ip`, unless it has too many open.
-    fn connect(self: &Arc<Self>, ip: IpAddr) -> Option<Connected> {
-        let mut clients = self.clients();
-        if clients.len() >= MAX_TRACKED {
-            clients.retain(|_, client| client.connections > 0);
-        }
-        let client = clients.entry(ip).or_insert_with(|| Client {
-            connections: 0,
-            allowance: f64::from(self.config.sessions_per_minute),
-            refilled: Instant::now(),
-        });
-        if client.connections >= self.config.connections_per_ip {
-            return None;
-        }
-        client.connections += 1;
-        Some(Connected {
-            relay: self.clone(),
-            ip,
-        })
-    }
-
-    /// Whether the address of `connected` may create or join another session now.
-    fn attempt(&self, connected: &Connected) -> bool {
-        let mut clients = self.clients();
-        let Some(client) = clients.get_mut(&connected.ip) else {
-            return false;
-        };
-        client.refill(self.config.sessions_per_minute);
-        if client.allowance < 1.0 {
-            return false;
-        }
-        client.allowance -= 1.0;
-        true
     }
 
     /// Opens a session under a fresh nameplate, or `None` when full.
@@ -283,7 +173,8 @@ async fn upgrade(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    let connected = relay.connect(client_ip(&relay.config, &headers, addr));
+    let ip = client_ip(relay.config.ip_header.as_ref(), &headers, addr);
+    let connected = relay.limits.connect(ip);
     ws.max_message_size(MAX_FRAME_BYTES)
         .max_frame_size(MAX_FRAME_BYTES)
         .on_upgrade(move |ws| async move {
@@ -293,20 +184,6 @@ async fn upgrade(
                 None => ws.fail(Error::Busy).await,
             }
         })
-}
-
-/// The client's address, an IPv6 one by its /64, which one host usually has all of.
-fn client_ip(config: &Config, headers: &HeaderMap, addr: SocketAddr) -> IpAddr {
-    let ip = (config.ip_header.as_ref())
-        .and_then(|name| headers.get(name)?.to_str().ok()?.trim().parse().ok())
-        .unwrap_or(addr.ip());
-    match ip {
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => IpAddr::V4(v4),
-            None => IpAddr::V6(Ipv6Addr::from_bits(v6.to_bits() & !u128::from(u64::MAX))),
-        },
-        v4 => v4,
-    }
 }
 
 async fn connection(mut ws: Socket, relay: Arc<Relay>, connected: Connected) {
@@ -319,7 +196,7 @@ async fn connection(mut ws: Socket, relay: Arc<Relay>, connected: Connected) {
         return ws.fail(Error::Version).await;
     }
     let message = serde_json::from_str::<ClientMessage>(&text);
-    if message.is_ok() && !relay.attempt(&connected) {
+    if message.is_ok() && !relay.limits.attempt(&connected) {
         return ws.fail(Error::Busy).await;
     }
     match message {
@@ -386,7 +263,7 @@ async fn create(mut ws: Socket, relay: Arc<Relay>, transports: Vec<Transport>) {
         }
     };
     match outcome {
-        Ok(Ok(peer)) => forward(ws, &relay.config, peer).await,
+        Ok(Ok(peer)) => forward(ws, &relay.config, peer, None).await,
         Ok(Err(code)) => ws.fail(code).await,
         // `join` always answers before dropping the slot.
         Err(_) => {}
@@ -430,18 +307,23 @@ async fn join(ws: Socket, relay: Arc<Relay>, nameplate: Nameplate, transports: V
         link: ours,
         deadline,
     };
-    forward(ws, &relay.config, peer).await;
+    let stats_token = relay.stats.as_ref().and_then(|stats| stats.issue());
+    forward(ws, &relay.config, peer, stats_token).await;
 }
 
 /// Relays signal frames both ways until a side leaves or the deadline passes;
 /// a slow peer holds back a fast one.
-async fn forward(mut ws: Socket, config: &Config, peer: Peer) {
+async fn forward(mut ws: Socket, config: &Config, peer: Peer, stats_token: Option<String>) {
     let Peer {
         transport,
         mut link,
         deadline,
     } = peer;
-    if !ws.send_json(&ServerMessage::Paired { transport }).await {
+    let paired = ServerMessage::Paired {
+        transport,
+        stats_token,
+    };
+    if !ws.send_json(&paired).await {
         return;
     }
     let deadline = sleep_until(deadline);

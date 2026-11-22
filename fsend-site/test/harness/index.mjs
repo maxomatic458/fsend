@@ -1,12 +1,12 @@
 import { readFileSync } from "node:fs";
 import { installWebRtc, resetWebRtc } from "./webrtc.mjs";
 import { installRelay, resetRelay } from "./relay.mjs";
-import { installDom, resetDom, getDownloads } from "./dom.mjs";
+import { installDom, resetDom, getBeacons, getDownloads } from "./dom.mjs";
 import { installWorker } from "./worker.mjs";
 import { MemoryDirectoryHandle } from "./fs-access.mjs";
 import { unzip } from "./zip.mjs";
 
-export { MemoryDirectoryHandle, getDownloads, unzip };
+export { MemoryDirectoryHandle, getBeacons, getDownloads, unzip };
 
 // The app loads its wasm with fetch(); hand it the bytes up front instead.
 const { initSync } = await import("../.build/app.mjs");

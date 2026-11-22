@@ -21,6 +21,7 @@ import {
     type Entry,
     type Local,
     type Offer,
+    type Route,
 } from "../proto";
 import {
     Peer,
@@ -35,6 +36,7 @@ import { NotEnoughRoom, type Asking, type TransferSink } from "./sinks";
 import type { TransferListener } from "./events";
 import { createCodec, type BlockCodec } from "./codec";
 import { expectChecksum, verifyPresent } from "./checksums";
+import { reportReceived } from "./report";
 
 const SENDER_IDLE = "the sender stopped sending";
 
@@ -50,7 +52,7 @@ export async function runReceive(
     code: string,
     sink: TransferSink,
     policy: ConflictPolicy,
-    emit: TransferListener,
+    onEvent: TransferListener,
     abort: AbortSignal,
     options: ReceiveOptions = {},
 ): Promise<void> {
@@ -58,11 +60,20 @@ export async function runReceive(
     let link: Link | null = null;
     // The sink in use, which the fallback may replace before anything is written.
     let current = sink;
+    let statsToken: string | undefined;
+    let received = 0;
+    let route: Route = "unknown";
+    const emit: TransferListener = (event) => {
+        if (event.type === "progress") received += event.bytes;
+        if (event.type === "connectionType") route = event.kind;
+        onEvent(event);
+    };
 
     try {
         emit({ type: "connecting" });
         let offer: Offer;
         ({ relay, offer } = await pairReceiver(code, abort));
+        statsToken = relay.statsToken;
         if (!(await decide(offer, relay, emit, abort))) {
             relay.reject();
             throw new TransferFailure("Transfer rejected");
@@ -91,6 +102,7 @@ export async function runReceive(
         if (!abort.aborted) emit({ type: "error", message: messageOf(err) });
     } finally {
         link?.close();
+        if (statsToken && received > 0) reportReceived(statsToken, route, received);
     }
 }
 

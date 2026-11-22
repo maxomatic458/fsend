@@ -92,8 +92,30 @@ $ fsend receive K7Q29XMV4P
 
 The offer is shown before the two sides connect, so declining it shares no IP addresses.
 
+#### Config file
+
+You can configure fsend using a config file which you can find here:
+- Linux: `~/.config/fsend/config.toml`
+- macOS: `~/Library/Application Support/fsend/config.toml`
+- Windows: `%APPDATA%\fsend\config.toml`
+
+### Telemetry
+fsend collects minimal & anonymous usage data. This currently only includes:
+- The fsend app you used to receive files (webapp or CLI)
+- The amount of bytes received in a given transfer
+- The type of connection used (direct or relay)
+
+This data is anonymous and cannot be traced back to a specific user.
+
+By default telemetry is only enabled in the webapp.
+To enable telemetry in the CLI, add the following to your config file:
+
+```toml
+telemetry = true
+```
+
 ## Licenses
-* fsend-relay, fsend-core and fsend-cli are licensed under MIT. See [LICENCE](fsend-relay/LICENCE), [LICENCE](fsend-core/LICENCE) and [LICENCE](fsend-cli/LICENCE).
+* fsend-server, fsend-core and fsend-cli are licensed under MIT. See [LICENCE](fsend-server/LICENCE), [LICENCE](fsend-core/LICENCE) and [LICENCE](fsend-cli/LICENCE).
 * fsend-site is licensed under [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/legalcode). See [LICENCE](fsend-site/LICENCE).
 * The fsend logo and the images made from it, everything in [`fsend-site/public/brand`](fsend-site/public/brand), are not covered by these licenses. All rights reserved. See [LICENCE](fsend-site/public/brand/LICENCE).
 

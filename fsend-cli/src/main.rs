@@ -1,7 +1,8 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
+use color_eyre::eyre::eyre;
 use colored::Colorize;
 use dialoguer::theme::ColorfulTheme;
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -10,6 +11,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use cli::{Args, Mode, OnConflict};
+use config::{Config, ConfigError};
 use fsend_core::{
     CancellationToken, Client, ConnectionKind, Error, Event, Outgoing, ReceiveHandler, async_trait,
     build_offer,
@@ -19,9 +21,11 @@ use fsend_proto::peer::checksum::{self, Algorithm};
 use fsend_proto::peer::resume::{Conflict, ConflictPolicy};
 use fsend_proto::peer::{AcceptedFile, Entry, Node, Offer};
 use fsend_proto::relay;
+use fsend_proto::stats::Platform;
 use url::Url;
 
 mod cli;
+mod config;
 
 const APP: &str = concat!("fsend-cli ", env!("CARGO_PKG_VERSION"));
 
@@ -31,9 +35,12 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     };
 
-    match report.downcast_ref::<Error>() {
-        Some(error) => eprintln!("{} {}", "error:".red(), printable(&error.to_string())),
-        None => eprintln!("{report:?}"),
+    if let Some(error) = report.downcast_ref::<Error>() {
+        eprintln!("{} {}", "error:".red(), printable(&error.to_string()));
+    } else if let Some(error) = report.downcast_ref::<ConfigError>() {
+        eprintln!("{} {error}", "error:".red());
+    } else {
+        eprintln!("{report:?}");
     }
 
     ExitCode::FAILURE
@@ -42,27 +49,31 @@ async fn main() -> ExitCode {
 async fn run() -> color_eyre::Result<()> {
     let args = Args::parse();
     color_eyre::install()?;
+    let config_path = args.config.clone().or_else(config::default_path);
+    let config = Config::load(args.config.as_deref())?.with_args(&args);
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
-        .with(log_filter(args.log_level))
+        .with(log_filter(config.log_level))
         .init();
 
     let client = Client {
-        relay_url: args.relay_url,
+        server_url: config.server_url,
         app: APP.into(),
+        platform: Platform::Cli,
+        telemetry: config.telemetry,
     };
     match args.mode {
         Mode::Send {
             files,
             no_compression,
-            checksums,
+            ..
         } => {
             run_send(
                 &client,
-                &args.download_url,
+                &config.download_url,
                 files,
                 !no_compression,
-                checksums,
+                config.checksums,
             )
             .await?
         }
@@ -83,7 +94,11 @@ async fn run() -> color_eyre::Result<()> {
             };
             run_receive(&client, code, output_dir, receiver).await?
         }
-        Mode::Version => print_version(),
+        Mode::Version => print_version(config_path.as_deref()),
+        Mode::Config => match config_path {
+            Some(path) => println!("{}", path.display()),
+            None => return Err(eyre!("this system has no config directory")),
+        },
     }
 
     Ok(())
@@ -112,10 +127,17 @@ fn log_filter(level: tracing::Level) -> Targets {
         .with_target("fsend", own)
 }
 
-fn print_version() {
+/// The versions, and which config file is read.
+fn print_version(config: Option<&Path>) {
+    let config = match config {
+        Some(path) if path.exists() => path.display().to_string(),
+        Some(path) => format!("{} (not found)", path.display()),
+        None => "none".into(),
+    };
     let rows = [
         ("fsend-cli", env!("CARGO_PKG_VERSION").to_owned()),
         ("protocol", relay::VERSION.to_string()),
+        ("config", config),
     ];
     for (label, value) in rows {
         println!("{:<10} {}", label, value.bright_white());
@@ -525,7 +547,7 @@ impl CliProgressBars {
 fn colorize_conn_type(kind: ConnectionKind) -> String {
     let name = kind.to_string();
     match kind {
-        ConnectionKind::Direct | ConnectionKind::WebRtc => name.green().to_string(),
+        ConnectionKind::Direct => name.green().to_string(),
         ConnectionKind::Relay => name.yellow().to_string(),
         ConnectionKind::Unknown => name.red().to_string(),
     }
@@ -631,10 +653,19 @@ mod tests {
         // A path after the bare flag is not its value.
         assert_eq!(parse(&["--checksums", "a"]), Ok((1, sha256)));
         assert_eq!(parse(&["a", "--checksums=sha256"]), Ok((1, sha256)));
+        assert_eq!(parse(&["--checksums=none", "a"]), Ok((1, None)));
         assert_eq!(
             parse(&["--checksums=md5", "a"]),
-            Err(clap::error::ErrorKind::InvalidValue)
+            Err(clap::error::ErrorKind::ValueValidation)
         );
+    }
+
+    #[test]
+    fn the_config_command_takes_the_named_file() {
+        let parse = |args: &[&str]| Args::try_parse_from(args).unwrap();
+        assert!(matches!(parse(&["fsend", "config"]).mode, Mode::Config));
+        let named = parse(&["fsend", "config", "--config", "my.toml"]);
+        assert_eq!(named.config, Some(PathBuf::from("my.toml")));
     }
 
     #[test]
@@ -643,7 +674,6 @@ mod tests {
         for (kind, name) in [
             (ConnectionKind::Direct, "Direct"),
             (ConnectionKind::Relay, "Relay"),
-            (ConnectionKind::WebRtc, "WebRTC"),
             (ConnectionKind::Unknown, "Unknown"),
         ] {
             assert_eq!(colorize_conn_type(kind), name);
